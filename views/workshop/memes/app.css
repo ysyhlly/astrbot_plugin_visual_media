@@ -1628,7 +1628,7 @@ select.codex-input {
     :root {
         --slot-size: var(--slot-size-mobile);
     }
-    
+
     .codex-header {
         display: flex;
         flex-direction: column;
@@ -1638,36 +1638,36 @@ select.codex-input {
         height: auto;
         min-height: var(--header-height);
     }
-    
+
     .header-title h1 {
         font-size: var(--fs-xl);
     }
-    
+
     .header-sidebar-toggle {
         width: 40px;
         height: 40px;
     }
-    
+
     .header-sidebar-toggle svg {
         width: 24px;
         height: 24px;
     }
-    
+
     .stats-bar {
         width: 100%;
         justify-content: space-around;
     }
-    
+
     .stat-item {
         padding: 8px 12px;
         min-width: auto;
         flex: 1;
     }
-    
+
     .stat-value {
         font-size: var(--fs-xl);
     }
-    
+
     .sidebar {
         top: 0;
         bottom: 0;
@@ -1701,12 +1701,12 @@ select.codex-input {
         align-items: stretch;
         gap: 12px;
     }
-    
+
     .toolbar-search {
         max-width: none;
         min-width: auto;
     }
-    
+
     .toolbar-actions {
         justify-content: center;
     }
@@ -1723,62 +1723,62 @@ select.codex-input {
     .character-create-row {
         grid-template-columns: 1fr;
     }
-    
+
     .inventory-grid {
         column-gap: 8px;
         padding: 12px;
     }
-    
+
     .item-info {
         padding: 4px 6px;
     }
-    
+
     .item-category {
         font-size: var(--fs-2xs);
     }
-    
+
     .modal-overlay {
         padding: 8px;
     }
-    
+
     .modal-panel {
         max-height: 95vh;
     }
-    
+
     .modal-header h2 {
         font-size: var(--fs-lg);
     }
-    
+
     .item-preview {
         min-height: 250px;
         padding: 16px;
     }
-    
 
-    
+
+
     .nav-btn {
         width: 40px;
         height: 40px;
     }
-    
+
     .nav-btn.left {
         left: 8px;
     }
-    
+
     .nav-btn.right {
         right: 8px;
     }
-    
+
     .modal-actions {
         padding: 12px;
     }
-    
+
     .modal-actions .codex-btn {
         min-width: 60px;
         padding: 10px 12px;
         font-size: var(--fs-xs);
     }
-    
+
     .batch-bar {
         left: 12px;
         right: 12px;
@@ -1786,12 +1786,12 @@ select.codex-input {
         bottom: 12px;
         padding: 10px 16px;
     }
-    
+
     .pagination-bar {
         gap: 12px;
         padding: 12px;
     }
-    
+
     .page-info {
         min-width: 80px;
         font-size: var(--fs-sm);
@@ -1803,11 +1803,11 @@ select.codex-input {
     :root {
         --slot-size: var(--slot-size-small);
     }
-    
+
     .inventory-grid {
         column-gap: 6px;
     }
-    
+
     .item-image {
         padding: 8px;
     }
@@ -1818,15 +1818,15 @@ select.codex-input {
     .item-slot:hover {
         transform: none;
     }
-    
+
     .item-slot:active {
         transform: scale(0.98);
     }
-    
+
     .codex-btn:hover {
         transform: none;
     }
-    
+
     .category-item:hover {
         background: rgba(var(--accent-rgb), 0.1);
         border-color: transparent;
@@ -1841,8 +1841,8 @@ select.codex-input {
 
 @supports (-webkit-touch-callout: none) {
     .inventory-grid {
-        
-        -webkit-overflow-scrolling: touch; 
+
+        -webkit-overflow-scrolling: touch;
     }
 
     .modal-content {
@@ -1873,7 +1873,7 @@ select.codex-input {
     align-items: center;
     justify-content: center;
     transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
-    box-shadow: 
+    box-shadow:
         0 4px 15px rgba(0, 0, 0, 0.4),
         inset 0 1px 0 rgba(255, 255, 255, 0.1),
         0 0 0 1px rgba(var(--accent-soft-rgb), 0.1);
@@ -1904,7 +1904,7 @@ select.codex-input {
 
 .theme-toggle:hover {
     border-color: var(--gold-primary);
-    box-shadow: 
+    box-shadow:
         0 8px 25px rgba(var(--accent-soft-rgb), 0.25),
         0 0 40px rgba(var(--accent-soft-rgb), 0.1),
         inset 0 1px 0 rgba(255, 255, 255, 0.15);
@@ -1980,7 +1980,7 @@ select.codex-input {
 [data-theme="light"] .theme-toggle {
     background: linear-gradient(145deg, #ffffff, #e8e5e0);
     border-color: #d1c4a8;
-    box-shadow: 
+    box-shadow:
         0 4px 15px rgba(0, 0, 0, 0.1),
         inset 0 1px 0 rgba(255, 255, 255, 0.9),
         0 0 0 1px rgba(184, 149, 78, 0.1);
@@ -1992,7 +1992,7 @@ select.codex-input {
 
 [data-theme="light"] .theme-toggle:hover {
     border-color: #b8954e;
-    box-shadow: 
+    box-shadow:
         0 8px 25px rgba(184, 149, 78, 0.2),
         0 0 40px rgba(184, 149, 78, 0.1),
         inset 0 1px 0 rgba(255, 255, 255, 0.9);
@@ -2438,7 +2438,7 @@ input, select, textarea {
     .theme-toggle {
         margin-left: 8px;
     }
-    
+
     .codex-header {
         padding: 12px 16px;
     }
@@ -2478,7 +2478,7 @@ input, select, textarea {
 
 
 @media (max-width: 768px) {
-    
+
     .modal-overlay {
         padding: 0;
         align-items: flex-start;
@@ -2491,13 +2491,13 @@ input, select, textarea {
         animation: none;
     }
 
-    
+
     .modal-panel form,
     .modal-panel .modal-pad {
         padding: 16px;
     }
 
-    
+
     .upload-area {
         padding: 20px !important;
     }
@@ -2511,7 +2511,7 @@ input, select, textarea {
         max-height: 120px;
     }
 
-    
+
     .modal-panel .mt-20 {
         margin-top: 12px;
     }
@@ -2520,13 +2520,13 @@ input, select, textarea {
         margin-top: 10px;
     }
 
-    
+
     .modal-footer-actions {
         margin-top: 16px !important;
         padding-top: 12px !important;
     }
 
-    
+
     .toolbar-search input {
         width: 100%;
         min-width: 0;
@@ -2558,7 +2558,7 @@ input, select, textarea {
         font-size: var(--fs-xs);
     }
 
-    
+
     .batch-file-list {
         grid-template-columns: repeat(auto-fill, minmax(60px, 1fr));
         max-height: 150px;
@@ -2569,12 +2569,12 @@ input, select, textarea {
         height: 50px;
     }
 
-    
+
     .modal-panel .upload-area {
         padding: 20px;
     }
 
-    
+
     .toast-notification {
         left: 12px;
         right: 12px;

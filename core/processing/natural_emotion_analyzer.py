@@ -19,6 +19,17 @@ from astrbot.api.event import AstrMessageEvent
 
 from ..search.text_similarity import calculate_hybrid_similarity, _has_negation_prefix
 
+
+def _inherit_series_provider(context: Any) -> str:
+    try:
+        if __package__ and __package__.count(".") >= 2:
+            from ...series_panels import inherit_provider
+        else:
+            from series_panels import inherit_provider
+    except ImportError:
+        return ""
+    return inherit_provider("", context, role="reply")
+
 # 标记：模型明确选择不发送，用于区分"LLM 异常"和"模型说 none"
 _EMOTION_ABSTAIN = object()
 
@@ -404,6 +415,13 @@ class NaturalEmotionAnalyzer:
         if configured_provider:
             logger.debug(f"[情绪分析] 尝试使用配置的提供商: {configured_provider}")
             return configured_provider
+
+        inherited_provider = _inherit_series_provider(
+            getattr(self.plugin, "context", None)
+        )
+        if inherited_provider:
+            logger.debug(f"[情绪分析] 继承群间系列默认模型: {inherited_provider}")
+            return inherited_provider
 
         # 2. 使用当前会话的模型
         try:
