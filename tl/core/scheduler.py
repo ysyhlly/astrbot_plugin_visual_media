@@ -571,13 +571,35 @@ class JobScheduler:
                 self._heartbeat_loop(), name="job-store-heartbeat"
             )
 
+    async def _prune_and_checkpoint(self, *, days: int = 30) -> None:
+        prune = getattr(self.store, "prune_jobs", None)
+        if callable(prune):
+            try:
+                cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+                pruned = await prune(cutoff, set(TERMINAL_STATES))
+                if pruned:
+                    logger.info("[v2] 已清理过期终态任务: count=%s", pruned)
+            except Exception as error:
+                logger.debug("[v2] 过期任务清理跳过: %s", _error_summary(error))
+        checkpoint = getattr(self.store, "checkpoint", None)
+        if callable(checkpoint):
+            try:
+                await checkpoint()
+            except Exception as error:
+                logger.debug("[v2] WAL checkpoint 跳过: %s", _error_summary(error))
+
     async def _heartbeat_loop(self) -> None:
+        last_maintenance = time.monotonic()
         try:
             while not self._closed:
                 await asyncio.sleep(self.heartbeat_interval)
                 if self._closed:
                     break
                 await self.store.heartbeat()
+                now_mono = time.monotonic()
+                if now_mono - last_maintenance >= 3600.0:
+                    await self._prune_and_checkpoint()
+                    last_maintenance = now_mono
         except asyncio.CancelledError:
             raise
         except BaseException as error:
@@ -1645,7 +1667,8 @@ class JobScheduler:
         return JobSnapshot.from_job(job) if job is not None else None
 
     async def recover(self) -> list[Job]:
-        """Expose JobStore owner recovery snapshots without replaying them."""
+        """Expose JobStore owner recovery snapshots and run retention maintenance."""
+        await self._prune_and_checkpoint()
         return await recoverable_jobs(self.store)
 
     async def close(self) -> None:

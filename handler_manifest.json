@@ -216,14 +216,14 @@
     "engine": "memes",
     "handler": "_start_joint_meme_prefetch",
     "decorators": [
-      "filter.on_llm_request(priority=4)"
+      "filter.on_llm_request(priority=5)"
     ]
   },
   {
     "engine": "memes",
     "handler": "_prepare_joint_meme_reply",
     "decorators": [
-      "filter.on_llm_request()"
+      "filter.on_llm_request(priority=1)"
     ]
   },
   {

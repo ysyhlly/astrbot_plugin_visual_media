@@ -31,6 +31,8 @@ TERMINAL_STATUSES = {
     "failed",
     "interrupted",
 }
+_FAILED_RETENTION_DAYS = 30
+_SAVE_DEBOUNCE_SECONDS = 0.25
 _KNOWN_SOURCES = {"command", "llm_tool", "llm_batch", "webui", "plugin"}
 _SAFE_FILE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 _PARAM_KEYS = (
@@ -338,6 +340,9 @@ class GenerationTracker:
         self._reference_leases: dict[str, set[str]] = {}
         self._pending_image_deletions: set[str] = set()
         self._lock = asyncio.Lock()
+        self._save_lock = threading.RLock()
+        self._save_dirty = False
+        self._save_task: asyncio.Task[None] | None = None
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
         self._closed = False
         self._jobs = self._load_jobs() if self.enabled else {}
@@ -388,19 +393,42 @@ class GenerationTracker:
     def _save_sync(self) -> None:
         if not self.enabled:
             return
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        temp_path = self.path.with_suffix(".json.tmp")
-        payload = json.dumps(
-            {"version": 1, "jobs": list(self._jobs.values())},
-            ensure_ascii=False,
-            indent=2,
-        )
-        temp_path.write_text(payload, encoding="utf-8")
-        os.replace(temp_path, self.path)
+        with self._save_lock:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            temp_path = self.path.with_suffix(".json.tmp")
+            payload = json.dumps(
+                {"version": 1, "jobs": list(self._jobs.values())},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            temp_path.write_text(payload, encoding="utf-8")
+            os.replace(temp_path, self.path)
+            self._save_dirty = False
 
-    async def _save(self) -> None:
+    async def _delayed_save(self) -> None:
+        try:
+            await asyncio.sleep(_SAVE_DEBOUNCE_SECONDS)
+            async with self._lock:
+                self._save_task = None
+                if self._save_dirty and self.enabled:
+                    await asyncio.to_thread(self._save_sync)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug(f"[生成历史] 异步落盘异常: {exc}")
+
+    async def _save(self, *, defer: bool = False) -> None:
         if not self.enabled:
             return
+        if defer and not self._closed:
+            self._save_dirty = True
+            if self._save_task is None or self._save_task.done():
+                self._save_task = asyncio.create_task(self._delayed_save())
+            return
+        pending = self._save_task
+        self._save_task = None
+        if pending is not None and not pending.done():
+            pending.cancel()
         await asyncio.to_thread(self._save_sync)
 
     def import_legacy(self, records: list[dict[str, Any]]) -> int:
@@ -462,9 +490,6 @@ class GenerationTracker:
 
     def _prune_locked(self) -> list[dict[str, Any]]:
         removed: list[dict[str, Any]] = []
-        if len(self._jobs) <= self.max_records:
-            return removed
-
         groups: dict[str, list[dict[str, Any]]] = {}
         for record in self._jobs.values():
             groups.setdefault(self._group_id(record), []).append(record)
@@ -474,19 +499,48 @@ class GenerationTracker:
             key=lambda group: str(group[0].get("created_at") or ""),
         )
         protected = self.protected_reference_names()
+        expired_cutoff = _now() - timedelta(days=_FAILED_RETENTION_DAYS)
+
         for group in ordered_groups:
-            if len(self._jobs) <= self.max_records:
-                break
             if any(record.get("status") in {"queued", "running"} for record in group):
+                continue
+            if any(record.get("shared") is True for record in group):
+                continue
+            if not all(
+                record.get("status") in {"failed", "interrupted"} for record in group
+            ):
                 continue
             if protected.intersection(
                 name for record in group for name in record.get("images") or []
             ):
                 continue
+            latest_ts: datetime | None = None
+            for record in group:
+                ts = _parse_timestamp(record.get("finished_at") or record.get("created_at"))
+                if ts is not None and (latest_ts is None or ts > latest_ts):
+                    latest_ts = ts
+            if latest_ts is None or latest_ts >= expired_cutoff:
+                continue
             for record in group:
                 removed_record = self._jobs.pop(str(record.get("job_id")), None)
                 if removed_record is not None:
                     removed.append(removed_record)
+
+        if len(self._jobs) > self.max_records:
+            for group in ordered_groups:
+                if len(self._jobs) <= self.max_records:
+                    break
+                if any(record.get("status") in {"queued", "running"} for record in group):
+                    continue
+                if protected.intersection(
+                    name for record in group for name in record.get("images") or []
+                ):
+                    continue
+                for record in group:
+                    removed_record = self._jobs.pop(str(record.get("job_id")), None)
+                    if removed_record is not None:
+                        removed.append(removed_record)
+
         if removed:
             names = {
                 str(name) for record in removed for name in (record.get("images") or [])
@@ -728,7 +782,7 @@ class GenerationTracker:
                 record["duration_ms"] = self._duration_ms(record, finished_at)
                 self._release_reference_lease(job_id)
             self._prune_locked()
-            await self._save()
+            await self._save(defer=record.get("status") not in TERMINAL_STATUSES)
             self._broadcast(record)
 
     async def complete(
@@ -1076,10 +1130,15 @@ class GenerationTracker:
             if self._closed:
                 return
             self._closed = True
+            pending = self._save_task
+            self._save_task = None
+            if pending is not None and not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
             changed = self._mark_running_interrupted()
             with self.gallery_lock:
                 self._reference_leases.clear()
-            await self._save()
+            await self._save(defer=False)
             for record in changed:
                 self._broadcast(record)
             self._broadcast_event({"type": "resync"})

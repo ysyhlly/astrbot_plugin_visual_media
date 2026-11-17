@@ -7,12 +7,7 @@ from typing import Any
 from PIL import Image
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.event.filter import (
-    EventMessageType,
-    PermissionType,
-    PlatformAdapterType,
-)
+from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Image as MessageImage
 from astrbot.api.star import Context
 from .runtime import Component
@@ -64,10 +59,11 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
     CAPACITY_CONTROL_INTERVAL_SECONDS = 60 * 60  # 60分钟
 
     # 超时和处理常量
-    IMAGE_PROCESSING_TIMEOUT_SECONDS = 120  # 图片处理超时时间（GIF动图处理需要更长时间）
+    IMAGE_PROCESSING_TIMEOUT_SECONDS = (
+        120  # 图片处理超时时间（GIF动图处理需要更长时间）
+    )
     MAX_SEARCH_RESULTS = 5  # 搜索表情包最大返回数量（避免 FC 输出过长）
     AUTO_EMOJI_COOLDOWN_SECONDS = 20  # 同一会话自动发表情的最短间隔
-
 
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -117,7 +113,9 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
         配置尚未初始化或属性不存在时抛出 AttributeError。
         """
         if name == "plugin_config":
-            raise AttributeError(f"'{type(self).__name__}' object has no attribute 'plugin_config'")
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute 'plugin_config'"
+            )
         cfg = self.__dict__.get("plugin_config")
         if cfg is not None and hasattr(cfg, name):
             return getattr(cfg, name)
@@ -143,7 +141,9 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
             setattr(self, key, value)
         final_prompts = self.plugin_config.get_prompts(prompts)
         self.image_processor_service.update_config(
-            emoji_classification_prompt=final_prompts.get("emoji_classification_prompt"),
+            emoji_classification_prompt=final_prompts.get(
+                "emoji_classification_prompt"
+            ),
             emoji_classification_with_filter_prompt=final_prompts.get(
                 "emoji_classification_with_filter_prompt"
             ),
@@ -218,15 +218,21 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
             errors.append("最大表情数量必须大于0的整数")
             fixed.append("最大表情数量已重置为100")
             fixed_values["max_reg_num"] = 100
-        if not isinstance(cfg.meme_chance, (int, float)) or not (0 <= cfg.meme_chance <= 1):
+        if not isinstance(cfg.meme_chance, (int, float)) or not (
+            0 <= cfg.meme_chance <= 1
+        ):
             errors.append("表情发送概率必须在0-1之间")
             fixed.append("表情发送概率已重置为0.4")
             fixed_values["meme_chance"] = 0.4
         if cfg.steal_mode not in ("probability", "cooldown"):
-            errors.append(f"偷图模式 '{cfg.steal_mode}' 无效，必须为 probability 或 cooldown")
+            errors.append(
+                f"偷图模式 '{cfg.steal_mode}' 无效，必须为 probability 或 cooldown"
+            )
             fixed.append("偷图模式已重置为 probability")
             fixed_values["steal_mode"] = "probability"
-        if not isinstance(cfg.steal_chance, (int, float)) or not (0 <= cfg.steal_chance <= 1):
+        if not isinstance(cfg.steal_chance, (int, float)) or not (
+            0 <= cfg.steal_chance <= 1
+        ):
             errors.append("偷图概率必须在0-1之间")
             fixed.append("偷图概率已重置为0.6")
             fixed_values["steal_chance"] = 0.6
@@ -236,7 +242,11 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
             fixed_values["steal_pool_capacity"] = 200
         source_limits = {
             "external_source_max_items": (1, 20_000, 2000),
-            "external_source_max_image_bytes": (1024, 1024 * 1024 * 1024, 32 * 1024 * 1024),
+            "external_source_max_image_bytes": (
+                1024,
+                1024 * 1024 * 1024,
+                32 * 1024 * 1024,
+            ),
             "external_source_max_archive_bytes": (
                 1024,
                 8 * 1024 * 1024 * 1024,
@@ -315,7 +325,10 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
                 moved_file = False
                 if in_old_dir:
                     target_path = new_dir / path_obj.name
-                    if target_path.exists() and target_path.resolve() != path_obj.resolve():
+                    if (
+                        target_path.exists()
+                        and target_path.resolve() != path_obj.resolve()
+                    ):
                         stem, suffix = target_path.stem, target_path.suffix
                         counter = 1
                         while target_path.exists():
@@ -323,7 +336,9 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
                             counter += 1
                     if path_obj.is_file() and target_path != path_obj:
                         try:
-                            await asyncio.to_thread(shutil.move, str(path_obj), str(target_path))
+                            await asyncio.to_thread(
+                                shutil.move, str(path_obj), str(target_path)
+                            )
                             moved_file = True
                         except OSError as exc:
                             logger.warning(f"旧分类图片迁移失败 {path_obj}: {exc}")
@@ -332,8 +347,12 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
                 updates = {"category": new_key}
                 if db:
                     if str(target_path) != str(path_obj) and moved_file:
-                        if not await db.move_path(str(path_obj), str(target_path), new_key, updates):
-                            await asyncio.to_thread(shutil.move, str(target_path), str(path_obj))
+                        if not await db.move_path(
+                            str(path_obj), str(target_path), new_key, updates
+                        ):
+                            await asyncio.to_thread(
+                                shutil.move, str(target_path), str(path_obj)
+                            )
                             await db.update_path(str(path_obj), updates)
                     else:
                         await db.update_path(str(path_obj), updates)
@@ -403,7 +422,9 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
         except Exception:
             return "", ""
 
-    def _is_action_enabled_for_event(self, action: str, event: AstrMessageEvent) -> bool:
+    def _is_action_enabled_for_event(
+        self, action: str, event: AstrMessageEvent
+    ) -> bool:
         """检查指定操作是否在当前事件中启用。"""
         if self.plugin_config is None:
             return True
@@ -427,7 +448,9 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
             return
         event_handler.begin_force_capture(event, seconds)
 
-    def get_force_capture_entry(self, event: AstrMessageEvent) -> dict[str, object] | None:
+    def get_force_capture_entry(
+        self, event: AstrMessageEvent
+    ) -> dict[str, object] | None:
         """委托给 EventHandler。"""
         event_handler = self._get_event_handler(
             log_message="event_handler 未初始化，无法获取强制接收状态",
@@ -461,7 +484,8 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
 
             cfg = self.plugin_config
             preset = cfg.SIM_WEIGHT_PRESETS.get(
-                getattr(cfg, "sim_weight_preset", "balanced"), cfg.SIM_WEIGHT_PRESETS["balanced"]
+                getattr(cfg, "sim_weight_preset", "balanced"),
+                cfg.SIM_WEIGHT_PRESETS["balanced"],
             )
             text_similarity.configure_similarity(
                 weights={
@@ -480,7 +504,9 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
         cfg = self.plugin_config
         final_prompts = cfg.get_prompts(
             {
-                "EMOJI_CLASSIFICATION_PROMPT": getattr(self, "EMOJI_CLASSIFICATION_PROMPT", None),
+                "EMOJI_CLASSIFICATION_PROMPT": getattr(
+                    self, "EMOJI_CLASSIFICATION_PROMPT", None
+                ),
                 "EMOJI_CLASSIFICATION_WITH_FILTER_PROMPT": getattr(
                     self, "EMOJI_CLASSIFICATION_WITH_FILTER_PROMPT", None
                 ),
@@ -490,7 +516,9 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
             categories=list(cfg.categories or []) or list(cfg.DEFAULT_CATEGORIES),
             content_filtration=cfg.content_filtration,
             vision_provider_id=self._load_vision_provider_id(),
-            emoji_classification_prompt=final_prompts.get("emoji_classification_prompt"),
+            emoji_classification_prompt=final_prompts.get(
+                "emoji_classification_prompt"
+            ),
             emoji_classification_with_filter_prompt=final_prompts.get(
                 "emoji_classification_with_filter_prompt"
             ),
@@ -501,7 +529,9 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
         if not config_dict:
             return False
         try:
-            if self.plugin_config is None or not self._apply_plugin_config_updates(config_dict):
+            if self.plugin_config is None or not self._apply_plugin_config_updates(
+                config_dict
+            ):
                 return False
             self._sync_image_processor_from_runtime()
             try:
@@ -604,7 +634,9 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
         page: str = "1",
     ):
         """列出已收集的表情包。用法: /meme list [分类] [每页数量] [页码]"""
-        async for result in self.image_commands.list_images(event, category, limit, page):
+        async for result in self.image_commands.list_images(
+            event, category, limit, page
+        ):
             yield result
 
     async def register_menu_interactions(self):
@@ -640,7 +672,9 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
         self, event: AstrMessageEvent, identifier: str = "", scope_mode: str = ""
     ):
         """设置表情包作用域。用法: /meme scope <序号|文件名> <public|local>"""
-        async for result in self.image_commands.set_image_scope(event, identifier, scope_mode):
+        async for result in self.image_commands.set_image_scope(
+            event, identifier, scope_mode
+        ):
             yield result
 
     async def rebuild_index(self, event: AstrMessageEvent):
@@ -648,7 +682,9 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
         async for result in self.index_commands.rebuild_index(event):
             yield result
 
-    async def search_meme(self, event: AstrMessageEvent, query: str, reply: str = "", character: str = ""):
+    async def search_meme(
+        self, event: AstrMessageEvent, query: str, reply: str = "", character: str = ""
+    ):
         """搜索表情包并返回编号、图上文字、角色和适合回应的场景。
 
         聊天中想表达情绪、接梗或自然回应时可主动使用。
@@ -744,15 +780,16 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
         if selector is None:
             return
         for item in messages:
-            if not isinstance(item, dict) or str(item.get("type", "")).lower() != "image":
+            if (
+                not isinstance(item, dict)
+                or str(item.get("type", "")).lower() != "image"
+            ):
                 continue
             image_path = str(item.get("path", "") or "").strip()
             if not image_path:
                 continue
             try:
-                await selector.record_emoji_usage(
-                    image_path, trigger="generic_tool"
-                )
+                await selector.record_emoji_usage(image_path, trigger="generic_tool")
             except Exception as exc:
                 logger.warning(f"[Stealer] 通用消息工具的图片计数失败: {exc}")
         logger.debug("[Stealer] LLM 已通过通用消息工具发送图片，跳过本轮被动表情")
@@ -787,7 +824,11 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
         user_message = ""
         try:
             original_text = getattr(event, "_cd_original_user_text_v1", None)
-            user_message = original_text if isinstance(original_text, str) else event.get_message_str() or ""
+            user_message = (
+                original_text
+                if isinstance(original_text, str)
+                else event.get_message_str() or ""
+            )
         except Exception:
             pass
         task = self._safe_create_task(
@@ -806,13 +847,16 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
     def _response_chain_has_image(response: Any) -> bool:
         chain = getattr(response, "result_chain", None)
         components = getattr(chain, "chain", chain if isinstance(chain, list) else [])
-        return any(isinstance(component, MessageImage) for component in components or [])
+        return any(
+            isinstance(component, MessageImage) for component in components or []
+        )
 
-    def start_joint_reply_prefetch(self,event):
+    def start_joint_reply_prefetch(self, event):
         from .core.tools.joint_prefetch import start_joint_prefetch
-        return start_joint_prefetch(self,event)
 
-    async def _start_joint_meme_prefetch(self,event: AstrMessageEvent,req):
+        return start_joint_prefetch(self, event)
+
+    async def _start_joint_meme_prefetch(self, event: AstrMessageEvent, req):
         # Mandatory request guards run first; LM's heavier priority-3 hook follows.
         self.start_joint_reply_prefetch(event)
 
@@ -828,7 +872,10 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
         """
 
         role = str(getattr(response, "role", "assistant") or "assistant").lower()
-        if self._emoji_sender_engine.is_command_event(event) or role not in {"", "assistant"}:
+        if self._emoji_sender_engine.is_command_event(event) or role not in {
+            "",
+            "assistant",
+        }:
             self._emoji_sender_engine.invalidate_auto_emoji_source(event)
             return False
         if getattr(response, "tools_call_args", None):
@@ -845,8 +892,9 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
         result = event.get_result()
         if result is None:
             return False
-        if (self._emoji_sender_engine.is_command_event(event)
-                or not self._emoji_sender_engine.is_llm_reply_result(result)):
+        if self._emoji_sender_engine.is_command_event(
+            event
+        ) or not self._emoji_sender_engine.is_llm_reply_result(result):
             self._emoji_sender_engine.invalidate_auto_emoji_source(event)
             return False
         if any(isinstance(comp, MessageImage) for comp in getattr(result, "chain", [])):
@@ -875,9 +923,8 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
             self.plugin_config.ensure_base_dirs()
             await self._migrate_legacy_category_storage()
             self.plugin_config.ensure_category_dirs(
-                list(self.plugin_config.categories or []) or list(
-                    self.plugin_config.DEFAULT_CATEGORIES
-                )
+                list(self.plugin_config.categories or [])
+                or list(self.plugin_config.DEFAULT_CATEGORIES)
             )
             await self.source_service.initialize()
             await self.image_processor_service._auto_migrate_categories()
@@ -887,7 +934,9 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
                 prompts_path = plugin_dir / "prompts.json"
                 if prompts_path.exists():
                     if aiofiles:
-                        async with aiofiles.open(prompts_path, encoding="utf-8-sig") as f:
+                        async with aiofiles.open(
+                            prompts_path, encoding="utf-8-sig"
+                        ) as f:
                             content = await f.read()
                         content = content.lstrip("\ufeff")
                         prompts = json.loads(content)
@@ -905,18 +954,22 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
             self.maintenance.start_periodic_tasks()
             await self.event_handler.start_background_workers()
             from .core.processing.pending_analysis_worker import PendingAnalysisWorker
+
             self.pending_analysis_worker = PendingAnalysisWorker(self)
             await self.pending_analysis_worker.start()
 
             # 初始化嵌入向量服务 + 回填旧数据（仅在开启嵌入检索时）
             if self.plugin_config.enable_embedding_search:
                 try:
-                    smart_service = getattr(self.meme_selector, "_smart_select_service", None)
+                    smart_service = getattr(
+                        self.meme_selector, "_smart_select_service", None
+                    )
                     if smart_service and smart_service._embedding_service:
                         # Initialization probes the actual output dimension and
                         # queues existing paths for the durable refresh worker.
                         self.task_scheduler.create_task(
-                            'embedding_initialize', smart_service._embedding_service.initialize(),
+                            "embedding_initialize",
+                            smart_service._embedding_service.initialize(),
                         )
                 except Exception as e:
                     logger.warning(f"[Embedding] 初始化失败: {e}")
@@ -932,7 +985,7 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
         if self._terminated:
             return
         self._terminated = True
-        for prefetch in tuple(getattr(self,"_joint_reply_prefetches",())):
+        for prefetch in tuple(getattr(self, "_joint_reply_prefetches", ())):
             await prefetch.close()
         await self.menu_commands.aclose()
         await self.index_manager.stop_search_worker()

@@ -214,8 +214,26 @@ class EmbeddingService:
             self.invalidate_cache()
             db = getattr(self.plugin, 'db_service', None)
             if db is not None:
-                db.enqueue_search_refresh(db.get_all_paths())
+                self._schedule_db_refresh(db)
             raise ValueError('嵌入输出维度已变化，已安排后台重建')
+
+    def _schedule_db_refresh(self, db: Any) -> None:
+        """Queue full search refresh off the event loop when a loop is running."""
+        if db is None:
+            return
+
+        def _enqueue() -> None:
+            try:
+                db.enqueue_search_refresh(db.get_all_paths())
+            except Exception as exc:
+                logger.debug(f"[Embedding] 后台重建排队跳过: {exc}")
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _enqueue()
+            return
+        loop.create_task(asyncio.to_thread(_enqueue))
 
     def warning_rate_limited(self, key: str, message: str, interval: float | None = None) -> None:
         """同一 key 的 WARN 在窗口期内只输出一次，避免供应商故障时刷屏。"""
@@ -226,6 +244,17 @@ class EmbeddingService:
             return
         self._warning_log_at[key] = now
         logger.warning(message)
+
+    async def _close_retired_faiss(self) -> None:
+        if not self._retired_faiss:
+            return
+        retired = list(self._retired_faiss)
+        self._retired_faiss.clear()
+        for client in retired:
+            try:
+                await client.close()
+            except Exception:
+                pass
 
     def _retire_faiss(self):
         if self._faiss_db is not None:
@@ -240,8 +269,10 @@ class EmbeddingService:
                 return
             identity = self._provider_identity(provider)
             if identity == self._observed_identity and self._observed_dim:
+                await self._close_retired_faiss()
                 return
             self._retire_faiss()
+            await self._close_retired_faiss()
             self.invalidate_cache()
             await EmbeddingProviderAdapter(self, provider).get_embedding('表情包')
             if self._provider_identity(provider) != identity:
@@ -306,7 +337,7 @@ class EmbeddingService:
             if needs_backfill:
                 db = getattr(self.plugin, 'db_service', None)
                 if db is not None:
-                    db.enqueue_search_refresh(db.get_all_paths())
+                    self._schedule_db_refresh(db)
             self._faiss_available = True
             logger.info(f"[Embedding] FaissVecDB 就绪 (dim={self._provider_dim})")
             return True
@@ -537,7 +568,16 @@ class EmbeddingService:
         db = getattr(self.plugin, "db_service", None)
         if db and hasattr(db, "delete_embedding"):
             await asyncio.to_thread(db.delete_embedding, path)
-            self._fallback_loaded = False
+            if self._fallback_loaded:
+                key = str(path)
+                if self._fallback_paths and key in self._fallback_paths:
+                    idx = self._fallback_paths.index(key)
+                    self._fallback_paths.pop(idx)
+                    if not self._fallback_paths:
+                        self._fallback_matrix = None
+                        self._fallback_dim = 0
+                    elif self._fallback_matrix is not None:
+                        self._fallback_matrix = np.delete(self._fallback_matrix, idx, axis=0)
             return True
         return False
 
@@ -570,7 +610,24 @@ class EmbeddingService:
                 return False
             await asyncio.to_thread(db.upsert_embedding, path, values.tobytes(),
                                     dim=len(values), model_sig=signature)
-            self._fallback_loaded = False  # 下次 search 时重载
+            if self._fallback_loaded and self._fallback_model_sig == signature:
+                norm = float(np.linalg.norm(values))
+                unit = values / (norm if norm != 0.0 else 1.0)
+                key = str(path)
+                if self._fallback_matrix is None or not self._fallback_paths:
+                    self._fallback_matrix = unit.reshape(1, -1)
+                    self._fallback_paths = [key]
+                    self._fallback_dim = len(values)
+                elif self._fallback_matrix.shape[1] == len(values):
+                    if key in self._fallback_paths:
+                        self._fallback_matrix[self._fallback_paths.index(key)] = unit
+                    else:
+                        self._fallback_matrix = np.vstack([self._fallback_matrix, unit.reshape(1, -1)])
+                        self._fallback_paths.append(key)
+                else:
+                    self._fallback_loaded = False
+            else:
+                self._fallback_loaded = False  # 模型签名变化或尚未加载时触发重载
             return True
         except Exception as e:
             logger.debug(f"[Embedding] upsert_embedding 失败: {e}")
@@ -689,7 +746,13 @@ class EmbeddingService:
                 return []
 
             scores = self._fallback_matrix @ qv
-            top_idx = np.argsort(scores)[::-1][:k]
+            if k <= 0 or len(scores) == 0:
+                return []
+            if len(scores) > k:
+                cand_idx = np.argpartition(scores, -k)[-k:]
+                top_idx = cand_idx[np.argsort(scores[cand_idx])[::-1]]
+            else:
+                top_idx = np.argsort(scores)[::-1]
 
             results: list[tuple[str, float]] = []
             for idx in top_idx:

@@ -283,28 +283,116 @@ class MediaLibrary:
             from types import SimpleNamespace
             audit_event = SimpleNamespace(unified_msg_origin='dashboard:visual_media', message_str='')
 
+        def _pending_checks():
+            pending = getattr(self, "_check_tasks", None)
+            if pending is None:
+                pending = set()
+                self._check_tasks = pending
+            return pending
+
+        async def _notify_mismatch(check):
+            if event is None or getattr(self.owner, "_closed", False):
+                return
+            if getattr(getattr(self.owner, "behavior", None), "stop_sends", False):
+                return
+            target = str(getattr(event, "unified_msg_origin", "") or "").strip()
+            context = getattr(self.owner, "context", None)
+            send_fn = getattr(context, "send_message", None)
+            if not target or not callable(send_fn):
+                return
+            issues = [str(x).strip() for x in (check.get("issues") or []) if str(x).strip()]
+            detail = "；".join(issues) if issues else str(check.get("reason") or "部分细节不一致")
+            notice = f"角色形象核对提醒：{detail}。已发送的图片保留供查看，尚未自动重画。"
+            try:
+                from astrbot.api.event import MessageChain
+                from astrbot.core.platform.message_session import MessageSession
+
+                session = MessageSession.from_str(target)
+                await asyncio.wait_for(
+                    send_fn(session, MessageChain().message(notice)),
+                    timeout=15,
+                )
+            except Exception as exc:
+                logger.debug(f"[VisualMedia] 角色核对差异提醒发送失败: {exc}")
+
+        async def _run_post_delivery_check(result):
+            from .character_check import check_character
+
+            task_key = result.get("task_id")
+            try:
+                check = await check_character(
+                    self.owner,
+                    profile,
+                    result.get("image_paths") or [],
+                    refs,
+                    prompt,
+                    event,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(f"[VisualMedia] 后台角色核对异常: {exc}")
+                return
+            if tasks and task_key:
+                fields = {"check": check}
+                if event is None:
+                    fields["stage"] = "ready"
+                await tasks.observe(task_key, fields)
+            if behavior:
+                await behavior.arecord(
+                    audit_event,
+                    "character_check",
+                    check["status"],
+                    "reference_comparison",
+                    {
+                        "character": character,
+                        "task_id": result.get("task_id", ""),
+                        **check,
+                    },
+                )
+            if check.get("status") == "mismatch":
+                await _notify_mismatch(check)
+
         async def completed(result):
             success = result.get("status") in {"succeeded", "partial_success"}
-            task_key = result.get('task_id')
-            if tasks and task_key:
-                await tasks.observe(task_key,{'job_id':result.get('job_id',''),'stage':'checking' if success else 'generation_failed'})
+            task_key = result.get("task_id")
             if behavior:
-                await behavior.arecord(audit_event, 'generate', 'generated' if success else 'failed', 'character_generation', {'character':character,'task_id':result.get('task_id',''),'reference_count':len(refs)})
-            check = None
-            if success:
-                from .character_check import check_character
-                check = await check_character(self.owner, profile, result.get('image_paths') or [], refs, prompt, event)
-                if tasks and task_key:
-                    await tasks.observe(task_key,{'check':check,'stage':'ready'})
-                if behavior:
-                    await behavior.arecord(audit_event, 'character_check', check['status'], 'reference_comparison', {'character':character,'task_id':result.get('task_id',''),**check})
+                await behavior.arecord(
+                    audit_event,
+                    "generate",
+                    "generated" if success else "failed",
+                    "character_generation",
+                    {
+                        "character": character,
+                        "task_id": result.get("task_id", ""),
+                        "reference_count": len(refs),
+                    },
+                )
             if event is None:
+                if tasks and task_key:
+                    await tasks.observe(
+                        task_key,
+                        {
+                            "job_id": result.get("job_id", ""),
+                            "stage": "ready" if success else "generation_failed",
+                        },
+                    )
+                if success:
+                    task = asyncio.create_task(_run_post_delivery_check(result))
+                    pending = _pending_checks()
+                    pending.add(task)
+                    task.add_done_callback(pending.discard)
                 return
-            text = result.get('text_content') or ''
-            if check and check['status'] == 'mismatch':
-                text += '\n角色形象核对发现差异：' + '；'.join(check['issues']) + '。此图保留供查看，尚未自动重画。'
-            elif check and check['status'] == 'unknown':
-                text += '\n角色形象自动核对未能确认一致。'
+
+            if tasks and task_key:
+                await tasks.observe(
+                    task_key,
+                    {
+                        "job_id": result.get("job_id", ""),
+                        "stage": "delivering" if success else "generation_failed",
+                    },
+                )
+            text = result.get("text_content") or ""
             payload = (
                 (
                     result.get("image_urls") or [],
@@ -315,14 +403,26 @@ class MediaLibrary:
                 if success
                 else result.get("error") or "图片生成失败"
             )
-            if tasks and task_key and success:
-                await tasks.observe(task_key,{'stage':'delivering'})
             delivered = await dispatch_generation_result(
-                generation, event, success, payload, scene="character", notify_llm=True,
-                task_id=result.get('task_id') or None,
+                generation,
+                event,
+                success,
+                payload,
+                scene="character",
+                notify_llm=True,
+                task_id=result.get("task_id") or None,
             )
             if tasks and task_key and success:
-                await tasks.observe(task_key,{'stage':'delivered' if delivered else 'delivery_failed'})
+                await tasks.observe(
+                    task_key,
+                    {"stage": "delivered" if delivered else "delivery_failed"},
+                )
+            if success:
+                # Run character verification after image delivery so extra vision latency never blocks output.
+                task = asyncio.create_task(_run_post_delivery_check(result))
+                pending = _pending_checks()
+                pending.add(task)
+                task.add_done_callback(pending.discard)
 
         completed._visual_callback_timeout = 180
 
@@ -361,3 +461,14 @@ class MediaLibrary:
             "status": "queued",
             "message": "角色图已提交，可在创作台查看进度。",
         }
+
+    async def close(self):
+        pending = getattr(self, "_check_tasks", None)
+        if not pending:
+            return
+        tasks = [task for task in list(pending) if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        pending.clear()

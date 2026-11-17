@@ -33,6 +33,18 @@ def parse_check_response(raw, checked, total, references):
             'checked_images':checked, 'total_images':total, 'reference_count':references}
 
 
+def _vlm_service(owner):
+    cached = getattr(owner, '_character_check_vlm', None)
+    if cached is not None and getattr(cached, 'memes', None) is owner.memes:
+        return cached
+    service = VLMCallService(owner.memes)
+    try:
+        owner._character_check_vlm = service
+    except Exception:
+        pass
+    return service
+
+
 async def check_character(owner, profile, paths, refs, prompt, event=None):
     settings = MediaSettings.parse(getattr(owner, 'raw_config', {}).get('media', {}))
     unknown = {'status':'unknown', 'issues':[], 'reason':'check_unavailable'}
@@ -55,7 +67,7 @@ async def check_character(owner, profile, paths, refs, prompt, event=None):
         + json.dumps({'character':profile['name'], 'appearance':profile['appearance'], 'request':prompt[:4000]}, ensure_ascii=False)
     )
     try:
-        provider = settings.character_check_provider or await VLMCallService(owner.memes)._resolve_vision_provider(event)
+        provider = settings.character_check_provider or await _vlm_service(owner)._resolve_vision_provider(event)
         if not provider:
             return {**unknown, 'reason':'vision_provider_unconfigured'}
         response = await asyncio.wait_for(model_request_gate(owner.memes).call(

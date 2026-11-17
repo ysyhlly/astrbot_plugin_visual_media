@@ -1,4 +1,5 @@
 """Validated options for the integrated behavior layer; defaults preserve 0.3."""
+
 from dataclasses import asdict, dataclass, fields
 
 
@@ -24,16 +25,21 @@ class MediaSettings:
         raw = raw if isinstance(raw, dict) else {}
         defaults = asdict(cls())
         bounds = {
-            'repeat_window_seconds': (0, 86400), 'recent_receipts': (1, 100),
-            'less_interval_seconds': (0, 3600), 'similar_distance': (0, 32),
-            'record_retention_days': (1, 365), 'max_records': (100, 50000),
-            'character_check_timeout': (5, 120), 'character_check_max_images': (1, 4),
+            "repeat_window_seconds": (0, 86400),
+            "recent_receipts": (1, 100),
+            "less_interval_seconds": (0, 3600),
+            "similar_distance": (0, 32),
+            "record_retention_days": (1, 365),
+            "max_records": (100, 50000),
+            "character_check_timeout": (5, 120),
+            "character_check_max_images": (1, 4),
         }
         for field in fields(cls):
             key = field.name
             value = raw.get(key, defaults[key])
             if isinstance(defaults[key], bool):
-                if type(value) is bool: defaults[key] = value
+                if type(value) is bool:
+                    defaults[key] = value
             elif key in bounds:
                 if type(value) is int:
                     lower, upper = bounds[key]

@@ -58,9 +58,9 @@ if _qualified_tl not in sys.modules:
     _package.__path__ = [str(Path(__file__).resolve().parents[1] / "tl")]
     sys.modules[_qualified_tl] = _package
 
-from astrbot_plugin_visual_media.media_behavior import MediaBehavior
-from astrbot_plugin_visual_media.media_library import MediaLibrary
-from astrbot_plugin_visual_media.media_tasks import MediaTasks
+from astrbot_plugin_visual_media.media_behavior import MediaBehavior  # noqa: E402
+from astrbot_plugin_visual_media.media_library import MediaLibrary  # noqa: E402
+from astrbot_plugin_visual_media.media_tasks import MediaTasks  # noqa: E402
 
 
 def test_sqlite_stores_enable_wal_and_busy_timeout(tmp_path: Path):

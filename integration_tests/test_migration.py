@@ -89,30 +89,46 @@ def test_migration_uses_sqlite_backup_for_wal(tmp_path):
         db.close()
 
 
-def test_failed_config_publish_preserves_sources_and_allows_retry(tmp_path,monkeypatch):
+def test_failed_config_publish_preserves_sources_and_allows_retry(
+    tmp_path, monkeypatch
+):
     import os
-    data,config=fixture(tmp_path);before=snapshot(data)
-    target=tmp_path/'new';config_target=tmp_path/'new_config.json'
-    real_link=os.link
-    def broken(*args,**kwargs):raise OSError('simulated config publish failure')
-    monkeypatch.setattr(os,'link',broken)
-    with pytest.raises(OSError,match='publish'):migrate(data,config,target,config_target)
-    assert snapshot(data)==before and not target.exists() and not config_target.exists()
-    assert not list(tmp_path.glob('.visual-migrate-*'))
-    monkeypatch.setattr(os,'link',real_link)
-    migrate(data,config,target,config_target)
+
+    data, config = fixture(tmp_path)
+    before = snapshot(data)
+    target = tmp_path / "new"
+    config_target = tmp_path / "new_config.json"
+    real_link = os.link
+
+    def broken(*args, **kwargs):
+        raise OSError("simulated config publish failure")
+
+    monkeypatch.setattr(os, "link", broken)
+    with pytest.raises(OSError, match="publish"):
+        migrate(data, config, target, config_target)
+    assert (
+        snapshot(data) == before and not target.exists() and not config_target.exists()
+    )
+    assert not list(tmp_path.glob(".visual-migrate-*"))
+    monkeypatch.setattr(os, "link", real_link)
+    migrate(data, config, target, config_target)
     assert target.exists() and config_target.exists()
 
 
-def test_migration_does_not_overwrite_racing_config(tmp_path,monkeypatch):
+def test_migration_does_not_overwrite_racing_config(tmp_path, monkeypatch):
     import os
-    data,config=fixture(tmp_path)
-    target=tmp_path/'new';config_target=tmp_path/'new_config.json'
-    real_link=os.link
-    def racing(src,dst):
-        config_target.write_text('concurrent owner')
-        return real_link(src,dst)
-    monkeypatch.setattr(os,'link',racing)
-    with pytest.raises(FileExistsError):migrate(data,config,target,config_target)
-    assert config_target.read_text()=='concurrent owner'
+
+    data, config = fixture(tmp_path)
+    target = tmp_path / "new"
+    config_target = tmp_path / "new_config.json"
+    real_link = os.link
+
+    def racing(src, dst):
+        config_target.write_text("concurrent owner")
+        return real_link(src, dst)
+
+    monkeypatch.setattr(os, "link", racing)
+    with pytest.raises(FileExistsError):
+        migrate(data, config, target, config_target)
+    assert config_target.read_text() == "concurrent owner"
     assert not target.exists()

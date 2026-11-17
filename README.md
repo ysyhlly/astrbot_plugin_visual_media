@@ -4,11 +4,11 @@
 
 将表情包收集、检索、发送、图片生成和角色参考管理整合为一个 AstrBot 插件。
 
-**当前版本：0.5.0-beta.1.worldrefs.1，私有测试版，暂不公开发布。** 不依赖旧表情包小偷或旧 Gemini 生图插件，也不要求安装 Chat Dynamics。安装 Chat Dynamics 后可在其允许回复的回合里统一选择文字、表情或生图。
+**发布候选：`0.5.0-rc.1`。** 不依赖旧表情包小偷或旧 Gemini 生图插件，也不要求安装 Chat Dynamics。安装 Chat Dynamics 后可在其允许回复的回合里统一选择文字、表情或生图。
 
 ## 参考图与任务体验
 
-新增可视化参考图选择、统一任务卡及失败恢复。详情见 [使用说明](docs/TASKS-AND-REFERENCES.md)。保留现有角色参考联动；本版仍为私有测试版。
+新增可视化参考图选择、统一任务卡及失败恢复。详情见 [使用说明](docs/TASKS-AND-REFERENCES.md)。保留现有角色参考联动。
 
 ## 安装要求与验证范围
 
@@ -19,7 +19,7 @@
 
 ## 首次安装
 
-1. 在 AstrBot 插件管理中上传私有 `*-install.zip`。
+1. 在 AstrBot 插件管理中上传安装归档（`astrbot_plugin_visual_media-*-install.zip`）。
 2. 若仍启用了旧的 `astrbot_plugin_stealer` 或 `astrbot_plugin_gemini_image_generation`，先禁用旧插件再启用本插件，避免重复命令和工具注册。旧数据迁移见后文。
 3. 打开插件配置，根据需要完成下表。没有配置生成供应商时控制台显示“待配置”，并不代表插件启动失败。
 4. 打开“视觉工坊”页面，分别检查表情图库、生图创作和角色形象。默认没有个人角色档案、参考图或聊天数据。

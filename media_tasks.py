@@ -32,6 +32,8 @@ class MediaTasks:
         self.path = Path(owner.generation._plugin_data_dir) / "media_tasks.sqlite3"
         self.lock = asyncio.Lock()
         self.closed = False
+        now = time.time()
+        self._last_prune_at = 0.0
         with self._connect() as db, db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=NORMAL")
@@ -40,6 +42,11 @@ class MediaTasks:
             )
             db.execute(
                 "CREATE TABLE IF NOT EXISTS operations (token TEXT PRIMARY KEY, job TEXT, action TEXT, status TEXT, result TEXT, created REAL)"
+            )
+            db.execute("CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(updated)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_operations_created ON operations(created)")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_job_id ON tasks(json_extract(data, '$.job_id'))"
             )
             db.execute(
                 "UPDATE operations SET status='uncertain' WHERE status='running'"
@@ -55,6 +62,13 @@ class MediaTasks:
                     db.execute(
                         "UPDATE tasks SET data=? WHERE key=?", (json.dumps(data), key)
                     )
+            self._prune_expired(db, now)
+
+    @staticmethod
+    def _prune_expired(db, now: float) -> None:
+        cutoff = now - 90 * 86400
+        db.execute("DELETE FROM operations WHERE created<?", (cutoff,))
+        db.execute("DELETE FROM tasks WHERE updated<?", (cutoff,))
 
     @contextmanager
     def _connect(self):
@@ -63,6 +77,8 @@ class MediaTasks:
             yield db
 
     def _update(self, key, fields, defaults=False):
+        now = time.time()
+        mono = time.monotonic()
         with self._connect() as db, db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT data FROM tasks WHERE key=?", (key,)).fetchone()
@@ -70,12 +86,11 @@ class MediaTasks:
             data = {**fields, **old} if defaults else {**old, **fields}
             db.execute(
                 "INSERT OR REPLACE INTO tasks VALUES (?,?,?)",
-                (key, json.dumps(data, ensure_ascii=False), time.time()),
+                (key, json.dumps(data, ensure_ascii=False), now),
             )
-            db.execute(
-                "DELETE FROM operations WHERE created<?", (time.time() - 90 * 86400,)
-            )
-            db.execute("DELETE FROM tasks WHERE updated<?", (time.time() - 90 * 86400,))
+            if mono - getattr(self, "_last_prune_at", 0.0) >= 300.0:
+                self._prune_expired(db, now)
+                self._last_prune_at = mono
             return data
 
     async def update(self, key, fields, *, defaults=False):
@@ -102,6 +117,32 @@ class MediaTasks:
                 for key, raw, updated in db.execute(
                     "SELECT key,data,updated FROM tasks"
                 )
+            }
+
+    def _for_jobs(self, job_ids, task_ids=()):
+        wanted_jobs = tuple(dict.fromkeys(str(j) for j in job_ids if j))
+        wanted_tasks = tuple(dict.fromkeys(str(t) for t in task_ids if t))
+        if not wanted_jobs and not wanted_tasks:
+            return {}
+        clauses = []
+        params = []
+        if wanted_jobs:
+            job_keys = [f"job:{j}" for j in wanted_jobs]
+            placeholders_keys = ",".join("?" for _ in job_keys)
+            placeholders_jobs = ",".join("?" for _ in wanted_jobs)
+            clauses.append(f"key IN ({placeholders_keys})")
+            params.extend(job_keys)
+            clauses.append(f"json_extract(data, '$.job_id') IN ({placeholders_jobs})")
+            params.extend(wanted_jobs)
+        if wanted_tasks:
+            placeholders_tasks = ",".join("?" for _ in wanted_tasks)
+            clauses.append(f"key IN ({placeholders_tasks})")
+            params.extend(wanted_tasks)
+        sql = "SELECT key,data,updated FROM tasks WHERE " + " OR ".join(clauses)
+        with self._connect() as db:
+            return {
+                key: {**json.loads(raw), "_updated": updated}
+                for key, raw, updated in db.execute(sql, params)
             }
 
     @staticmethod
@@ -327,15 +368,22 @@ class MediaTasks:
     async def listing(self, page=1, size=20):
         rows = self.owner.generation.generation_tracker.records_snapshot()
         rows.sort(key=lambda r: str(r.get("created_at", "")), reverse=True)
+        page_rows = rows[(page - 1) * size : page * size]
+        page_job_ids = [r["job_id"] for r in page_rows if r.get("job_id")]
         backgrounds = (
             await self.owner.generation.background_task_manager.snapshot_records()
         )
-        meta = await asyncio.to_thread(self._all)
+        bg_task_ids = [
+            b["task_id"]
+            for b in backgrounds
+            if b.get("task_id") and b.get("job_id") in set(page_job_ids)
+        ]
+        meta = await asyncio.to_thread(self._for_jobs, page_job_ids, bg_task_ids)
 
         def project():
             by_background, by_metadata = self._by_job(backgrounds, meta)
             cards = []
-            for row in rows[(page - 1) * size : page * size]:
+            for row in page_rows:
                 bg, extra, _ = self._select(
                     row["job_id"], meta, by_background, by_metadata
                 )

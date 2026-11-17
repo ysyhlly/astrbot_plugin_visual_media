@@ -13,7 +13,7 @@ ensure_current(
         ("media_library", "MediaLibrary", "_rebuild_public_ref_cache"),
         ("media_behavior", "MediaBehavior", "records"),
     ],
-    version="0.5.0-beta.1.worldrefs.2.reliability.1.memenotes.1.warnfix.1",
+    version="0.5.0-rc.1",
 )
 
 import threading
@@ -90,28 +90,36 @@ class VisualMediaPlugin(Star):
                 ConfigSection(self.raw_config, "generation", self._config_save_lock),
             )
             self.library = MediaLibrary(self)
-            self.behavior = await asyncio.to_thread(MediaRuntime, self.generation._plugin_data_dir, lambda: self.raw_config.get('media', {}))
+            self.behavior = await asyncio.to_thread(
+                MediaRuntime,
+                self.generation._plugin_data_dir,
+                lambda: self.raw_config.get("media", {}),
+            )
             self.memes.media_behavior = self.behavior
             self.generation.media_behavior = self.behavior
             self.tasks = await asyncio.to_thread(MediaTasks, self)
             self.media_api = MediaAPI(self)
             self.media_api.register(self.engine_context)
             from .series_panels import register_series_panels
-            register_series_panels(self,'astrbot_plugin_visual_media')
+
+            register_series_panels(self, "astrbot_plugin_visual_media")
             logger.info("[VisualMedia] Meme and generation engines initialized")
         except BaseException:
             await self.terminate()
             raise
 
     async def terminate(self):
-        panel=getattr(self,'_series_panels',None)
-        if panel:panel.close()
+        panel = getattr(self, "_series_panels", None)
+        if panel:
+            panel.close()
         if self._closed:
             return
         self._closed = True
-        if getattr(self, 'tasks', None) is not None:
+        if getattr(self, "library", None) is not None:
+            await self.library.close()
+        if getattr(self, "tasks", None) is not None:
             await self.tasks.close()
-        if getattr(self, 'behavior', None) is not None:
+        if getattr(self, "behavior", None) is not None:
             self.behavior.stop_sends = True
         # Stop generation before closing the library that may receive its output.
         try:
@@ -122,7 +130,7 @@ class VisualMediaPlugin(Star):
                     except Exception:
                         logger.exception("[VisualMedia] Engine shutdown failed")
         finally:
-            if getattr(self, 'behavior', None) is not None:
+            if getattr(self, "behavior", None) is not None:
                 await self.behavior.close()
             self.engine_context.release()
 
@@ -131,11 +139,114 @@ class VisualMediaPlugin(Star):
 
     def get_world_reference_access(self, directory):
         from .world_reference_access import status
-        return status(self,directory)
+
+        return status(self, directory)
 
     def grant_world_reference_access(self, directory):
         from .world_reference_access import grant
-        return grant(self,directory)
+
+        return grant(self, directory)
+
+    def add_reference_allowed_dir(self, directory: str) -> bool:
+        """Persist an allowed local reference directory using public plugin locking."""
+        import copy
+
+        target = str(directory or "").strip()
+        if not target:
+            raise ValueError("Directory cannot be empty")
+        with self._config_save_lock:
+            save = getattr(self.raw_config, "save_config", None)
+            if not callable(save):
+                raise ValueError("Host configuration cannot be saved")
+            generation = self.raw_config.setdefault("generation", {})
+            previous = copy.deepcopy(generation.get("image_generation_settings", {}))
+            updated = copy.deepcopy(previous)
+            dirs = list(
+                dict.fromkeys(
+                    [*updated.get("llm_tool_reference_allowed_dirs", []), target]
+                )
+            )
+            updated["llm_tool_reference_allowed_dirs"] = dirs
+            try:
+                generation["image_generation_settings"] = updated
+                save()
+            except Exception:
+                generation["image_generation_settings"] = previous
+                raise
+            if getattr(self, "generation", None) is not None:
+                self.generation.cfg.llm_tool_reference_allowed_dirs = list(dirs)
+            return True
+
+    def get_dynamics_summary(self, umo: str = "") -> dict[str, Any]:
+        """Return non-secret media summary for companion plugins without exposing internals."""
+        target_umo = str(umo or "").strip()
+        characters: list[dict[str, str]] = []
+        lib = getattr(self, "library", None)
+        if lib is not None and callable(getattr(lib, "profiles", None)):
+            characters = [
+                {
+                    "key": str(p.get("key") or ""),
+                    "name": str(p.get("name") or ""),
+                    "appearance": str(p.get("appearance") or ""),
+                    "style": str(p.get("style") or ""),
+                }
+                for p in lib.profiles()
+            ]
+        elif getattr(self, "memes", None) is not None:
+            cfg = getattr(self.memes, "plugin_config", None)
+            if cfg is not None and callable(getattr(cfg, "get_characters", None)):
+                info = (
+                    cfg.get_character_info()
+                    if callable(getattr(cfg, "get_character_info", None))
+                    else {}
+                )
+                for key in cfg.get_characters():
+                    meta = info.get(key) if isinstance(info, dict) else {}
+                    characters.append(
+                        {
+                            "key": str(key),
+                            "name": str((meta or {}).get("name") or key),
+                            "appearance": str((meta or {}).get("desc") or ""),
+                            "style": "",
+                        }
+                    )
+        running = 0
+        recent = 0
+        latest_output_path = ""
+        latest_prompt = ""
+        tracker = getattr(getattr(self, "generation", None), "generation_tracker", None)
+        if tracker is not None and callable(getattr(tracker, "records_snapshot", None)):
+            rows = tracker.records_snapshot()
+            for row in rows:
+                req_umo = str((row.get("requester") or {}).get("umo") or "")
+                if target_umo and req_umo and req_umo != target_umo:
+                    continue
+                if row.get("status") in {"queued", "running"}:
+                    running += 1
+                else:
+                    recent += 1
+                    if not latest_prompt:
+                        latest_prompt = str(row.get("prompt") or "")[:200]
+                    imgs = row.get("images") or []
+                    if (
+                        not latest_output_path
+                        and imgs
+                        and callable(getattr(tracker, "gallery_image_path", None))
+                    ):
+                        resolved = tracker.gallery_image_path(imgs[0])
+                        if resolved is not None:
+                            latest_output_path = str(resolved)
+        return {
+            "schema_version": 1,
+            "ready": not self._closed
+            and self.memes is not None
+            and self.generation is not None,
+            "characters": characters,
+            "running": running,
+            "recent": recent,
+            "latest_output_path": latest_output_path,
+            "latest_prompt": latest_prompt,
+        }
 
     def get_dynamics_capabilities(self):
         """Declare the current media owner without exposing configuration or secrets."""
@@ -143,7 +254,9 @@ class VisualMediaPlugin(Star):
             "schema_version": 1,
             "display_name": "视觉工坊",
             "enabled": not self._closed,
-            "ready": not self._closed and self.memes is not None and self.generation is not None,
+            "ready": not self._closed
+            and self.memes is not None
+            and self.generation is not None,
             "capabilities": {"media": 1},
             "media_policy_version": 1,
         }
@@ -434,41 +547,82 @@ class VisualMediaPlugin(Star):
         self, event: AstrMessageEvent, tool, tool_args: dict | None, tool_result
     ) -> None:
         """记录 LLM 通过 AstrBot 通用消息工具发送的图片，避免同轮再被动发表情。"""
-        if str(getattr(tool, 'name', '')) == 'send_message_to_user':
+        if str(getattr(tool, "name", "")) == "send_message_to_user":
             self.behavior.bind(event)
             receipt = image_receipt(event, tool_args, tool_result)
             if receipt:
-                matched = note_confirmed_images(event, receipt['images'], same_session=receipt['same_session']) if receipt['confirmed'] else 0
-                mode = 'generate' if getattr(event, '_visual_generation_task', None) or event.get_extra('visual_media_generation_requested', False) else 'image'
-                if getattr(event, '_visual_expected_image_keys', None) is not None and not matched:
-                    mode = 'image'
-                destination = receipt['event']
-                task_id = (getattr(event, '_visual_generation_task', '') or '') if mode=='generate' else ''
-                await self.behavior.arecord(destination, mode, receipt['phase'], receipt['reason'], {'image_count':len(receipt['images']),'matched_image_count':matched,'task_id':task_id, 'same_session':receipt['same_session']})
-                if receipt['confirmed']:
+                matched = (
+                    note_confirmed_images(
+                        event, receipt["images"], same_session=receipt["same_session"]
+                    )
+                    if receipt["confirmed"]
+                    else 0
+                )
+                mode = (
+                    "generate"
+                    if getattr(event, "_visual_generation_task", None)
+                    or event.get_extra("visual_media_generation_requested", False)
+                    else "image"
+                )
+                if (
+                    getattr(event, "_visual_expected_image_keys", None) is not None
+                    and not matched
+                ):
+                    mode = "image"
+                destination = receipt["event"]
+                task_id = (
+                    (getattr(event, "_visual_generation_task", "") or "")
+                    if mode == "generate"
+                    else ""
+                )
+                await self.behavior.arecord(
+                    destination,
+                    mode,
+                    receipt["phase"],
+                    receipt["reason"],
+                    {
+                        "image_count": len(receipt["images"]),
+                        "matched_image_count": matched,
+                        "task_id": task_id,
+                        "same_session": receipt["same_session"],
+                    },
+                )
+                if receipt["confirmed"]:
                     index = self.memes.plugin_api._get_index()
-                    for item in receipt['images']:
-                        path = str(item.get('path', '') or '')
+                    for item in receipt["images"]:
+                        path = str(item.get("path", "") or "")
                         if path in index:
-                            await self.behavior.adelivered(destination, {**index[path], 'path':path})
+                            await self.behavior.adelivered(
+                                destination, {**index[path], "path": path}
+                            )
                 # Sending elsewhere must not consume this conversation's media turn.
-                if not receipt['same_session'] or not receipt['confirmed']:
+                if not receipt["same_session"] or not receipt["confirmed"]:
                     return
         return await self.memes._track_external_image_delivery(
             event, tool, tool_args, tool_result
         )
 
-    @filter.on_llm_request(priority=4)
+    @filter.on_llm_request(priority=5)
     async def _start_joint_meme_prefetch(self, event: AstrMessageEvent, req):
-        if event.get_extra("visual_media_generation_requested", False):
+        if event.get_extra("_narrative_internal_v1", False) or event.get_extra(
+            "visual_media_generation_requested", False
+        ):
             return
         return await self.memes._start_joint_meme_prefetch(event, req)
 
-    @filter.on_llm_request()
+    @filter.on_llm_request(priority=1)
     async def _prepare_joint_meme_reply(self, event: AstrMessageEvent, req):
-        await asyncio.to_thread(self.behavior.remember_explicit, event)
-        if not getattr(req, '_visual_preferences_attached', False):
-            req.system_prompt = str(getattr(req, 'system_prompt', '') or '') + await asyncio.to_thread(self.behavior.prompt, event)
+        if event.get_extra("_narrative_internal_v1", False):
+            return
+        attach_prompt = not getattr(req, "_visual_preferences_attached", False)
+        extra_prompt = await asyncio.to_thread(
+            self.behavior.remember_and_prompt, event, attach_prompt
+        )
+        if attach_prompt:
+            if extra_prompt:
+                req.system_prompt = (
+                    str(getattr(req, "system_prompt", "") or "") + extra_prompt
+                )
             req._visual_preferences_attached = True
         if event.get_extra("visual_media_generation_requested", False):
             return
