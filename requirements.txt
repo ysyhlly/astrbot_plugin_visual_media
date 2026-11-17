@@ -1,0 +1,10 @@
+Pillow>=10.0.0
+PyYAML
+quart>=0.20
+RapidFuzz>=3.9,<4
+aiohttp-socks
+cryptography
+numpy
+opencv-python-headless
+scikit-image
+scipy

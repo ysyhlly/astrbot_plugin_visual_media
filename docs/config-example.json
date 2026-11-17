@@ -1,0 +1,20 @@
+{
+  "memes": {},
+  "generation": {},
+  "media": {
+    "preferences_enabled": true,
+    "repeat_guard_enabled": true,
+    "repeat_window_seconds": 1800,
+    "recent_receipts": 12,
+    "less_interval_seconds": 180,
+    "similar_demotion_enabled": true,
+    "similar_distance": 8,
+    "decision_records_enabled": true,
+    "record_retention_days": 30,
+    "max_records": 5000,
+    "character_check_enabled": true,
+    "character_check_provider": "",
+    "character_check_timeout": 60,
+    "character_check_max_images": 2
+  }
+}

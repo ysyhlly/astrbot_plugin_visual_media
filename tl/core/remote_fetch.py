@@ -1,0 +1,247 @@
+"""RemoteFetchService：远端抓取（大小/时间/重定向边界与 URL 基本形态校验）。"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
+from urllib.parse import urljoin, urlsplit
+
+import aiohttp
+from astrbot.api import logger
+
+from .errors import (
+    PathPolicyError,
+    RemoteFetchBodyTooLargeError,
+    RemoteFetchError,
+    RemoteFetchRejectedError,
+    RemoteFetchTimeoutError,
+    RemoteFetchTooManyRedirectsError,
+    redact_text,
+    redact_url,
+)
+from .path_policy import check_remote_url
+
+# 手动跟随的最大重定向跳数，每跳都重新校验 URL 形态。
+MAX_REDIRECTS = 5
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_READ_CHUNK_BYTES = 64 * 1024
+# 受支持格式的魔数都在文件头：实测 512B 已足够，取 4096 留余量。
+# 尺寸未必：WEBP 需完整内容，故探测只把魔数当权威，像素校验尽力而为。
+PROBE_BYTES = 4 * 1024
+_SENSITIVE_REDIRECT_HEADERS = frozenset(
+    {"authorization", "proxy-authorization", "cookie", "cookie2"}
+)
+
+
+def _origin(url: str) -> tuple[str, str, int | None]:
+    parsed = urlsplit(url)
+    return (parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port)
+
+
+def _remaining(
+    deadline_at: datetime | None, deadline_mono: float | None
+) -> float | None:
+    """与 tl/core/retry.py 相同的 deadline 剩余时间口径。"""
+
+    if deadline_mono is not None:
+        return max(deadline_mono - time.monotonic(), 0.0)
+    if deadline_at is None:
+        return None
+    if deadline_at.tzinfo is None or deadline_at.utcoffset() is None:
+        raise ValueError("deadline 必须是带时区的 datetime")
+    return max(
+        (
+            deadline_at.astimezone(timezone.utc) - datetime.now(timezone.utc)
+        ).total_seconds(),
+        0.0,
+    )
+
+
+class RemoteFetchService:
+    """按 deadline、响应体上限与重定向边界抓取远端字节。"""
+
+    def __init__(
+        self,
+        *,
+        max_body_bytes: int = 16 * 1024 * 1024,
+        connect_timeout: float = 10.0,
+        max_redirects: int = MAX_REDIRECTS,
+    ) -> None:
+        self.max_body_bytes = int(max_body_bytes)
+        self.connect_timeout = float(connect_timeout)
+        self.max_redirects = int(max_redirects)
+
+    def check_url(self, url: str) -> str:
+        """校验 URL 可作为抓取目标，原样返回。"""
+
+        return check_remote_url(url)
+
+    async def fetch(
+        self,
+        url: str,
+        *,
+        deadline_at: datetime | None = None,
+        proxy: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        probe: Callable[[bytes], None] | None = None,
+    ) -> bytes:
+        """抓取 URL 字节；deadline_at 截断总时长，proxy 与 probe 由调用方传入。"""
+
+        current = str(url or "").strip()
+        request_headers = dict(headers or {})
+        remaining = _remaining(deadline_at, None)
+        deadline_mono = time.monotonic() + remaining if remaining is not None else None
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(), trust_env=False
+        ) as session:
+            for hop in range(self.max_redirects + 1):
+                remaining = _remaining(deadline_at, deadline_mono)
+                if remaining is not None and remaining <= 0:
+                    logger.error("远端抓取超过 deadline: %s", redact_url(current))
+                    raise RemoteFetchTimeoutError(
+                        f"远端抓取超过 deadline: {redact_url(current)}"
+                    )
+                try:
+                    current = self.check_url(current)
+                except PathPolicyError as exc:
+                    logger.warning("远端抓取目标被拒绝: %s", redact_url(current))
+                    raise RemoteFetchRejectedError(
+                        f"远端抓取目标被拒绝: {redact_url(current)}"
+                    ) from exc
+                remaining = _remaining(deadline_at, deadline_mono)
+                if remaining is not None and remaining <= 0:
+                    logger.error("远端抓取超过 deadline: %s", redact_url(current))
+                    raise RemoteFetchTimeoutError(
+                        f"远端抓取超过 deadline: {redact_url(current)}"
+                    )
+                timeout = aiohttp.ClientTimeout(
+                    total=remaining if remaining is not None else None,
+                    connect=self.connect_timeout,
+                    sock_connect=self.connect_timeout,
+                )
+                try:
+                    async with session.get(
+                        current,
+                        timeout=timeout,
+                        proxy=proxy,
+                        headers=request_headers,
+                        allow_redirects=False,
+                    ) as response:
+                        if response.status in _REDIRECT_STATUSES:
+                            if hop >= self.max_redirects:
+                                logger.error(
+                                    "远端抓取重定向超过 %d 跳: %s",
+                                    self.max_redirects,
+                                    redact_url(current),
+                                )
+                                raise RemoteFetchTooManyRedirectsError(
+                                    f"远端抓取重定向超过 {self.max_redirects} 跳: "
+                                    f"{redact_url(current)}"
+                                )
+                            location = response.headers.get("Location", "")
+                            if not location:
+                                logger.warning(
+                                    "远端抓取重定向缺少 Location: %s",
+                                    redact_url(current),
+                                )
+                                raise RemoteFetchError(
+                                    f"重定向缺少 Location: {redact_url(current)}"
+                                )
+                            next_url = urljoin(current, location)
+                            if _origin(next_url) != _origin(current):
+                                logger.debug(
+                                    "远端抓取跨源重定向，已剥离认证头: %s -> %s",
+                                    redact_url(current),
+                                    redact_url(next_url),
+                                )
+                                request_headers = {
+                                    key: value
+                                    for key, value in request_headers.items()
+                                    if key.lower() not in _SENSITIVE_REDIRECT_HEADERS
+                                }
+                            else:
+                                logger.debug(
+                                    "远端抓取重定向 %s/%s: %s -> %s",
+                                    hop + 1,
+                                    self.max_redirects,
+                                    redact_url(current),
+                                    redact_url(next_url),
+                                )
+                            current = next_url
+                            continue
+                        if response.status != 200:
+                            logger.error(
+                                "远端抓取 HTTP %s: %s",
+                                response.status,
+                                redact_url(current),
+                            )
+                            raise RemoteFetchError(
+                                f"远端抓取失败: HTTP {response.status} "
+                                f"{redact_url(current)}"
+                            )
+                        return await self._read_body(response, current, probe)
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError as exc:
+                    logger.error("远端抓取超时: %s", redact_url(current))
+                    raise RemoteFetchTimeoutError(
+                        f"远端抓取超时: {redact_url(current)}"
+                    ) from exc
+                except (aiohttp.ClientError, OSError) as exc:
+                    logger.warning(
+                        "远端抓取网络错误: %s (%s)",
+                        redact_url(current),
+                        redact_text(exc)[:240],
+                    )
+                    raise RemoteFetchError(
+                        f"远端抓取网络错误: {redact_url(current)}: {exc}"
+                    ) from exc
+        # 循环耗尽只可能是末跳 redirect 分支已抛错，这里仅作兜底。
+        logger.warning("远端抓取重定向循环异常结束: %s", redact_url(current))
+        raise RemoteFetchTooManyRedirectsError(
+            f"远端抓取重定向超过 {self.max_redirects} 跳"
+        )
+
+    async def _read_body(
+        self,
+        response: aiohttp.ClientResponse,
+        url: str,
+        probe: Callable[[bytes], None] | None,
+    ) -> bytes:
+        content_length = response.headers.get("Content-Length", "")
+        if content_length.isdigit() and int(content_length) > self.max_body_bytes:
+            logger.error(
+                "远端响应体超过 %d 字节上限: %s",
+                self.max_body_bytes,
+                redact_url(url),
+            )
+            raise RemoteFetchBodyTooLargeError(
+                f"远端响应体超过 {self.max_body_bytes} 字节上限: {redact_url(url)}"
+            )
+        chunks: list[bytes] = []
+        size = 0
+        probed = probe is None
+        async for chunk in response.content.iter_chunked(_READ_CHUNK_BYTES):
+            size += len(chunk)
+            if size > self.max_body_bytes:
+                logger.error(
+                    "远端响应体超过 %d 字节上限: %s",
+                    self.max_body_bytes,
+                    redact_url(url),
+                )
+                raise RemoteFetchBodyTooLargeError(
+                    f"远端响应体超过 {self.max_body_bytes} 字节上限: {redact_url(url)}"
+                )
+            chunks.append(chunk)
+            if not probed and size >= PROBE_BYTES:
+                # 格式与尺寸都在文件头，先用已收字节提前判定，不合格就不再读下去。
+                probe(b"".join(chunks)[:PROBE_BYTES])
+                probed = True
+        if not probed and chunks:
+            probe(b"".join(chunks)[:PROBE_BYTES])
+        logger.debug(
+            "远端抓取完成: %s (%s 字节 %s 块)", redact_url(url), size, len(chunks)
+        )
+        return b"".join(chunks)

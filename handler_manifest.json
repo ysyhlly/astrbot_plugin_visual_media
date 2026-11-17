@@ -1,0 +1,341 @@
+[
+  {
+    "engine": "memes",
+    "handler": "meme",
+    "decorators": [
+      "filter.command_group('meme')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "meme_on",
+    "decorators": [
+      "filter.permission_type(PermissionType.ADMIN)",
+      "meme.command('on')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "meme_off",
+    "decorators": [
+      "filter.permission_type(PermissionType.ADMIN)",
+      "meme.command('off')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "auto_on",
+    "decorators": [
+      "filter.permission_type(PermissionType.ADMIN)",
+      "meme.command('auto_on')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "auto_off",
+    "decorators": [
+      "filter.permission_type(PermissionType.ADMIN)",
+      "meme.command('auto_off')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "group_filter",
+    "decorators": [
+      "filter.permission_type(PermissionType.ADMIN)",
+      "meme.command('group')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "capture",
+    "decorators": [
+      "filter.permission_type(PermissionType.ADMIN)",
+      "meme.command('偷')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "toggle_natural_analysis",
+    "decorators": [
+      "filter.permission_type(PermissionType.ADMIN)",
+      "meme.command('natural_analysis')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "emotion_analysis_stats",
+    "decorators": [
+      "meme.command('emotion_stats')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "clear_emotion_cache",
+    "decorators": [
+      "filter.permission_type(PermissionType.ADMIN)",
+      "meme.command('clear_emotion_cache')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "status",
+    "decorators": [
+      "meme.command('status')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "tag_stats",
+    "decorators": [
+      "filter.permission_type(PermissionType.ADMIN)",
+      "meme.command('tag_stats')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "clean",
+    "decorators": [
+      "filter.permission_type(PermissionType.ADMIN)",
+      "meme.command('clean', priority=-100)"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "enforce_capacity",
+    "decorators": [
+      "filter.permission_type(PermissionType.ADMIN)",
+      "meme.command('capacity')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "list_images",
+    "decorators": [
+      "filter.permission_type(PermissionType.ADMIN)",
+      "meme.command('list')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "register_menu_interactions",
+    "decorators": [
+      "filter.on_platform_loaded()"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "menu_panel",
+    "decorators": [
+      "meme.command('menu', alias={'help'})"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "random_menu_image",
+    "decorators": [
+      "meme.command('random')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "close_menu",
+    "decorators": [
+      "meme.command('close')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "delete_image",
+    "decorators": [
+      "filter.permission_type(PermissionType.ADMIN)",
+      "meme.command('delete')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "blacklist_image",
+    "decorators": [
+      "filter.permission_type(PermissionType.ADMIN)",
+      "meme.command('blacklist')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "set_image_scope",
+    "decorators": [
+      "filter.permission_type(PermissionType.ADMIN)",
+      "meme.command('scope')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "rebuild_index",
+    "decorators": [
+      "filter.permission_type(PermissionType.ADMIN)",
+      "meme.command('rebuild_index')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "search_meme",
+    "decorators": [
+      "filter.llm_tool(name=SEARCH_MEME_TOOL_NAME)"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "send_meme",
+    "decorators": [
+      "filter.llm_tool(name=SEND_MEME_TOOL_NAME)"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "steal_sticker",
+    "decorators": [
+      "filter.llm_tool(name='steal_meme')"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "on_message",
+    "decorators": [
+      "filter.event_message_type(EventMessageType.ALL)",
+      "filter.platform_adapter_type(PlatformAdapterType.ALL)"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "_track_external_image_delivery",
+    "decorators": [
+      "filter.on_llm_tool_respond()"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "_start_joint_meme_prefetch",
+    "decorators": [
+      "filter.on_llm_request(priority=4)"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "_prepare_joint_meme_reply",
+    "decorators": [
+      "filter.on_llm_request()"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "_prepare_emoji_after_llm",
+    "decorators": [
+      "filter.on_llm_response()"
+    ]
+  },
+  {
+    "engine": "memes",
+    "handler": "_prepare_emoji_response",
+    "decorators": [
+      "filter.on_decorating_result(priority=100)"
+    ]
+  },
+  {
+    "engine": "generation",
+    "handler": "on_astrbot_loaded",
+    "decorators": [
+      "filter.on_astrbot_loaded()"
+    ]
+  },
+  {
+    "engine": "generation",
+    "handler": "generate_image",
+    "decorators": [
+      "filter.command('生图')"
+    ]
+  },
+  {
+    "engine": "generation",
+    "handler": "quick_mode_group",
+    "decorators": [
+      "filter.command_group('快速')"
+    ]
+  },
+  {
+    "engine": "generation",
+    "handler": "quick_avatar",
+    "decorators": [
+      "quick_mode_group.command('头像')"
+    ]
+  },
+  {
+    "engine": "generation",
+    "handler": "quick_poster",
+    "decorators": [
+      "quick_mode_group.command('海报')"
+    ]
+  },
+  {
+    "engine": "generation",
+    "handler": "quick_wallpaper",
+    "decorators": [
+      "quick_mode_group.command('壁纸')"
+    ]
+  },
+  {
+    "engine": "generation",
+    "handler": "quick_card",
+    "decorators": [
+      "quick_mode_group.command('卡片')"
+    ]
+  },
+  {
+    "engine": "generation",
+    "handler": "quick_mobile",
+    "decorators": [
+      "quick_mode_group.command('手机')"
+    ]
+  },
+  {
+    "engine": "generation",
+    "handler": "quick_figure",
+    "decorators": [
+      "quick_mode_group.command('手办化')"
+    ]
+  },
+  {
+    "engine": "generation",
+    "handler": "quick_sticker",
+    "decorators": [
+      "quick_mode_group.command('表情包')"
+    ]
+  },
+  {
+    "engine": "generation",
+    "handler": "split_image_command",
+    "decorators": [
+      "filter.command('切图')"
+    ]
+  },
+  {
+    "engine": "generation",
+    "handler": "show_help",
+    "decorators": [
+      "filter.command('生图帮助')"
+    ]
+  },
+  {
+    "engine": "generation",
+    "handler": "modify_image",
+    "decorators": [
+      "filter.command('改图')"
+    ]
+  },
+  {
+    "engine": "generation",
+    "handler": "change_style",
+    "decorators": [
+      "filter.command('换风格')"
+    ]
+  }
+]

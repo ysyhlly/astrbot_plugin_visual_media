@@ -1,0 +1,859 @@
+"""
+工具函数模块
+提供头像管理、文件保存和图像处理功能
+"""
+
+import asyncio
+import base64
+import hashlib
+import os
+import time
+import urllib.parse
+from collections import OrderedDict
+from datetime import datetime
+from pathlib import Path
+from uuid import uuid4
+
+import aiohttp
+import cv2
+from astrbot.api import logger
+
+from .api_types import APIError
+from .file_uri import file_uri_to_path
+from .reference_image import (
+    REFERENCE_IMAGE_CACHE_DIR,
+    build_reference_image_headers,
+    check_reference_image_cache,
+    detect_reference_image_mime,
+    is_qq_image_host,
+)
+from .session_image_dir import cleanup_session_images_by_size, current_session_image_dir
+
+
+def _decode_base64_to_temp_file(
+    b64_data: str, *, verify_image: bool = True, logger_obj=logger
+) -> str | None:
+    """
+    将 base64 数据解码并保存到临时文件
+
+    注意：调用方负责清理返回的临时文件。建议在使用完毕后调用:
+        Path(result).unlink(missing_ok=True)
+    或使用 try...finally 块确保清理。
+
+    Args:
+        b64_data: base64 数据（可以是 data URI 或纯 base64）
+        verify_image: 是否验证图片可读性
+        logger_obj: 日志对象
+
+    Returns:
+        临时文件路径，失败返回 None。调用方负责清理此文件。
+    """
+    try:
+        data = b64_data
+        if ";base64," in data:
+            _, _, data = data.partition(";base64,")
+        raw_bytes = base64.b64decode(data)
+        # 使用 AstrBot 共享临时目录，由 AstrBot 统一清理
+        temp_dir = get_temp_dir()
+        tmp_path = temp_dir / f"cut_{int(time.time() * 1000)}_{os.getpid()}.png"
+        tmp_path.write_bytes(raw_bytes)
+
+        if verify_image and cv2.imread(str(tmp_path)) is None:
+            logger_obj.debug("base64 解码后图片不可读")
+            tmp_path.unlink(missing_ok=True)
+            return None
+
+        return str(tmp_path)
+    except Exception as e:
+        logger_obj.debug(f"base64 解码到临时文件失败: {e}")
+        return None
+
+
+def get_plugin_data_dir() -> Path:
+    """获取插件数据目录"""
+    # 使用AstrBot的StarTools获取标准数据目录
+    from astrbot.api.star import StarTools
+
+    return StarTools.get_data_dir("astrbot_plugin_visual_media")
+
+
+def get_shared_temp_dir() -> Path:
+    """返回 AstrBot 共享临时目录根（不可用时回退到系统临时目录）。
+
+    生成图、切图、参考图缓存等瞬时文件统一写入该目录下的插件专属子目录，
+    由 AstrBot 的 TempDirCleaner 按容量上限自动清理，插件不再自行维护清理逻辑。
+    """
+    try:
+        from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
+
+        temp_dir = Path(get_astrbot_temp_path())
+    except Exception:
+        import tempfile
+
+        temp_dir = Path(tempfile.gettempdir())
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    return temp_dir
+
+
+def get_temp_dir() -> Path:
+    """获取插件临时文件目录（AstrBot 共享临时目录下的插件专属子目录，由 AstrBot 统一清理）"""
+    temp_dir = get_shared_temp_dir() / "astrbot_plugin_visual_media"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    return temp_dir
+
+
+# 生成图保留区容量上限（MB）：会话工作区按全部会话插件名子目录总量、其余按插件 images/ 目录计，超限按最旧清理；<=0 表示不清理
+_DEFAULT_IMAGE_CACHE_MAX_SIZE_MB = 512.0
+_image_cache_max_size_mb = _DEFAULT_IMAGE_CACHE_MAX_SIZE_MB
+
+
+def set_image_cache_max_size_mb(value: float) -> None:
+    """由插件配置设置生成图保留区的容量上限（MB）"""
+    global _image_cache_max_size_mb
+    try:
+        _image_cache_max_size_mb = float(value)
+    except (TypeError, ValueError):
+        _image_cache_max_size_mb = _DEFAULT_IMAGE_CACHE_MAX_SIZE_MB
+
+
+def cleanup_image_cache_by_size(
+    images_dir: Path | None = None, max_size_mb: float | None = None
+) -> None:
+    """按容量清理生成图保留区：超过上限时从最旧文件开始删除，释放约 30% 空间。
+
+    策略对齐 AstrBot 的 TempDirCleaner；max_size_mb <= 0 时不清理。
+    """
+    limit_mb = _image_cache_max_size_mb if max_size_mb is None else max_size_mb
+    if limit_mb <= 0:
+        return
+    try:
+        if images_dir is None:
+            images_dir = get_plugin_data_dir() / "images"
+        if not images_dir.is_dir():
+            return
+
+        files = [f for f in images_dir.iterdir() if f.is_file()]
+        total = sum(f.stat().st_size for f in files)
+        if total <= int(limit_mb * 1024**2):
+            return
+
+        files.sort(key=lambda f: f.stat().st_mtime)
+        target_release = max(int(total * 0.3), 1)
+        released = 0
+        removed = 0
+        for file_path in files:
+            try:
+                size = file_path.stat().st_size
+                file_path.unlink()
+            except OSError:
+                continue
+            released += size
+            removed += 1
+            if released >= target_release:
+                break
+        logger.debug(f"生成图缓存超出容量上限，已清理 {removed} 个最旧文件")
+    except Exception as e:
+        logger.warning(f"生成图缓存清理失败: {e}")
+
+
+def _image_save_dir() -> Path:
+    """生成图保存目录：聊天会话为工作区子目录（框架发送白名单内），其余为插件 images/。"""
+    return current_session_image_dir() or (get_plugin_data_dir() / "images")
+
+
+def _build_image_path(
+    image_format: str = "png", prefix: str = "gemini_advanced_image"
+) -> Path:
+    """生成规范的图片路径，避免重复逻辑"""
+    # 生成图需要保留供发送与复用，按保存目录做容量自清理；
+    # AstrBot 临时目录没有防清理机制，不适合存放待发送的生成图
+    images_dir = _image_save_dir()
+    images_dir.mkdir(parents=True, exist_ok=True)
+    if current_session_image_dir() is not None:
+        # 工作区按全部会话目录总量管理，避免按会话独立累积
+        cleanup_session_images_by_size(_image_cache_max_size_mb)
+    else:
+        cleanup_image_cache_by_size(images_dir)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    unique_suffix = uuid4().hex[:6]
+    filename = f"{prefix}_{timestamp}_{unique_suffix}.{image_format}"
+    return images_dir / filename
+
+
+def _pick_avatar_url(data: dict | None) -> str | None:
+    """尝试从不同字段中提取头像URL"""
+    if not isinstance(data, dict):
+        return None
+
+    candidate_keys = [
+        "avatar",
+        "avatar_url",
+        "user_avatar",
+        "head_image",
+        "tiny_avatar",
+        "thumb_avatar",
+        "url",
+    ]
+    for key in candidate_keys:
+        url = data.get(key)
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            return url
+
+    inner = data.get("data")
+    if isinstance(inner, dict):
+        return _pick_avatar_url(inner)
+
+    return None
+
+
+_QQ_OFFICIAL_PLATFORMS = {"qq_official", "qq_official_webhook"}
+
+
+def _build_qq_official_avatar_url(event, user_id: str) -> str | None:
+    """Build the QQ Official avatar URL from the bot appid and user openid."""
+    try:
+        platform_name = str(event.get_platform_name() or "").strip()
+    except Exception:
+        platform_name = str(
+            getattr(getattr(event, "platform_meta", None), "name", "") or ""
+        ).strip()
+    if platform_name not in _QQ_OFFICIAL_PLATFORMS:
+        return None
+
+    bot = getattr(event, "bot", None) or getattr(event, "_bot", None)
+    appid = str(getattr(getattr(bot, "platform", None), "appid", "") or "").strip()
+    openid = str(user_id or "").strip()
+    if not appid or not openid:
+        return None
+
+    return (
+        "https://q.qlogo.cn/qqapp/"
+        f"{urllib.parse.quote(appid, safe='')}/"
+        f"{urllib.parse.quote(openid, safe='')}/100"
+    )
+
+
+def _encode_file_to_base64(file_path: Path, chunk_size: int = 65536) -> str:
+    """流式编码文件为base64
+    注意: chunk_size 必须是 3 的倍数，否则 base64 编码会出错
+    """
+    # 确保 chunk_size 是 3 的倍数
+    chunk_size = (chunk_size // 3) * 3
+    if chunk_size == 0:
+        chunk_size = 3
+
+    encoded_parts: list[str] = []
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            encoded_parts.append(base64.b64encode(chunk).decode("utf-8"))
+    return "".join(encoded_parts)
+
+
+def encode_file_to_base64(file_path: str | Path, chunk_size: int = 65536) -> str:
+    """对外暴露的编码方法，兼容字符串路径"""
+    return _encode_file_to_base64(Path(file_path), chunk_size)
+
+
+async def save_image_stream(
+    stream_reader,
+    image_format: str = "png",
+    target_path: Path | None = None,
+) -> str | None:
+    """
+    将异步流式读取到的图片保存到文件，避免一次性加载到内存
+
+    Args:
+        stream_reader: aiohttp.StreamReader 或任意异步可迭代的字节流
+        image_format: 图片格式
+        target_path: 指定文件路径，便于缓存复用
+
+    Raises:
+        APIError: 会话工作区不可用时抛出（不落盘）
+    """
+    file_path = target_path or _build_image_path(image_format)
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, "wb") as f:
+            if hasattr(stream_reader, "iter_chunked"):
+                async for chunk in stream_reader.iter_chunked(8192):
+                    if chunk:
+                        f.write(chunk)
+            else:
+                async for chunk in stream_reader:
+                    if chunk:
+                        f.write(chunk)
+
+        logger.debug(f"图像已流式保存: {file_path}")
+        return str(file_path)
+    except Exception as e:
+        logger.error(f"流式保存图像失败: {e}")
+        return None
+
+
+# base64 图片去重缓存（base64_hash -> file_path），使用 LRU 策略限制大小
+_BASE64_CACHE_MAX_SIZE = 128  # 最大缓存条目数
+
+
+class _LRUCache(OrderedDict):
+    """简单的 LRU 缓存实现，继承 OrderedDict"""
+
+    def __init__(self, maxsize: int = 128):
+        super().__init__()
+        if maxsize < 0:
+            raise ValueError(f"maxsize 必须为非负整数，当前值为: {maxsize}")
+        self.maxsize = maxsize
+
+    def get(self, key: str, default: str | None = None) -> str | None:
+        if key in self:
+            self.move_to_end(key)
+            return self[key]
+        return default
+
+    def set(self, key: str, value: str) -> None:
+        if key in self:
+            self.move_to_end(key)
+        self[key] = value
+        while len(self) > self.maxsize:
+            self.popitem(last=False)
+
+    def __contains__(self, key: object) -> bool:
+        return super().__contains__(key)
+
+
+_base64_image_cache: _LRUCache = _LRUCache(maxsize=_BASE64_CACHE_MAX_SIZE)
+
+
+async def save_base64_image(base64_data: str, image_format: str = "png") -> str | None:
+    """
+    保存base64图像数据到文件
+
+    Args:
+        base64_data: base64编码的图像数据
+        image_format: 图像格式 (png, jpg, jpeg等)
+
+    Returns:
+        保存的文件路径，失败返回None；若已保存过相同数据则返回现有路径
+
+    Raises:
+        APIError: 会话工作区不可用时抛出（不落盘）
+    """
+
+    # 去掉空白后计算哈希，用于去重；缓存键包含保存目录，避免跨会话复用错路径
+    cleaned_data = "".join(base64_data.split())
+    data_hash = hashlib.md5(cleaned_data.encode()).hexdigest()
+    cache_key = f"{_image_save_dir()}:{data_hash}"
+
+    # 检查是否已保存过相同的数据
+    existing_path = _base64_image_cache.get(cache_key)
+    if existing_path:
+        # 检查文件是否还存在
+        if Path(existing_path).exists():
+            logger.debug(f"复用已保存的图片: {existing_path}")
+            return existing_path
+        else:
+            # 文件已被删除，从缓存中移除
+            del _base64_image_cache[cache_key]
+
+    try:
+        file_path = _build_image_path(image_format)
+
+        # 去掉空白并按块解码，避免一次性占用过大内存
+        # 一次性解码完整数据，若失败则宽松清洗后再试
+        try:
+            raw = base64.b64decode(cleaned_data, validate=False)
+        except Exception:
+            import re
+
+            relaxed = re.sub(r"[^A-Za-z0-9+/=_-]", "", cleaned_data)
+            pad_len = (-len(relaxed)) % 4
+            if pad_len:
+                relaxed += "=" * pad_len
+            raw = base64.b64decode(relaxed, validate=False)
+
+        with open(file_path, "wb") as f:
+            f.write(raw)
+
+        # 加入缓存，避免重复保存相同数据（使用 LRU 策略）
+        _base64_image_cache.set(cache_key, str(file_path))
+
+        logger.debug(f"图像已保存: {file_path}")
+        return str(file_path)
+
+    except APIError:
+        raise
+    except Exception as e:
+        logger.error(f"保存图像失败: {e}")
+        return None
+
+
+async def save_image_data(image_data: bytes, image_format: str = "png") -> str | None:
+    """
+    保存图像字节数据到文件
+
+    Args:
+        image_data: 图像字节数据
+        image_format: 图像格式
+
+    Returns:
+        保存的文件路径，失败返回None
+
+    Raises:
+        APIError: 会话工作区不可用时抛出（不落盘）
+    """
+    try:
+        file_path = _build_image_path(image_format)
+        with open(file_path, "wb") as f:
+            f.write(image_data)
+
+        logger.debug(f"图像已保存: {file_path}")
+        return str(file_path)
+
+    except APIError:
+        raise
+    except Exception as e:
+        logger.error(f"保存图像失败: {e}")
+        return None
+
+
+async def download_qq_avatar(
+    user_id: str,
+    cache_name: str,
+    images_dir: Path | None = None,
+    event=None,
+) -> str | None:
+    """
+    下载QQ头像并转换为base64格式，优先使用NapCat事件系统获取头像URL
+
+    Args:
+        user_id (str): QQ用户ID
+        cache_name (str): 缓存文件名前缀
+        images_dir (Path): images目录路径，如果为None则使用默认路径
+        event: AstrMessageEvent，便于通过事件携带的 bot/原始消息提取头像URL
+
+    Returns:
+        str: base64格式的头像数据，失败返回None
+    """
+
+    async def _resolve_avatar_url() -> str | None:
+        """通过事件上下文或NapCat接口解析头像URL"""
+        # 1. 原始消息
+        try:
+            raw_msg = getattr(getattr(event, "message_obj", None), "raw_message", None)
+            sender_raw = getattr(raw_msg, "sender", None) or (
+                raw_msg.get("sender") if isinstance(raw_msg, dict) else None
+            )
+            url = _pick_avatar_url(sender_raw)
+            if url:
+                logger.debug(f"从原始消息获取到头像URL: {url}")
+                return url
+        except Exception as e:
+            logger.debug(f"从原始消息提取头像失败: {e}")
+
+        # 2. sender 对象
+        try:
+            sender_obj = getattr(getattr(event, "message_obj", None), "sender", None)
+            url = _pick_avatar_url(sender_obj.__dict__ if sender_obj else None)
+            if url:
+                logger.debug("从 sender 对象提取到头像URL")
+                return url
+        except Exception:
+            pass
+
+        # 3. QQ 官方 API：从 bot client 读取 appid，并与用户 openid 构造直链。
+        url = _build_qq_official_avatar_url(event, user_id)
+        if url:
+            logger.debug("已构造 QQ 官方用户头像 URL")
+            return url
+
+        # 4. NapCat / OneBot API
+        bot = getattr(event, "bot", None) or getattr(event, "_bot", None)
+        if bot:
+            group_id = None
+            try:
+                raw_group_id = (
+                    getattr(event, "group_id", None)
+                    or getattr(event, "get_group_id", lambda: None)()
+                )
+                group_id = int(raw_group_id) if raw_group_id else None
+            except Exception:
+                group_id = None
+
+            actions: list[tuple[str, dict]] = []
+            actions.append(("get_avatar", {"user_id": int(user_id), "img_type": "640"}))
+            actions.append(
+                ("get_user_avatar", {"user_id": int(user_id), "img_type": "640"})
+            )
+            if group_id:
+                actions.append(
+                    (
+                        "get_group_member_info",
+                        {
+                            "group_id": group_id,
+                            "user_id": int(user_id),
+                            "no_cache": False,
+                        },
+                    )
+                )
+            actions.append(
+                ("get_stranger_info", {"user_id": int(user_id), "no_cache": False})
+            )
+
+            napcat_unsupported = False
+
+            for action, payload in actions:
+                if napcat_unsupported:
+                    break
+                try:
+                    resp = await bot.call_action(action, **payload)
+                    url = None
+                    if isinstance(resp, str) and resp.startswith(
+                        ("http://", "https://")
+                    ):
+                        url = resp
+                    elif isinstance(resp, dict):
+                        url = _pick_avatar_url(resp)
+                    if url:
+                        logger.debug(f"通过 {action} 获取头像URL成功: {url}")
+                        return url
+                except Exception as e:
+                    err_text = str(e)
+                    logger.debug(f"调用 {action} 获取头像失败: {err_text}")
+                    # 对于不支持的接口，避免继续尝试其他 NapCat API，直接走直链回退
+                    if getattr(e, "retcode", None) == 1404 or "不支持的Api" in err_text:
+                        napcat_unsupported = True
+
+        logger.warning(f"无法通过事件系统获取用户 {user_id} 的头像URL")
+        return None
+
+    try:
+        if images_dir is None:
+            images_dir = get_plugin_data_dir() / "images"
+
+        avatar_url = await _resolve_avatar_url()
+        if not avatar_url:
+            # 回退使用 qlogo 直链（使用 HTTP 协议，更稳定）
+            avatar_url = f"http://q4.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640"
+            logger.debug(f"未从事件获取头像URL，回退 qlogo: {avatar_url}")
+        elif not avatar_url.startswith("https://q.qlogo.cn/qqapp/"):
+            # 将获取到的 URL 转为 HTTP 协议
+            avatar_url = avatar_url.replace("https://", "http://")
+
+        timeout = aiohttp.ClientTimeout(total=12, connect=5)
+        max_retries = 3
+        retry_interval = 1.0
+        async with aiohttp.ClientSession() as session:
+            for attempt in range(1, max_retries + 1):
+                try:
+                    async with session.get(
+                        avatar_url,
+                        timeout=timeout,
+                    ) as response:
+                        if response.status != 200:
+                            logger.warning(
+                                f"下载头像失败: HTTP {response.status} "
+                                f"{response.reason} (尝试 {attempt}/{max_retries})"
+                            )
+                            if attempt < max_retries:
+                                await asyncio.sleep(retry_interval * attempt)
+                                continue
+                            return None
+
+                        data = await response.read()
+                        if not data or len(data) <= 1000:
+                            logger.warning(
+                                f"用户 {user_id} 头像可能为空或默认头像，文件过小，放弃"
+                            )
+                            return None
+
+                        # 尝试从响应头猜测 mime
+                        mime_type = (
+                            (response.headers.get("Content-Type") or "")
+                            .split(";")[0]
+                            .lower()
+                        )
+                        if not mime_type or "/" not in mime_type:
+                            mime_type = "image/jpeg"
+
+                        encoded = base64.b64encode(data).decode()
+                        base64_data = f"data:{mime_type};base64,{encoded}"
+                        logger.debug(f"头像下载成功(仅内存使用): {cache_name}")
+                        return base64_data
+                except Exception as e:
+                    logger.warning(f"下载头像异常: {e} (尝试 {attempt}/{max_retries})")
+                    if attempt < max_retries:
+                        await asyncio.sleep(retry_interval * attempt)
+                        continue
+                    return None
+
+    except Exception as e:
+        logger.error(f"下载头像 {cache_name} 失败: {e}")
+        return None
+
+
+def is_valid_base64_image_str(value: str) -> bool:
+    """粗略判断字符串是否为有效的 base64 图像数据或 data URL"""
+    if not value:
+        return False
+
+    cleaned = value.strip()
+    if not cleaned:
+        return False
+    # 明确包含 URL 特征时直接排除，避免误判
+    if "://" in cleaned:
+        return False
+
+    if cleaned.startswith("data:image/"):
+        _, _, cleaned = cleaned.partition(";base64,")
+    try:
+        raw = base64.b64decode(cleaned, validate=True)
+    except Exception:
+        return False
+
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return True
+    return detect_reference_image_mime(raw) is not None
+
+
+async def collect_image_sources(event, log_debug=logger.debug) -> list[str]:
+    """
+    从消息/引用/合并转发/群文件中收集图片源
+
+    Args:
+        event: AstrMessageEvent
+        log_debug: 日志函数
+    """
+    sources: list[str] = []
+    seen: set[str] = set()
+
+    def add_source(val: str, origin: str):
+        if not val:
+            return
+        if val in seen:
+            return
+        seen.add(val)
+        sources.append(val)
+        log_debug(f"✓ 收集图片源({origin}): {str(val)[:80]}")
+
+    def extract_from_components(components, origin: str):
+        if not components:
+            return
+        for comp in components:
+            try:
+                # 图片组件
+                if comp.__class__.__name__ == "Image":
+                    if getattr(comp, "url", None):
+                        add_source(comp.url, origin)
+                    elif getattr(comp, "file", None):
+                        add_source(comp.file, origin)
+                    continue
+
+                # 文件组件（尝试按图片处理）
+                if comp.__class__.__name__ == "File":
+                    # File.file 会尝试同步下载；此处只读取元数据，下载交给后续流程。
+                    file_val = getattr(comp, "file_", None) or getattr(
+                        comp, "url", None
+                    )
+                    add_source(file_val, origin)
+                    continue
+
+                # 引用消息
+                if comp.__class__.__name__ == "Reply" and getattr(comp, "chain", None):
+                    extract_from_components(comp.chain, "引用消息")
+                    continue
+
+                # 合并转发节点
+                if comp.__class__.__name__ == "Node":
+                    node_content = getattr(comp, "content", None)
+                    extract_from_components(node_content, "合并转发")
+                    continue
+
+                # Nodes（多个节点）
+                if comp.__class__.__name__ == "Nodes":
+                    nodes = getattr(comp, "nodes", None) or getattr(comp, "list", None)
+                    extract_from_components(nodes, "合并转发")
+                    continue
+            except Exception as e:
+                log_debug(f"提取图片源异常: {e}")
+
+    try:
+        message_chain = event.get_messages()
+    except Exception:
+        message_chain = getattr(event.message_obj, "message", []) or []
+
+    extract_from_components(message_chain, "当前消息")
+
+    return sources
+
+
+async def resolve_image_source_to_path(
+    source: str,
+    *,
+    image_input_mode: str = "force_base64",
+    api_client=None,
+    download_qq_image_fn=None,
+    event=None,
+    is_valid_checker=is_valid_base64_image_str,
+    logger_obj=logger,
+) -> str | None:
+    """
+    将图片源转换为本地文件路径以便切割
+
+    注意：当返回的路径是临时文件（通过 base64/URL 转换生成）时，
+    调用方负责在使用完毕后清理该文件。建议使用 try...finally 块：
+
+        tmp_path = await resolve_image_source_to_path(source)
+        try:
+            # 使用 tmp_path
+            ...
+        finally:
+            if tmp_path and Path(tmp_path).exists():
+                Path(tmp_path).unlink(missing_ok=True)
+
+    Args:
+        source: 图片源（URL/文件/base64/data URL）
+        image_input_mode: 参考图处理模式（统一 base64）
+        api_client: 用于 normalize 的 API 客户端（可选）
+        download_qq_image_fn: 处理 qpic 链接的下载函数（可选，需为 async）
+        is_valid_checker: base64 校验函数
+        logger_obj: 日志对象
+
+    Returns:
+        本地文件路径，失败返回 None。若为临时文件，调用方需负责清理。
+    """
+    if not source:
+        return None
+
+    src = str(source).strip()
+    # 修正 HTML 转义的参数
+    if "&amp;" in src:
+        src = src.replace("&amp;", "&")
+    if not src:
+        return None
+
+    # 本地文件或 file://
+    fs_path = file_uri_to_path(src)
+    if fs_path is not None and fs_path.exists():
+        return str(fs_path)
+    if os.path.exists(src):
+        return src
+
+    # base64/data URL - 使用统一的解码函数
+    if is_valid_checker(src):
+        result = _decode_base64_to_temp_file(
+            src, verify_image=True, logger_obj=logger_obj
+        )
+        if result:
+            return result
+
+    # http(s) 下载
+    if src.startswith(("http://", "https://")):
+        parsed_host = ""
+        try:
+            parsed_host = urllib.parse.urlparse(src).netloc or ""
+        except Exception:
+            parsed_host = ""
+
+        try:
+            # 命中下载缓存直接返回文件
+            cached = check_reference_image_cache(src, REFERENCE_IMAGE_CACHE_DIR)
+            if cached:
+                return str(cached)
+
+            data_url = None
+            is_qq = is_qq_image_host(parsed_host)
+
+            if download_qq_image_fn and is_qq:
+                try:
+                    data_url = await download_qq_image_fn(src, event=event)
+                except Exception:
+                    data_url = await download_qq_image_fn(src)
+
+            if not data_url and api_client:
+                mime_type, b64 = await api_client._normalize_reference_image_input(
+                    src, image_input_mode=image_input_mode
+                )
+                if b64:
+                    data_url = (
+                        b64
+                        if image_input_mode == "force_base64"
+                        else f"data:{mime_type};base64,{b64}"
+                    )
+
+            if not data_url:
+                timeout = aiohttp.ClientTimeout(total=12, connect=5)
+                headers = build_reference_image_headers(parsed_host, for_qq=is_qq)
+                trust_env_flag = not is_qq
+                async with aiohttp.ClientSession(
+                    headers=headers, trust_env=trust_env_flag
+                ) as session:
+                    async with session.get(src, timeout=timeout) as resp:
+                        if resp.status == 200:
+                            mime = resp.headers.get("Content-Type", "image/png")
+                            content = await resp.read()
+                            b64 = base64.b64encode(content).decode()
+                            data_url = f"data:{mime};base64,{b64}"
+
+            # 使用统一的解码函数
+            if data_url and is_valid_checker(data_url):
+                result = _decode_base64_to_temp_file(
+                    data_url, verify_image=True, logger_obj=logger_obj
+                )
+                if result:
+                    return result
+        except Exception as e:
+            logger_obj.warning(f"下载图片失败: {e} | {src[:80]}")
+
+    # 其他字符串尝试当作 base64
+    result = _decode_base64_to_temp_file(src, verify_image=True, logger_obj=logger_obj)
+    return result
+
+
+class AvatarManager:
+    """头像管理器"""
+
+    def __init__(self, images_dir: Path | None = None):
+        self.images_dir = images_dir
+
+    async def get_avatar(self, user_id: str, cache_name: str, event=None) -> str | None:
+        """
+        获取用户头像
+
+        Args:
+            user_id: 用户ID
+            cache_name: 缓存名称
+            event: AstrMessageEvent，用于调用NapCat API
+
+        Returns:
+            base64格式的头像数据
+        """
+        return await download_qq_avatar(user_id, cache_name, self.images_dir, event)
+
+
+# 为了向后兼容，提供一些旧名称的别名
+def download_qq_avatar_legacy(user_id: str, cache_name: str, event=None) -> str | None:
+    """
+    下载QQ头像的兼容函数
+
+    Args:
+        user_id: QQ用户ID
+        cache_name: 缓存文件名
+
+    Returns:
+        base64格式的头像数据，失败返回None
+    """
+    # 使用 asyncio.run() 简化异步调用
+    return asyncio.run(download_qq_avatar(user_id, cache_name, event=event))
+
+
+def format_error_message(error: Exception | str) -> str:
+    """已迁移到 :mod:`tl.format_error`。此处保留为向后兼容 re-export。
+
+    新代码请使用 ``from .format_error import format_error_message``。
+    """
+    from .format_error import format_error_message as _impl
+
+    return _impl(error)

@@ -1,0 +1,968 @@
+"""插件配置加载和管理模块"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+from astrbot.api import logger
+
+from . import provider_hooks as _provider_hooks
+from .limit_config import apply_limits, normalize_limits
+from .provider_loader import load_callable
+from .provider_metadata import (
+    get_provider_spec,
+    is_known_api_type,
+    iter_provider_specs,
+    normalize_api_type,
+    supports_image_edit,
+)
+from .provider_settings import candidate_is_keyless
+
+DOUBAO_SEQUENTIAL_IMAGES_MAX = _provider_hooks.DOUBAO_SEQUENTIAL_IMAGES_MAX
+DOUBAO_SEQUENTIAL_IMAGES_MIN = _provider_hooks.DOUBAO_SEQUENTIAL_IMAGES_MIN
+_validate_openai_images_settings = _provider_hooks.validate_openai_images_settings
+
+
+def _session_isolated_fallback_umo(
+    context: Any, umo: str | None, event: Any
+) -> str | None:
+    """unique_session 会话隔离改写导致 umo 查不到会话配置时，返回按真实群号重建的群 umo。"""
+    if not (umo and event):
+        return None
+    try:
+        get_extra = getattr(event, "get_extra", None)
+        if not callable(get_extra) or not get_extra("_session_isolated"):
+            return None
+        parts = umo.split(":", 2)
+        if len(parts) != 3:
+            return None
+        group_id = event.get_group_id()
+        if not group_id or group_id == parts[2]:
+            return None
+        mgr = getattr(context, "astrbot_config_mgr", None)
+        if mgr is None:
+            return None
+        if mgr.get_conf_info(umo).get("id", "default") != "default":
+            return None
+        rebuilt = f"{parts[0]}:{parts[1]}:{group_id}"
+        if mgr.get_conf_info(rebuilt).get("id", "default") == "default":
+            return None
+        return rebuilt
+    except Exception:
+        return None
+
+
+def get_session_tool_timeout(
+    context: Any, umo: str | None = None, event: Any = None
+) -> int:
+    """读取会话的框架工具超时，兼容 agent_runner 配置迁移前的版本。"""
+    try:
+        config = context.get_config(umo=umo) if umo else context.get_config()
+        fallback_umo = _session_isolated_fallback_umo(context, umo, event)
+        if fallback_umo:
+            config = context.get_config(umo=fallback_umo)
+        misc = config.get("agent_runner", {}).get("config", {}).get("misc", {})
+        if "tool_call_timeout" in misc:
+            return misc["tool_call_timeout"]
+        return config.get("provider_settings", {}).get("tool_call_timeout", 120)
+    except Exception as e:
+        logger.warning(f"获取 tool_call_timeout 配置失败: {e}，使用默认值 120 秒")
+        return 120
+
+
+def _clean_string(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _clean_api_keys(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def _clean_non_negative_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clean_positive_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return max(int(value), 1)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_int(
+    value: Any,
+    default: int,
+    minimum: int,
+    maximum: int,
+    *,
+    allow_zero: bool = False,
+) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if allow_zero and parsed == 0:
+        return 0
+    return min(max(parsed, minimum), maximum)
+
+
+def _clean_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "0", "no", "off"}
+    return bool(value)
+
+
+def _clean_priority(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _entry_model(api_type: str, settings: dict[str, Any]) -> str:
+    spec = get_provider_spec(api_type)
+    model_field = spec.model_field if spec else "model"
+    return _clean_string(settings.get(model_field))
+
+
+@dataclass(frozen=True)
+class ProviderCandidate:
+    """单条供应商候选配置。"""
+
+    id: str
+    api_type: str
+    settings: dict[str, Any]
+    priority: int = 0
+    order: int = 0
+    supports_image_edit: bool = True
+    model_alias: str | None = None
+
+    @property
+    def api_keys(self) -> list[str]:
+        return self.settings.get("api_keys") or []
+
+    @property
+    def model(self) -> str:
+        return _entry_model(self.api_type, self.settings)
+
+    @property
+    def api_base(self) -> str:
+        return _clean_string(self.settings.get("api_base"))
+
+    @property
+    def proxy(self) -> str | None:
+        proxy = self.settings.get("proxy")
+        return proxy if isinstance(proxy, str) and proxy else None
+
+
+@dataclass
+class PluginConfig:
+    """插件配置数据类"""
+
+    # API 设置
+    vision_provider_id: str = ""
+    vision_model: str = ""
+    proxy: str | None = None
+
+    # 供应商特定设置
+    doubao_settings: dict[str, Any] = field(default_factory=dict)
+    minimax_settings: dict[str, Any] = field(default_factory=dict)
+    stepfun_settings: dict[str, Any] = field(default_factory=dict)
+    sensenova_settings: dict[str, Any] = field(default_factory=dict)
+    xai_settings: dict[str, Any] = field(default_factory=dict)
+    openai_images_settings: dict[str, Any] = field(default_factory=dict)
+    agnes_ai_settings: dict[str, Any] = field(default_factory=dict)
+    dashscope_settings: dict[str, Any] = field(default_factory=dict)
+    modelscope_settings: dict[str, Any] = field(default_factory=dict)
+    siliconflow_settings: dict[str, Any] = field(default_factory=dict)
+
+    # 供应商配置覆盖
+    # 结构：{candidate_id: {api_keys: [...], daily_limit_per_key: int, ...}}
+    provider_settings_by_type: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict
+    )
+    provider_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
+    provider_candidates: list[ProviderCandidate] = field(default_factory=list)
+    # 全部启用候选（含未加入轮询表的条目）：仅工作台可选，聊天链路仍用 provider_candidates
+    provider_candidates_all: list[ProviderCandidate] = field(default_factory=list)
+    provider_polling: list[str] = field(default_factory=list)
+    provider_config_errors: list[str] = field(default_factory=list)
+
+    # 图像生成设置
+    enable_sticker_split: bool = True
+    enable_sticker_zip: bool = False
+    preserve_reference_image_size: bool = False
+    enable_llm_crop: bool = True
+    image_input_mode: str = "force_base64"
+    max_inline_image_size_mb: float = 2.0  # 本地图片 base64 编码阈值（MB）
+    llm_tool_timeout_reserve_percent: int = 50
+    llm_tool_reference_path_mode: str = "whitelist"  # "whitelist" | "global"
+    llm_tool_reference_allowed_dirs: list[str] = field(default_factory=list)
+    batch_max_images_per_task: int = 10
+    batch_max_tasks: int = 20
+    batch_concurrency: int = 3
+    generation_max_concurrency: int = 3
+    generation_max_queue_size: int = 100
+    background_task_retention_hours: int = 24
+    background_failure_notify_llm: bool = True
+
+    # WebUI 工作台
+    webui_history_enabled: bool = True
+    webui_history_max_records: int = 500
+    webui_gallery_max_size_mb: int = 512
+    webui_upload_max_mb: int = 20
+    webui_max_concurrent_jobs: int = 2
+    webui_batch_total_budget: int = 40
+
+    # 表情包设置
+    sticker_grid_rows: int = 4
+    sticker_grid_cols: int = 4
+    sticker_bbox_rows: int = 6
+    sticker_bbox_cols: int = 4
+
+    # 快速模式覆盖
+    quick_mode_overrides: dict[str, tuple[str | None, str | None]] = field(
+        default_factory=dict
+    )
+
+    # 重试设置
+    max_attempts_per_key: int = 3
+    enable_smart_retry: bool = True
+    total_timeout: int = 120
+
+    # 服务设置
+    napcat_stream_threshold_mb: float = 2.0
+    auto_avatar_reference: bool = False
+    reference_cross_session: bool = False
+    template_hub_mode: str = "cache"
+    template_hub_url: str = ""
+    template_hub_key: str = ""
+    show_duration_stats: bool = True
+    show_retry_stats: bool = True
+    show_token_usage_stats: bool = True
+    image_cache_max_size_mb: float = 512.0
+
+    # 帮助页渲染
+    help_render_mode: str = "html"
+    html_render_options: dict[str, Any] = field(default_factory=dict)
+
+    # 限制设置
+    group_limit_mode: str = "none"
+    group_limit_list: set[str] = field(default_factory=set)
+    limit_config_error: str = ""
+    global_rate_limit: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "period_seconds": 60,
+            "max_requests": 5,
+        }
+    )
+    # 限流规则列表
+    rate_limit_rules: list[dict[str, Any]] = field(default_factory=list)
+    # 默认限流设置（未匹配规则时使用）
+    default_rate_limit: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "period_seconds": 60,
+            "max_requests": 5,
+        }
+    )
+
+
+def max_configured_reference_images(candidates: Any) -> int:
+    """Return the largest configured reference-image limit across candidates."""
+    max_refs = 0
+    for candidate in candidates or []:
+        settings = getattr(candidate, "settings", None) or {}
+        try:
+            max_refs = max(
+                max_refs,
+                int(settings.get("max_reference_images", 0)),
+            )
+        except (TypeError, ValueError):
+            continue
+    return max_refs
+
+
+# 快速模式键列表
+QUICK_MODES = (
+    "avatar",
+    "poster",
+    "wallpaper",
+    "card",
+    "mobile",
+    "figure",
+    "sticker",
+)
+
+
+class ConfigLoader:
+    """配置加载器"""
+
+    def __init__(
+        self,
+        raw_config: dict[str, Any],
+        *,
+        data_dir: str | None = None,
+    ):
+        self.raw_config = raw_config
+        self._migrated = False
+        self._data_dir = data_dir  # 插件持久化存储目录
+
+    def _needs_migration(self) -> list[str]:
+        """检测哪些配置需要迁移
+
+        Returns:
+            需要迁移的配置项列表
+        """
+        migrations_needed = []
+
+        # 检查 limit_settings 是否使用旧版格式
+        limit_settings = self.raw_config.get("limit_settings")
+        if isinstance(limit_settings, dict):
+            has_old_fields = "enable_rate_limit" in limit_settings
+            has_new_rules = "rate_limit_rules" in limit_settings
+            if has_old_fields and not has_new_rules:
+                migrations_needed.append("limit_settings")
+
+        # 检查 quick_mode_settings 是否使用旧版 object 格式
+        quick_mode_settings = self.raw_config.get("quick_mode_settings")
+        if isinstance(quick_mode_settings, dict):
+            migrations_needed.append("quick_mode_settings")
+
+        return migrations_needed
+
+    def _get_migration_marker_path(self) -> str | None:
+        """获取迁移标记文件路径"""
+        import os
+
+        if not self._data_dir:
+            return None
+        return os.path.join(self._data_dir, ".migration_v1.9.0.done")
+
+    def _is_migration_done(self) -> bool:
+        """检查迁移是否已完成"""
+        import os
+
+        marker_path = self._get_migration_marker_path()
+        if not marker_path:
+            return False
+        return os.path.exists(marker_path)
+
+    def _mark_migration_done(self) -> None:
+        """标记迁移已完成"""
+        import os
+
+        marker_path = self._get_migration_marker_path()
+        if not marker_path:
+            return
+        try:
+            os.makedirs(self._data_dir, exist_ok=True)
+            with open(marker_path, "w", encoding="utf-8") as f:
+                f.write("migration completed\n")
+        except Exception as e:
+            logger.debug(f"无法写入迁移标记文件: {e}")
+
+    def _backup_config(self, migration_items: list[str]) -> str | None:
+        """备份旧配置到插件持久化存储目录
+
+        Args:
+            migration_items: 需要迁移的配置项列表
+
+        Returns:
+            备份文件路径，失败返回 None
+        """
+        import json
+        import os
+        from datetime import datetime
+
+        if not self._data_dir:
+            logger.warning("未提供插件数据目录，跳过配置备份")
+            return None
+
+        try:
+            # 确保目录存在
+            os.makedirs(self._data_dir, exist_ok=True)
+
+            # 生成备份文件名（包含迁移前版本信息）
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            # 获取迁移前版本号（从 marker 文件名推断上一个版本）
+            from_version = "pre_v1.9.0"
+            backup_filename = f"config_backup_{from_version}_{timestamp}.json"
+            backup_path = os.path.join(self._data_dir, backup_filename)
+
+            # 写入备份
+            with open(backup_path, "w", encoding="utf-8") as f:
+                json.dump(self.raw_config, f, ensure_ascii=False, indent=2)
+
+            items_str = ", ".join(migration_items)
+            logger.info(f"配置已备份到: {backup_path}")
+            logger.info(f"将迁移以下配置项: {items_str}")
+            return backup_path
+        except Exception as e:
+            logger.warning(f"配置备份失败: {e}")
+            return None
+
+    def _migrate_config(self) -> bool:
+        """迁移旧版配置到新版格式
+
+        迁移内容：
+        1. limit_settings 旧版字段 -> rate_limit_rules
+        2. quick_mode_settings 从 object 格式迁移到 template_list 格式
+
+        Returns:
+            bool: 是否进行了迁移
+        """
+        if self._migrated:
+            return False
+        self._migrated = True
+
+        # 检查是否已经完成迁移（持久化标记）
+        if self._is_migration_done():
+            return False
+
+        # 检测需要迁移的项目
+        migrations_needed = self._needs_migration()
+        if not migrations_needed:
+            return False
+
+        # 备份旧配置
+        logger.info("检测到旧版配置格式，开始迁移...")
+        self._backup_config(migrations_needed)
+
+        migrated = False
+
+        # 迁移旧版限流配置到 rate_limit_rules
+        limit_settings = self.raw_config.get("limit_settings")
+        if isinstance(limit_settings, dict):
+            has_old_fields = "enable_rate_limit" in limit_settings
+            has_new_rules = "rate_limit_rules" in limit_settings
+
+            if has_old_fields and not has_new_rules:
+                # 旧版启用了限流，迁移为一条规则
+                old_enabled = limit_settings.get("enable_rate_limit", False)
+                if old_enabled:
+                    new_rule = {
+                        "__template_key": "rule",
+                        "rule_name": "默认规则（迁移）",
+                        "group_ids": [],  # 空表示匹配所有
+                        "enabled": True,
+                        "period_seconds": limit_settings.get("rate_limit_period", 60),
+                        "max_requests": limit_settings.get("max_requests_per_group", 5),
+                    }
+                    limit_settings["rate_limit_rules"] = [new_rule]
+                    logger.info("配置迁移: 旧版限流配置 -> rate_limit_rules")
+                else:
+                    # 旧版未启用限流，设置空规则列表
+                    limit_settings["rate_limit_rules"] = []
+                    logger.info("配置迁移: 旧版限流未启用，设置空规则列表")
+                migrated = True
+
+        # 迁移旧版 quick_mode_settings 从 object 格式到 template_list 格式
+        quick_mode_settings = self.raw_config.get("quick_mode_settings")
+        if isinstance(quick_mode_settings, dict):
+            new_quick_mode_list = []
+            for mode_key in QUICK_MODES:
+                mode_settings = quick_mode_settings.get(mode_key)
+                if isinstance(mode_settings, dict):
+                    resolution = (mode_settings.get("resolution") or "").strip()
+                    aspect_ratio = (mode_settings.get("aspect_ratio") or "").strip()
+                    if resolution or aspect_ratio:
+                        new_entry = {"__template_key": mode_key}
+                        if resolution:
+                            new_entry["resolution"] = resolution
+                        if aspect_ratio:
+                            new_entry["aspect_ratio"] = aspect_ratio
+                        new_quick_mode_list.append(new_entry)
+            self.raw_config["quick_mode_settings"] = new_quick_mode_list
+            logger.info("配置迁移: quick_mode_settings object -> template_list")
+            migrated = True
+
+        # 标记迁移完成
+        if migrated:
+            self._mark_migration_done()
+
+        return migrated
+
+    def _parse_provider_settings(self, config: PluginConfig) -> None:
+        provider_settings = self.raw_config.get("provider_settings") or {}
+        if not isinstance(provider_settings, dict):
+            provider_settings = {}
+
+        config.vision_provider_id = provider_settings.get("vision_provider_id") or ""
+        config.vision_model = (provider_settings.get("vision_model") or "").strip()
+        config.proxy = str(provider_settings.get("proxy") or "").strip() or None
+
+        provider_overrides = provider_settings.get("provider_overrides") or []
+        candidates_by_type: dict[str, list[ProviderCandidate]] = {}
+
+        if isinstance(provider_overrides, list):
+            for order, override in enumerate(provider_overrides):
+                if not isinstance(override, dict):
+                    continue
+                template_key = normalize_api_type(override.get("__template_key"))
+                if not template_key:
+                    message = f"第 {order + 1} 条供应商配置缺少供应商名称"
+                    config.provider_config_errors.append(message)
+                    logger.error(f"[配置加载] {message}")
+                    continue
+                if not is_known_api_type(template_key):
+                    message = f"未知供应商配置: {template_key}"
+                    config.provider_config_errors.append(message)
+                    logger.error(f"[配置加载] {message}")
+                    continue
+                spec = get_provider_spec(template_key)
+                if spec is None:
+                    message = f"未知供应商配置: {template_key}"
+                    config.provider_config_errors.append(message)
+                    logger.error(f"[配置加载] {message}")
+                    continue
+
+                settings = override.copy()
+                settings.pop("__template_key", None)
+
+                # 条目级开关：禁用条目不参与轮询和生图
+                enabled = settings.pop("enabled", True)
+                if isinstance(enabled, str):
+                    enabled = enabled.strip().lower() not in (
+                        "false",
+                        "0",
+                        "no",
+                        "off",
+                    )
+                elif enabled is None:
+                    enabled = True
+                if not enabled:
+                    logger.info(
+                        f"[配置加载] {template_key} 第 {order + 1} 条配置已禁用，跳过"
+                    )
+                    continue
+                settings["api_keys"] = _clean_api_keys(settings.get("api_keys"))
+                settings["daily_limit_per_key"] = _clean_non_negative_int(
+                    settings.get("daily_limit_per_key")
+                )
+                settings["priority"] = _clean_priority(settings.get("priority"))
+                settings["max_reference_images"] = _clean_non_negative_int(
+                    settings.get("max_reference_images"), 6
+                )
+                for key in (
+                    "model",
+                    "endpoint_id",
+                    "model_capability",
+                    "api_base",
+                    "endpoint_mode",
+                    "resolution",
+                    "aspect_ratio",
+                    "resolution_param_name",
+                    "aspect_ratio_param_name",
+                    "default_size",
+                    "optimize_prompt_mode",
+                    "sequential_image_generation",
+                    "response_format",
+                    "output_format",
+                    "reference_image_mode",
+                    "size",
+                    "custom_size",
+                    "negative_prompt",
+                    "model_alias",
+                    "project_id",
+                    "location",
+                    "person_generation",
+                    "service_account_json",
+                ):
+                    if isinstance(settings.get(key), str):
+                        settings[key] = settings[key].strip()
+
+                proxy_val = settings.get("proxy")
+                settings["proxy"] = (
+                    proxy_val.strip() if isinstance(proxy_val, str) else None
+                )
+                if spec.settings_validator_path:
+                    # 校验 hook 抛错表示该条配置不合法：记录错误并跳过该条，不阻断插件加载
+                    try:
+                        load_callable(spec.settings_validator_path)(settings)
+                    except Exception as exc:
+                        message = f"{template_key} 第 {len(candidates_by_type.get(template_key, [])) + 1} 条配置无效: {exc}"
+                        config.provider_config_errors.append(message)
+                        logger.error(f"[配置加载] {message}")
+                        continue
+                if spec.settings_normalizer_path:
+                    load_callable(spec.settings_normalizer_path)(settings)
+
+                model_name = _entry_model(template_key, settings)
+                if not model_name:
+                    message = f"{template_key} 第 {len(candidates_by_type.get(template_key, [])) + 1} 条配置缺少模型"
+                    config.provider_config_errors.append(message)
+                    logger.error(f"[配置加载] {message}")
+                    continue
+
+                # requires_api_keys=False 的供应商允许以其他凭证（如服务账号文件）代替 api_keys
+                if not settings["api_keys"] and not candidate_is_keyless(
+                    template_key, settings
+                ):
+                    message = f"{template_key} 第 {len(candidates_by_type.get(template_key, [])) + 1} 条配置缺少 api_keys"
+                    config.provider_config_errors.append(message)
+                    logger.error(f"[配置加载] {message}")
+                    continue
+
+                edit_capable = supports_image_edit(template_key)
+                if spec.edit_capability_path:
+                    edit_capable = bool(
+                        load_callable(spec.edit_capability_path)(settings)
+                    )
+
+                candidate_index = len(candidates_by_type.get(template_key, [])) + 1
+                candidate = ProviderCandidate(
+                    id=f"{template_key}#{candidate_index}",
+                    api_type=template_key,
+                    settings=settings,
+                    priority=settings["priority"],
+                    order=order,
+                    supports_image_edit=edit_capable,
+                    model_alias=_clean_string(settings.get("model_alias")) or None,
+                )
+                candidates_by_type.setdefault(template_key, []).append(candidate)
+
+        for api_type, candidates in list(candidates_by_type.items()):
+            candidates_by_type[api_type] = sorted(
+                candidates,
+                key=lambda item: (-item.priority, item.order),
+            )
+
+        polling_raw = provider_settings.get("provider_polling") or []
+        polling: list[str] = []
+        seen: set[str] = set()
+        if isinstance(polling_raw, list):
+            for value in polling_raw:
+                api_type = normalize_api_type(value)
+                if not api_type or api_type in seen:
+                    continue
+                seen.add(api_type)
+                if not is_known_api_type(api_type):
+                    message = f"轮询表包含未知供应商: {api_type}"
+                    config.provider_config_errors.append(message)
+                    logger.error(f"[配置加载] {message}")
+                    continue
+                polling.append(api_type)
+
+        if not polling:
+            polling = [
+                api_type
+                for api_type in candidates_by_type
+                if api_type in candidates_by_type
+            ]
+            extra_candidates = []
+        else:
+            missing_from_polling = [
+                api_type for api_type in candidates_by_type if api_type not in seen
+            ]
+            if missing_from_polling:
+                # 未入轮询的启用条目仍保留给工作台手动选择，只是不参与聊天自动生成。
+                message = (
+                    "已启用但未加入轮询表（聊天生成不参与，工作台仍可选择）: "
+                    + ", ".join(missing_from_polling)
+                )
+                logger.warning(f"[配置加载] {message}")
+
+            polling_set = set(polling)
+            extra_candidates = [
+                candidate
+                for api_type, candidates in candidates_by_type.items()
+                if api_type not in polling_set
+                for candidate in candidates
+            ]
+
+        ordered_candidates: list[ProviderCandidate] = []
+        for api_type in polling:
+            ordered_candidates.extend(candidates_by_type.get(api_type, []))
+
+        if not ordered_candidates:
+            message = "未找到任何有效供应商配置"
+            config.provider_config_errors.append(message)
+            logger.error(f"[配置加载] {message}")
+
+        config.provider_polling = polling
+        config.provider_candidates = ordered_candidates
+        config.provider_candidates_all = ordered_candidates + extra_candidates
+        config.provider_overrides = {
+            candidate.id: candidate.settings
+            for candidate in config.provider_candidates_all
+        }
+        config.provider_settings_by_type = {}
+        for candidate in ordered_candidates:
+            config.provider_settings_by_type.setdefault(candidate.api_type, []).append(
+                candidate.settings
+            )
+
+        for spec in iter_provider_specs():
+            if spec.settings_attr:
+                setattr(
+                    config,
+                    spec.settings_attr,
+                    self._first_settings_for(ordered_candidates, spec.api_type),
+                )
+
+    @staticmethod
+    def _first_settings_for(
+        candidates: list[ProviderCandidate], api_type: str
+    ) -> dict[str, Any]:
+        for candidate in candidates:
+            if candidate.api_type == api_type:
+                return candidate.settings
+        return {}
+
+    def _normalize_doubao_settings(self, settings: dict[str, Any]) -> None:
+        _provider_hooks.normalize_doubao_settings(settings)
+
+    def load(self) -> PluginConfig:
+        """加载配置并返回 PluginConfig 实例"""
+        # 先执行配置迁移
+        self._migrate_config()
+
+        config = PluginConfig()
+
+        self._parse_provider_settings(config)
+
+        # 图像生成设置
+        image_settings = self.raw_config.get("image_generation_settings") or {}
+        config.enable_sticker_split = image_settings.get("enable_sticker_split", True)
+        config.enable_sticker_zip = image_settings.get("enable_sticker_zip") or False
+        config.preserve_reference_image_size = (
+            image_settings.get("preserve_reference_image_size") or False
+        )
+        config.enable_llm_crop = image_settings.get("enable_llm_crop", True)
+        max_size = image_settings.get("max_inline_image_size_mb")
+        if max_size is not None:
+            try:
+                config.max_inline_image_size_mb = max(float(max_size), 0.1)
+            except (TypeError, ValueError):
+                config.max_inline_image_size_mb = (
+                    PluginConfig().max_inline_image_size_mb
+                )
+        timeout_reserve_percent = image_settings.get("llm_tool_timeout_reserve_percent")
+        if timeout_reserve_percent is not None:
+            try:
+                config.llm_tool_timeout_reserve_percent = min(
+                    max(int(timeout_reserve_percent), 1),
+                    100,
+                )
+            except (TypeError, ValueError):
+                config.llm_tool_timeout_reserve_percent = (
+                    PluginConfig().llm_tool_timeout_reserve_percent
+                )
+
+        # LLM 工具本地路径参考图：模式与白名单目录
+        ref_path_mode = (
+            str(image_settings.get("llm_tool_reference_path_mode") or "whitelist")
+            .strip()
+            .lower()
+        )
+        config.llm_tool_reference_path_mode = (
+            "global" if ref_path_mode == "global" else "whitelist"
+        )
+        raw_allowed_dirs = image_settings.get("llm_tool_reference_allowed_dirs")
+        if isinstance(raw_allowed_dirs, list):
+            config.llm_tool_reference_allowed_dirs = [
+                item.strip()
+                for item in raw_allowed_dirs
+                if isinstance(item, str) and item.strip()
+            ]
+
+        config.batch_max_images_per_task = _clean_positive_int(
+            image_settings.get("batch_max_images_per_task"), 10
+        )
+        config.batch_max_tasks = _clean_positive_int(
+            image_settings.get("batch_max_tasks"), 20
+        )
+        config.batch_concurrency = _clean_positive_int(
+            image_settings.get("batch_concurrency"), 3
+        )
+        config.generation_max_concurrency = _clean_positive_int(
+            image_settings.get("generation_max_concurrency"), 3
+        )
+        config.generation_max_queue_size = _clean_positive_int(
+            image_settings.get("generation_max_queue_size"), 100
+        )
+        config.background_task_retention_hours = _clean_positive_int(
+            image_settings.get("background_task_retention_hours"), 24
+        )
+        config.background_failure_notify_llm = bool(
+            image_settings.get("background_failure_notify_llm", True)
+        )
+
+        webui_settings = self.raw_config.get("webui") or {}
+        if not isinstance(webui_settings, dict):
+            webui_settings = {}
+        config.webui_history_enabled = _clean_bool(
+            webui_settings.get("history_enabled"), True
+        )
+        config.webui_history_max_records = _clamp_int(
+            webui_settings.get("history_max_records"), 500, 50, 5000
+        )
+        config.webui_gallery_max_size_mb = _clamp_int(
+            webui_settings.get("gallery_max_size_mb"),
+            512,
+            64,
+            10240,
+            allow_zero=True,
+        )
+        config.webui_upload_max_mb = _clamp_int(
+            webui_settings.get("upload_max_mb"), 20, 1, 64
+        )
+        config.webui_max_concurrent_jobs = _clamp_int(
+            webui_settings.get("max_concurrent_jobs"), 2, 1, 8
+        )
+        config.webui_batch_total_budget = _clamp_int(
+            webui_settings.get("batch_total_budget"), 40, 4, 200
+        )
+
+        # 表情包网格设置
+        grid_raw = str(image_settings.get("sticker_grid") or "4x4").strip()
+        m = re.match(r"^\s*(\d{1,2})\s*[xX]\s*(\d{1,2})\s*$", grid_raw)
+        if m:
+            config.sticker_grid_rows = int(m.group(1))
+            config.sticker_grid_cols = int(m.group(2))
+        config.sticker_grid_rows = min(max(config.sticker_grid_rows, 1), 20)
+        config.sticker_grid_cols = min(max(config.sticker_grid_cols, 1), 20)
+
+        # 快速模式覆盖 - template_list 格式
+        quick_mode_settings = self.raw_config.get("quick_mode_settings") or []
+        if isinstance(quick_mode_settings, list):
+            for mode_entry in quick_mode_settings:
+                if isinstance(mode_entry, dict):
+                    mode_key = mode_entry.get("__template_key")
+                    if mode_key and mode_key in QUICK_MODES:
+                        override_res = (mode_entry.get("resolution") or "").strip()
+                        override_ar = (mode_entry.get("aspect_ratio") or "").strip()
+                        if override_res or override_ar:
+                            config.quick_mode_overrides[mode_key] = (
+                                override_res or None,
+                                override_ar or None,
+                            )
+
+        # 重试设置
+        retry_settings = self.raw_config.get("retry_settings") or {}
+        config.max_attempts_per_key = retry_settings.get("max_attempts_per_key") or 3
+        config.enable_smart_retry = retry_settings.get("enable_smart_retry", True)
+        config.total_timeout = retry_settings.get("total_timeout") or 120
+
+        # 服务设置
+        service_settings = self.raw_config.get("service_settings") or {}
+        try:
+            config.napcat_stream_threshold_mb = float(
+                service_settings.get("napcat_stream_threshold_mb", 2.0)
+            )
+        except (TypeError, ValueError):
+            config.napcat_stream_threshold_mb = 2.0
+        config.napcat_stream_threshold_mb = max(config.napcat_stream_threshold_mb, 0.0)
+        config.auto_avatar_reference = (
+            service_settings.get("auto_avatar_reference") or False
+        )
+        config.reference_cross_session = _clean_bool(
+            service_settings.get("reference_cross_session"), False
+        )
+        mode = str(service_settings.get("template_hub_mode") or "cache").strip().lower()
+        config.template_hub_mode = (
+            mode if mode in ("cache", "online", "off") else "cache"
+        )
+        config.template_hub_url = str(
+            service_settings.get("template_hub_url") or ""
+        ).strip()
+        config.template_hub_key = str(
+            service_settings.get("template_hub_key") or ""
+        ).strip()
+        config.show_duration_stats = service_settings.get("show_duration_stats", True)
+        config.show_retry_stats = service_settings.get("show_retry_stats", True)
+        config.show_token_usage_stats = service_settings.get(
+            "show_token_usage_stats", True
+        )
+        try:
+            config.image_cache_max_size_mb = max(
+                float(service_settings.get("image_cache_max_size_mb", 512.0)), 0.0
+            )
+        except (TypeError, ValueError):
+            config.image_cache_max_size_mb = 512.0
+
+        # 帮助页渲染
+        config.help_render_mode = self.raw_config.get("help_render_mode") or "html"
+        config.html_render_options = self._load_html_render_options(service_settings)
+
+        # 限制设置
+        self._load_limit_settings(config)
+
+        return config
+
+    def _load_html_render_options(
+        self, service_settings: dict[str, Any]
+    ) -> dict[str, Any]:
+        """加载 HTML 渲染选项"""
+        html_render_options = (
+            self.raw_config.get("html_render_options")
+            or service_settings.get("html_render_options")
+            or {}
+        )
+
+        # 设置默认值以确保图片清晰度和完整性
+        defaults = {
+            "scale": "device",
+            "full_page": True,
+            "type": "png",
+        }
+        for key, default_val in defaults.items():
+            html_render_options.setdefault(key, default_val)
+
+        try:
+            quality_val = html_render_options.get("quality")
+            if quality_val is not None:
+                quality_int = int(quality_val)
+                if 1 <= quality_int <= 100:
+                    html_render_options["quality"] = quality_int
+                else:
+                    logger.warning(
+                        "html_render_options.quality 超出范围(1-100)，已忽略"
+                    )
+                    html_render_options.pop("quality", None)
+
+            type_val = html_render_options.get("type")
+            if type_val and str(type_val).lower() not in {"png", "jpeg"}:
+                logger.warning("html_render_options.type 仅支持 png/jpeg，已忽略")
+                html_render_options.pop("type", None)
+
+            scale_val = html_render_options.get("scale")
+            if scale_val and str(scale_val) not in {"css", "device"}:
+                logger.warning("html_render_options.scale 仅支持 css/device，已忽略")
+                html_render_options.pop("scale", None)
+        except Exception:
+            logger.warning("解析 html_render_options 失败，已忽略质量设置")
+            html_render_options.pop("quality", None)
+
+        return html_render_options
+
+    def _load_limit_settings(self, config: PluginConfig):
+        """加载限制设置"""
+        limit_settings = self.raw_config.get("limit_settings") or {}
+        if not isinstance(limit_settings, dict):
+            config.limit_config_error = "限制设置必须是对象"
+            logger.warning("[限流] 限制设置格式无效，暂停生成准入")
+            return
+
+        try:
+            apply_limits(config, normalize_limits(limit_settings, strict=False))
+        except ValueError as exc:
+            config.limit_config_error = str(exc)
+            logger.warning(f"[限流] 配置无效，暂停生成准入: {exc}")

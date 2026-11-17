@@ -1,0 +1,2 @@
+# Optional vector acceleration; NumPy search works without this.
+faiss-cpu>=1.8.0

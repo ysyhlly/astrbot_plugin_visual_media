@@ -1,0 +1,803 @@
+# 配置参考
+
+本文档记录插件的完整配置项。README 只保留最小配置和常用入口。
+
+
+## 必填配置
+
+| 配置项 | 说明 |
+|--------|------|
+| `provider_settings.provider_overrides` | 生图供应商配置表，至少添加一条有效模板并填写 `api_keys` 和模型字段 |
+| `provider_settings.provider_polling` | 可选轮询顺序；留空时按有效配置自动尝试 |
+
+## provider_settings
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `proxy` | - | 全局代理地址，支持 `http://`、`https://`、`socks5://`；留空读取环境变量 |
+| `vision_provider_id` | - | 可选，用于切图前 AI 识别网格行列 |
+| `vision_model` | - | 可选，视觉识别模型名 |
+| `provider_polling` | `[]` | 供应商轮询表，按列表从上到下尝试；重复项自动去重 |
+| `provider_overrides` | `[]` | 生图供应商配置表，可添加多个相同类型模板 |
+
+### Studio 配置保存
+
+「供应商配置」按配置条目、轮询排序、公共设置分区，读取全部原始条目而非仅有效候选。表单来自当前 schema；工作台的临时参数弹窗不修改这些持久配置。
+
+- 新增条目在 Studio 默认停用，填写模型与 Key 后再启用；禁用或未知的旧条目保留，未知条目只能保留或删除。
+- 拖动只改变跨供应商轮询顺序；空列表保持自动模式，同类型仍按 `priority` 和表内顺序排序。打开页面或仅排序不会补写缺省字段、清除旧字段。
+- 已有 Key 默认以「••••••••」省略显示，点击「显示」后才在已鉴权页面查看完整明文：单个用单行输入，多个以标签摘要展示；管理子视图支持逐项编辑、移除和批量追加去重，统一保存后生效。不写入浏览器持久存储或日志；带认证信息的地址仍需显式替换或清空，其他接口不返回 Key。
+- 生成空闲时通过宿主配置接口热保存，与限流页共用事务锁；保存期间暂不接受新生成，不取消已有任务，不重载插件。忙碌时可保留草稿稍后重试；版本冲突须先重新加载。
+- 切换候选、客户端、代理、视觉参数及工具能力时保留同供应商、同 Key 的每日用量，包括调整条目顺序后的重启恢复。KV 读取或用量检查点保存失败时拒绝应用；有每日限额的候选在用量无法读取时暂不发起请求，恢复后重试。
+- 持久化失败保持原运行时，应用失败回滚；回滚失败暂停生成并提示重载，避免磁盘与运行时配置不一致。不会另行导出含密钥的配置备份。
+
+### 模型目录与视觉提供商
+
+- 视觉下拉对齐本体 `provider` / `provider_sources` 配置，筛选已启用的 `chat_completion`；启用但未加载的条目仍可见并标注状态。刷新失败保留名单和选择，手填作为回退。
+- 生图目录当前接入 Google、Gemini Interactions、OpenAI 兼容、OpenAI Images、Agnes AI、MiniMax、阶跃星辰、ModelScope、xAI、SiliconFlow；其余渠道仍可手填。保留当前自定义路径及 StepPlan 前缀，不偷偷回退普通端点；列表来自上游，不保证每个模型都支持生图。
+- 仅点击时使用当前连接草稿和第一个有效 Key 查询，代理优先级不变，不保存配置、不扣生成额度；使用已有 Key 请求变更后的地址或代理时先确认目标。视觉模型由选中的已加载本体实例提供，查询不会改变其配置。
+- 查询上限为 2 并发、2 排队、20 秒总时限、2 MiB 响应及 2000 个模型；Google 最多 5 页。禁止自动重定向，失败、空列表或迟到响应不会清空当前模型。
+- 官方目录协议：[Google](https://ai.google.dev/api/models)、[OpenAI](https://developers.openai.com/api/reference/resources/models/methods/list)、[xAI](https://docs.x.ai/developers/rest-api-reference/inference/models)、[SiliconFlow](https://docs.siliconflow.com/en/api-reference/models/get-model-list)。
+- 新增目录依据：[Agnes 客户端指南](https://wiki.agnes-ai.com/en/docs/cid6.md)、[MiniMax](https://platform.minimaxi.com/docs/api-reference/models/openai/list-models)、[阶跃星辰](https://platform.stepfun.com/docs/zh/api-reference/models/list)、[ModelScope 推理目录](https://api-inference.modelscope.cn/v1/models)。
+
+## provider_settings.provider_overrides
+
+`provider_overrides` 是 `template_list` 配置项。每条模板自带供应商类型，插件会从表中读取生图 API 配置，不再使用全局 `api_type`：
+
+| 通用配置项 | 默认值 | 说明 |
+|------------|--------|------|
+| `enabled` | `true` | 条目级开关；设为 `false` 临时停用本条模型配置但不删除，同渠道其他条目不受影响 |
+| `priority` | `0` | 同类型多条配置按优先级从高到低尝试；相同优先级按配置表从上到下 |
+| `api_keys` | `[]` | API Key 列表，支持多 Key 轮换 |
+| `daily_limit_per_key` | `0` | 每个 Key 每日调用上限，`0` 表示不限制 |
+| `model_alias` | - | 可选模型别名，供命令和 LLM 工具选择；可跨供应商复用，实际请求仍使用原始模型名 |
+| `model` | - | 模型名称；豆包使用 `endpoint_id` |
+| `api_base` | - | API 端点地址 |
+| `proxy` | - | 独立代理地址，优先级高于全局代理和环境变量 |
+| `resolution` | `1K` | 该供应商默认分辨率；快速模式覆盖值优先 |
+| `aspect_ratio` | `1:1` | 该供应商默认长宽比；快速模式覆盖值优先 |
+| `max_reference_images` | `6` | 该供应商最多使用的参考图数量 |
+
+LLM 工具的 `aspect_ratio` 全局枚举为各渠道官方支持比例的并集（标准 10 种 + Gemini 3.1 Flash 极端比例 `1:4`/`1:8`/`4:1`/`8:1` + xAI 宽幅 `2:1`/`1:2`/`19.5:9`/`9:19.5`/`20:9`/`9:20`）；渠道不支持的比例由 provider 层忽略并记录日志，xAI 按官方白名单精确声明（含 `auto`，不含 `4:5`/`5:4`/`21:9`）。
+
+加载规则：
+
+- `enabled` 为 `false` 的条目直接跳过，不校验模型/密钥、不参与轮询；重新设为 `true` 即可恢复。
+- 缺少供应商名称、未知模板、缺少模型或缺少 `api_keys` 的条目会记录配置错误并跳过。
+- 只要至少有一个有效供应商候选，插件仍可继续使用；如果没有任何有效候选，加载时会记录 `未找到任何有效供应商配置`。
+- 同类型多条配置先按 `priority` 从高到低排序；优先级相同时按配置表从上到下排序。
+- 改图或参考图请求会跳过不支持参考图的候选，例如 `sensenova` 或开启 `generations_only` 的 `openai_images`。
+
+`provider_polling` 只填写供应商名称，例如：
+
+```text
+google / openai_images / minimax
+```
+
+列表按从上到下尝试生成，重复名称会自动去重；未知名称会记录配置错误并跳过。留空时按配置表中有效供应商首次出现顺序自动生成轮询列表。未加入轮询的启用条目不参与聊天自动生成（仅记录警告），但仍会在工作台模型下拉中出现、可手动选择。
+
+支持的模板：
+
+```text
+google / gemini_interactions / vertex / openai / agnes_ai / xai / minimax / stepfun / openai_images / openai_responses / doubao / sensenova / senseaudio / dashscope / modelscope / siliconflow
+```
+
+下方 `doubao_settings`、`openai_images_settings`、`agnes_ai_settings`、`xai_settings`、`minimax_settings`、`stepfun_settings`、`sensenova_settings`、`dashscope_settings`、`modelscope_settings`、`siliconflow_settings` 章节对应这些模板的专用字段；`gemini_interactions` 无历史投影字段，全部配置都在模板内。代码中的同名 `*_settings` 字段仅作为兼容旧调用的首个候选投影；多候选场景以 `provider_settings.provider_overrides` 和运行时派生的 `provider_settings_by_type` 为准。
+
+## image_generation_settings
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `enable_sticker_split` | `true` | 表情包自动切割 |
+| `enable_sticker_zip` | `false` | 切分后打包 ZIP 发送 |
+| `sticker_grid` | `4x4` | 表情包提示词网格描述 |
+| `preserve_reference_image_size` | `false` | 改图时保留参考图尺寸 |
+| `max_inline_image_size_mb` | `2.0` | 本地图片 base64 编码阈值 |
+| `llm_tool_timeout_reserve_percent` | `50` | 为 `tool_call_timeout` 预留的百分比，剩余时间用于前台同步等待 |
+| `llm_tool_reference_path_mode` | `whitelist` | LLM 工具 `reference_image_paths` 的本地路径权限模式 |
+| `llm_tool_reference_allowed_dirs` | `[]` | `whitelist` 模式下额外允许的参考图目录 |
+| `batch_max_images_per_task` | `10` | 单个命名提示词的目标图片数量上限；供应商原生单次上限更小时自动拆分补齐 |
+| `batch_max_tasks` | `20` | 一次 `gemini_image_batch` 的 `tasks` 允许的命名任务条目上限 |
+| `batch_concurrency` | `3` | 后台批量生成并发数；每个条目内部按供应商单次上限顺序补齐 |
+| `generation_max_concurrency` | `3` | 指令、LLM、Studio 与外部插件共用的生成执行槽上限；重载生效 |
+| `generation_max_queue_size` | `100` | 全入口等待队列容量，不含执行请求；排队不占供应商请求超时，满时拒绝提交；重载生效 |
+| `background_task_retention_hours` | `24` | 后台任务状态记录保留时间；插件重启会把未完成任务标记为 `interrupted` |
+| `background_failure_notify_llm` | `true` | 无图片产出的后台生图失败时，由 AI 重新组织语言告知用户；回灌不可用时发送简短失败提示，关闭时直发错误文本。有图片产出的后台结果始终反向激活 AI，要求调用 `send_message_to_user` 发送图片 |
+
+分辨率、长宽比、最大参考图数量、Google 文本响应、Google 搜索接地、OpenAI/OpenAI 兼容参数名等均在 `provider_settings.provider_overrides` 的各供应商条目内配置。
+
+外部插件默认自行限流，显式选择接入后才扣本插件额度：有完整 UMO 时匹配会话规则，无 UMO 时按稳定插件标识独立应用默认限流。全局限流开启时额外叠加，关闭时默认限流仍生效。默认规则无需为每个插件重复配置，详见 [其他插件接入指南](plugin-api.md#限流与并发)。
+
+### LLM 工具本地路径参考图
+
+`gemini_image_generation` 工具支持 `reference_image_paths` 参数，用于让 LLM 复用上一次工具调用缓存在本地的图片，例如 `data/temp/tool_images/` 下的文件。
+
+路径守卫规则：
+
+- `llm_tool_reference_path_mode=whitelist`：默认模式，只允许默认目录和 `llm_tool_reference_allowed_dirs` 中的文件。
+- `llm_tool_reference_path_mode=global`：跳过白名单目录检查，但仍会检查路径穿越、文件存在性和图片完整性。插件会在支持函数工具权限配置的 AstrBot 新版上，尝试将 `gemini_image_generation` 默认权限设为管理员；若管理员已在 WebUI 手动配置过该工具权限，则不会覆盖。
+- 默认白名单包含常见 AstrBot 数据目录：`~/.astrbot/data`、`/opt/astrbot/data`、`/AstrBot/data`、`/app/data`，以及 `ASTRBOT_DATA_PATH` 环境变量指向的目录。
+- `llm_tool_reference_allowed_dirs` 可追加自定义目录，支持绝对路径或 `~` 开头路径。
+- 原始路径中包含 `..` 穿越会被拒绝；符号链接会先 `resolve`，再检查最终路径是否仍位于允许目录内。
+- 只有能通过完整性校验的图片文件会被接受；不存在、非文件、非图片或损坏图片都会被拒绝并写入日志。
+
+## quick_mode_settings
+
+可覆盖各快速模式的默认分辨率和长宽比。支持模式：
+
+```text
+avatar / poster / wallpaper / card / mobile / figure / sticker
+```
+
+## retry_settings
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `max_attempts_per_key` | `3` | 每个密钥最大重试次数 |
+| `enable_smart_retry` | `true` | 按错误类型智能重试 |
+| `total_timeout` | `120` | 单次调用总超时，单位秒 |
+
+## service_settings
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `napcat_stream_threshold_mb` | `2.0` | 本地图片原始发送失败后，达到该大小才使用 NapCat Stream API 兜底重试；`0` 表示禁用 |
+| `auto_avatar_reference` | `false` | 自动获取头像作为参考图 |
+| `reference_cross_session` | `false` | 开启后，同一机器人下所有会话的生成记录都可以被 `gen:` 引用；关闭时只有同一会话或已共享的记录可以。语法见 [内部引用](references.md) |
+| `template_hub_mode` | `cache` | 在线模板使用方式：`cache` 按哈希同步到插件本地缓存（检索和生成都不联网）、`online` 额外实时检索在线服务、`off` 完全不连接在线服务 |
+| `template_hub_url` | 空 | 在线模板服务地址，必须是 https；留空用官方地址 `https://image-hub.alxy.app` |
+| `template_hub_key` | 空 | 在线模板服务密钥，用于上传、修改和删除自己上传的模板；不填只能浏览和导入。在提示词广场的在线页申请，打开密钥框会自动回填并保持密码隐藏 |
+| `show_duration_stats` | `true` | 生成完成后是否展示耗时统计 |
+| `show_retry_stats` | `true` | 生成完成后是否展示重试次数 |
+| `show_token_usage_stats` | `true` | 生成完成后是否展示上游返回的 token 用量 |
+| `image_cache_max_size_mb` | `512.0` | 生成图容量上限（MB）：聊天会话图片按全部会话工作区的 `astrbot_plugin_gemini_image_generation/` 子目录总量计，其他来源按插件数据目录 `images/` 计；超限时按最旧文件优先自动清理；`0` 表示不清理 |
+| `theme_settings.mode` | `cycle` | 帮助页主题模式 |
+
+NapCat v4.8.115+ 支持 Stream API。插件默认仍先按 `max_inline_image_size_mb` 规则发送本地图片；只有原始发送失败且文件大小达到 `napcat_stream_threshold_mb` 时，才会复用当前 NapCat/OneBot 连接调用 `upload_file_stream` 并重试一次。Docker / docker compose 部署仍建议共享 `AstrBot/data` 目录，以兼容普通本地文件发送路径。
+
+
+## webui（内置 WebUI 创作台）
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `history_enabled` | `true` | 生成历史记录总开关；关闭后不将新生成记录写入历史（不影响生成本身） |
+| `history_max_records` | `500` | 历史记录上限（50-5000），按父子任务整组淘汰，运行中的任务不会被清理 |
+| `gallery_max_size_mb` | `512` | 画廊目录容量上限（MB），超限后从最旧任务整组清理图片（记录保留）；`0` 表示不清理 |
+| `upload_max_mb` | `20` | 工作台参考图单文件上传上限（MB），仅允许可解码的 PNG/JPEG/WebP/GIF/BMP |
+| `max_concurrent_jobs` | `2` | 工作台全局并发任务数（1-8），达到上限拒绝新任务 |
+| `batch_total_budget` | `40` | 单次批量图片总预算（4-200），批量条目的 image_count 之和不得超过此值 |
+
+## help_render_mode
+
+| 值 | 说明 |
+|----|------|
+| `html` | 使用 t2i 网络服务渲染，默认 |
+| `local` | 本地 Pillow 渲染 |
+| `text` | 纯文本输出 |
+
+## limit_settings
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `group_limit_mode` | `none` | 群限制模式：`none` / `whitelist` / `blacklist` |
+| `group_limit_list` | `[]` | 黑/白名单共用的群号列表，最多 1000 项，每项最多 1024 字符 |
+| `global_rate_limit.enabled` | `false` | 共享全局限流开关，命令、LLM 与 Studio 累计计数 |
+| `global_rate_limit.period_seconds` | `60` | 全局滑动窗口，1-604800 秒 |
+| `global_rate_limit.max_requests` | `5` | 全局窗口内额度，1-10000 次 |
+| `rate_limit_rules` | `[]` | 按顺序匹配第一条启用规则，最多 100 条 |
+| `rate_limit_rules[].umos` | `[]` | 完整 UMO 列表，每条最多 500 项；空列表匹配所有会话并分别计数 |
+| `rate_limit_rules[].group_ids` | `[]` | 仅为旧群号迁移保留，不再作为限流计数键 |
+| `default_rate_limit.enabled` | `false` | 未匹配规则时启用默认会话额度，包含私聊 |
+| `default_rate_limit.period_seconds` | `60` | 会话滑动窗口，1-604800 秒 |
+| `default_rate_limit.max_requests` | `5` | 每个 UMO 窗口内额度，1-10000 次 |
+
+Studio「限流控制」页顶部统一配置群限制模式与名单，切换模式保留同一份群号列表。群名单仅控制群聊访问，不影响私聊和 Studio；**空白名单沿用原有行为，表示不限制群**，填写后才仅允许所列群。该名单与规则中的旧 `group_ids` 迁移字段不同，不需要改成 UMO。保存时模式与名单成对提交；旧版页面省略两项时保留原值。首次提交群访问字段会单独备份至插件数据目录 `group_access_config_backup.json`，不覆盖旧的限流迁移备份。
+
+UMO 格式为 `平台实例ID:消息类型:会话ID`，例如 `qq-bot:GroupMessage:123456`；直接沿用 AstrBot 的会话身份，包括群内独立会话，不按群号重新拼接。规则的 `rule_name`、`enabled`、`period_seconds`、`max_requests` 保持原字段，规则名称最多 100 字符，UMO 最多 1024 字符。全局额度与会话额度同时检查，任一不足均不扣减；会话规则不能绕过全局限制。
+
+单任务计 1 次，批量按子任务数量一次性预留；单任务多张、供应商重试和转后台不额外计数。明显无效输入、API 未就绪、准入拒绝不扣额度；Studio 挂入任务前失败会退还预留，任务受理后供应商失败不退。Studio 没有聊天 UMO，只占全局额度，仍受 `webui.max_concurrent_jobs` 和批量图片预算约束。
+
+Studio 保存仅更新群访问与限流字段，不修改供应商、不重载插件或清空已有计数。缩短窗口/修改次数即时生效；已清理的旧时间戳不能因延长窗口恢复，新增限制也不追溯未计数的请求。KV 加载失败暂拒请求；计数写入采用 1 秒合并保存，写失败保留内存计数并记录日志，正常卸载等待落盘，进程异常退出仍可能丢失尚未写入的短窗口。
+
+**旧配置迁移**：启用规则中仍有非空 `group_ids` 时，暂停聊天生图（不影响 Studio 的全局限流）。在 Studio 选择实际 UMO、点击「确认迁移」并保存；停用或删除旧规则也需显式保存。旧空群号规则仍是每会话规则，不会变成共享全局限流。首次保存将原限流字段备份到插件数据目录 `rate_limit_config_backup.json`，不包含供应商密钥；旧 `rate_limit_buckets` KV 不覆盖，新计数写入 `rate_limit_buckets_v2`。旧群桶无法精确拆分，未过期时保守等待原配置最大窗口结束后再放行聊天请求。回退旧版本前可从该备份恢复限流字段，保留当前其它配置，并重载插件；旧版不识别新增的全局/UMO 策略。
+
+## doubao_settings（豆包生图专用配置）
+
+配置路径：`provider_settings.provider_overrides` 中选择 `doubao` 模板。
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `api_keys` | `[]` | 火山引擎 API Key 列表，支持多 Key 轮换 |
+| `daily_limit_per_key` | `0` | 每个 Key 每日调用上限，`0` 表示不限制 |
+| `endpoint_id` | `doubao-seedream-5-0-260128` | Ark `model` 字段，可填写模型 ID、版本化模型 ID 或推理点 ID，例如 `doubao-seedream-5-0-pro-260628`、`ep-xxxx` |
+| `model_capability` | `auto` | `auto` 仅按 `endpoint_id` 中明确的 Pro 标记识别；不带 Pro 标记的 `seedream-5.0` 不会自动按 Pro 处理。若使用对应 Seedream 5.0 Pro 的 `ep-...` 推理点 ID 或其他无法从名称判断能力的 ID，请设为 `seedream_5_pro`，以启用单图和最多 10 张参考图限制 |
+| `endpoint_mode` | `official` | 接入端点：`official` 火山方舟官方图片端点；`agent_plan` Agent Plan 专属图片端点 |
+| `api_base` | `https://ark.cn-beijing.volces.com` | API 基础地址；插件按 `endpoint_mode` 自动追加 `/api/v3` 或 `/api/plan/v3`，通常无需修改 |
+| `size_mode` | `preset` | 尺寸模式：`preset` 使用 `size`；`custom` 使用 `custom_size` |
+| `size` | `2K` | Ark Images API 的 `size` 字段快捷值；5.0 Pro/Lite 支持 `2K` / `3K` / `4K`，4.5 支持 `2K` / `4K`，4.0 支持 `1K` / `2K` / `4K` |
+| `custom_size` | `2048x2048` | 自定义宽高像素值，仅 `size_mode=custom` 生效，格式 `WxH`，如 `2304x1728` |
+| `watermark` | `false` | 是否添加水印 |
+| `output_format` | `jpeg` | 输出图片格式：`jpeg` 或 `png` |
+| `optimize_prompt_mode` | `standard` | 提示词优化模式：`standard` / `fast` |
+| `sequential_image_generation` | `disabled` | 组图生成模式：`disabled` / `auto`；Seedream 5.0 Pro 不支持组图，设置为 `auto` 时会被 provider 忽略 |
+| `sequential_max_images` | `4` | 组图最大数量，范围 `1-15` |
+
+### Seedream 5.0 Pro 适配说明
+
+当 `endpoint_id` 使用 `doubao-seedream-5-0-pro-260628` 等 Seedream 5.0 Pro 模型 ID 时，provider 会按官方能力自动处理；如果使用对应的 `ep-...` 推理点 ID，请同时将 `model_capability` 设为 `seedream_5_pro`：
+
+- 只发送单图请求；即使配置 `sequential_image_generation=auto`，也不会发送 `sequential_image_generation` 字段。
+- 参考图最多发送 10 张；其他支持多图的豆包模型仍按原有上限最多发送 14 张。
+- `output_format` 支持 `jpeg`（默认）和 `png`，base64 重试响应会按该格式保存。
+- 交互编辑通过提示词中的坐标、框选或箭头等描述完成，插件不会额外注入不受支持的组图、流式字段。
+
+豆包图片接口的请求路径由 `endpoint_mode` 选择：
+
+- `official`：`https://ark.cn-beijing.volces.com/api/v3/images/generations`
+- `agent_plan`：`https://ark.cn-beijing.volces.com/api/plan/v3/images/generations`
+
+### Agent Plan 接入
+
+将同一个 `doubao` 模板的 `endpoint_mode` 设置为 `agent_plan` 即可切换，无需改动 `api_base`。Agent Plan 必须使用 Agent Plan 专属 API Key；`endpoint_id` 可填写当前套餐支持的模型（例如 `doubao-seedream-5-0-pro-260628`）或对应的推理点 ID。若填写 `ep-...` 且该推理点对应 Seedream 5.0 Pro，请将 `model_capability` 设为 `seedream_5_pro`。模型和套餐以[支持模型及 Harness](https://docs.volcengine.com/docs/82379/2366394)为准。
+
+当前插件的 `doubao` provider 只封装图片生成接口；Agent Plan 的视频任务接口尚未纳入本插件的图片生成流程。
+
+豆包组图官方文档：<https://www.volcengine.com/docs/82379/1824121?lang=zh#fc9f85e4>
+
+## openai_responses（Responses 生图）
+
+在 `provider_settings.provider_overrides` 中添加 `openai_responses` 模板，填写该服务的 `api_keys` 和 `api_base`。地址支持域名根路径、以 `/v1` 结尾的地址，或完整的 `/v1/responses` 地址。
+
+| 字段 | 默认值 | 作用 |
+|---|---|---|
+| `base_model` | `gpt-5.6-luna` | 顶层对话模型，传入请求的 `model` |
+| `model` | `gpt-image-2.5-flare` | 生图模型，传入 `tools[].model`；指令、别名和候选选择使用此模型 |
+| `size_mode` / `custom_size` | `custom` / `1024x1024` | 复用自定义尺寸配置 |
+| `quality` | `auto` | 生图质量 |
+| `output_format` | `png` | 图片保存格式 |
+| `output_compression` | `100` | JPEG/WebP 压缩参数，0–100；PNG 不发送此参数 |
+| `background` | `auto` | `auto` / `opaque` / `transparent`；透明背景需 PNG/WebP |
+| `action` | `auto` | `auto` / `generate` / `edit`；强制编辑必须有参考图 |
+| `partial_images` | `0` | 0 关闭预览；1–3 请求生成中的部分图片 |
+| `moderation` | `auto` | 官方提供的内容审核模式 `auto` / `low` |
+
+两个模型字段都是自由文本，允许填写自定义名称或网关别名。默认组合已在 CPA 实测生成成功，不代表 OpenAI 官方或其他网关支持这些名称；应以所接服务实际能力为准。
+
+GPT Image 2.5 的 `quality` 支持 `auto/low/medium/high/xhigh/max`，较旧 GPT Image 模型不接受 `xhigh/max`；自定义网关模型名仍可手动填写。`size_mode=auto` 交由上游决定尺寸；`custom` 校验 16 倍数、最大边 3840、比例不超过 3:1、总像素 655360–8294400。GPT Image 2/2.5 的预设尺寸按分辨率与比例推导。
+
+文生图和参考图请求均通过 Responses 的 `image_generation` 工具；参考图按已有设置转换成 `input_image`。连续编辑沿用上一轮图片作为下一轮参考图，可设 `action=edit`，不保存跨用户的 Responses 对话 ID。一次请求不承诺原生批量，多图沿用插件调度。插件读取 SSE 完成事件并保存完整图片，也支持网关返回完整 JSON 响应。
+
+启用预览后，工作台运行中的任务卡显示临时 PNG 缩略图；预览不落盘、不进入画廊、不计入生成数量，刷新页面后只保留正常任务状态，最终结果到达时替换预览。命令/插件调用的生成记录也可在工作台看到预览。
+
+协议依据：[Responses 生图工具](https://developers.openai.com/api/docs/guides/tools-image-generation)、[图像尺寸与输出参数](https://developers.openai.com/api/docs/guides/image-generation)。网关可能仅实现部分参数，遇到明确不支持的参数应调整配置，不自动改用其他协议。
+
+已提交后超时、断流或缺少完成事件会报告“任务结果未知”，停止自动重试和跨候选切换，避免重复生成；明确的鉴权/限流错误仍走现有错误处理。长时间生图需确保插件总超时、单次超时和网关超时匹配。
+
+## openai_images_settings（OpenAI Images API 专用配置）
+
+配置路径：`provider_settings.provider_overrides` 中选择 `openai_images` 模板。
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `api_keys` | `[]` | API Key 列表，支持多 Key 轮换 |
+| `daily_limit_per_key` | `0` | 每个 Key 每日调用上限，`0` 表示不限制 |
+| `model` | `gpt-image-2.5-flare` | 自由输入：支持 Flare/Sunburst 及日期快照、GPT Image 2/1.5/1；保留旧 DALL·E 兼容路径 |
+| `api_base` | - | API 端点地址，留空使用 OpenAI 官方 |
+| `quality` | - | GPT Image 2.5 另支持 `xhigh/max`，旧 GPT Image 最高 `high`；DALL·E 3 使用 `hd/standard` |
+| `response_format` | `b64_json` | 仅旧 DALL·E/兼容模型发送；GPT Image 在生成和编辑接口均返回 base64，不发送该字段 |
+| `size_mode` | `preset` | `preset` 按模型能力解析分辨率与比例；`custom` 使用像素尺寸；`auto` 交由上游选择 |
+| `custom_size` | `1024x1024` | 自定义尺寸，仅 `size_mode=custom` 生效。格式 `WxH`，支持 `x` 或 `×` |
+| `style` | - | 图像风格，仅 dall-e-3：`vivid` / `natural` |
+| `background` | - | 背景透明度，仅 GPT image：`auto` / `transparent` / `opaque` |
+| `output_format` | - | 输出格式，仅 GPT image：`png` / `jpeg` / `webp` |
+| `output_compression` | `100` | JPEG/WebP 的 0–100 压缩参数，包含 0 均按原值发送；PNG 不发送 |
+| `moderation` | - | 审核模式，仅 GPT image，例如 `low` |
+| `generations_only` | `false` | 开启后强制只用 `/v1/images/generations`，不走 `/v1/images/edits` |
+| `n` | `1` | GPT Image 非流式单次张数上限，1–10；实际请求不超过本轮剩余张数 |
+| `stream` | `false` | GPT Image 原生流式返回；启用时单次一张，多图由插件分次调度 |
+| `partial_images` | `0` | 流式时的预览数量 0–3；预览只展示在运行中的工作台任务，不作为最终结果 |
+
+GPT Image 编辑使用 `image[]` 上传，最多 16 张参考图，PNG/JPEG/WebP 保留对应上传类型。生成与编辑均传递质量、背景、输出格式、压缩率和 moderation；透明背景搭配 JPEG 会在本地拒绝。GPT Image 不发送非官方的 seed 字段。
+
+升级注意：旧配置曾用压缩率 `0` 表示“不传参数”。现在按官方 API 把 `0` 原样发送；如果旧配置的本意是使用默认压缩率，请改成 `100`。新模板默认为 `100`。已有模型名称不会自动改写，网关必须自身支持所填模型的 Images 路由；CPA 等服务的 Images 白名单与 Responses 工具能力可能不同。
+
+接口依据：[生成](https://developers.openai.com/api/reference/resources/images/methods/generate)、[编辑](https://developers.openai.com/api/reference/resources/images/methods/edit)。
+
+### OpenAI Images 自定义尺寸
+
+`size_mode=custom` 时，插件会在发送请求前校验 `custom_size`：
+
+- 最大边 `<= 3840`
+- 宽高均为 `16` 的倍数
+- 长短边比 `<= 3:1`
+- 总像素在 `655360-8294400` 之间
+
+官方文档：
+
+- <https://developers.openai.com/api/docs/guides/image-generation>
+- <https://developers.openai.com/api/docs/models/gpt-image-2>
+
+`size_mode=custom` 各调用路径行为：
+
+| 调用路径 | `size` 取值 |
+|----------|-------------|
+| 普通生图/改图 | 直接使用配置中的 `custom_size` |
+| 快速模式 | 根据模式预设的 `resolution + aspect_ratio` 自动换算，例如 `2K + 16:9 -> 2048x1152` |
+| LLM 工具调用 | 只接收 `resolution` / `aspect_ratio`（传入的 `size` 忽略），未传入时使用配置中的 `custom_size` |
+
+WebUI 中切换为 `size_mode=custom` 后，`resolution` 和 `aspect_ratio` 会自动隐藏，仅保留 `custom_size`；切回 `preset` 后再显示预设分辨率和长宽比。
+
+`size_mode=custom` 时，LLM 工具不会动态切换参数 schema；传入非法 `resolution` / `aspect_ratio` 时会记录警告并回退为默认配置。
+
+## xai_settings（xAI Images API 专用配置）
+
+配置路径：`provider_settings.provider_overrides` 中选择 `xai` 模板。
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `api_keys` | `[]` | API Key 列表，支持多 Key 轮换 |
+| `daily_limit_per_key` | `0` | 每个 Key 每日调用上限，`0` 表示不限制 |
+| `model` | `grok-imagine-image-2.0` | 当前模型；旧模型名仍可手填但可能已被官方退役 |
+| `api_base` | `https://api.x.ai` | API 端点地址 |
+| `response_format` | `url` | 响应格式：`url` / `b64_json` |
+| `quality` | - | 仅 `grok-imagine-image-2.0` 支持，官方仅 `low` / `medium`（服务端默认 `medium`）；`high` 自动降级为 `medium`，留空不传 |
+| `n` | `1` | 单次请求生成数量，官方上限 `10` |
+| `proxy` | - | 独立代理地址 |
+
+`xai` 供应商会自动走 xAI 官方 JSON 图像接口：
+
+- 文生图：`/v1/images/generations`
+- 改图：`/v1/images/edits`
+
+改图请求会把参考图统一内联为 `data URI`，不使用 `multipart/form-data`。单次编辑最多支持 `3` 张参考图（超出截取前 3 张并记录日志），分辨率支持 `1k/2k`；多图编辑默认输出比例跟随第一张输入图，可用 `aspect_ratio` 覆盖，单图编辑始终跟随输入图。
+
+`aspect_ratio` 官方枚举：`1:1` / `16:9` / `9:16` / `4:3` / `3:4` / `3:2` / `2:3` / `2:1` / `1:2` / `19.5:9` / `9:19.5` / `20:9` / `9:20` / `auto`；`4:5` / `5:4` / `21:9` 不受支持，传入自动忽略并记录日志。
+
+官方文档：
+
+- <https://docs.x.ai/developers/model-capabilities/imagine>
+
+## agnes_ai_settings（Agnes AI 图片生成 API 专用配置）
+
+配置路径：`provider_settings.provider_overrides` 中选择 `agnes_ai` 模板。
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `api_keys` | `[]` | Agnes AI API Key 列表，支持多 Key 轮换 |
+| `daily_limit_per_key` | `0` | 每个 Key 每日调用上限，`0` 表示不限制 |
+| `model` | `agnes-image-2.5-flash` | Agnes AI 图片模型，可填写 `agnes-image-2.5-flash` / `agnes-image-2.1-flash` |
+| `api_base` | `https://apihub.agnes-ai.com` | API 端点地址，插件会统一调用 `/v1/images/generations` |
+| `response_format` | `url` | 响应格式：`url` / `b64_json` |
+| `reference_image_mode` | `base64` | 参考图传递方式：`base64` / `auto` / `url` |
+| `proxy` | - | 独立代理地址 |
+
+`agnes_ai` 供应商统一使用 JSON 请求：
+
+- 文生图：`POST /v1/images/generations`
+- 图生图：同一端点，通过 `extra_body.image` 传入参考图 URL 或 data URI
+- 尺寸：默认下发档位 `size`（`1K`/`2K`/`3K`/`4K`）+ 顶层 `ratio` 获得原生分辨率；`ratio` 官方白名单为 `1:1`/`3:4`/`4:3`/`16:9`/`9:16`/`2:3`/`3:2`/`21:9`，非白名单比例或显式像素尺寸时回退为本地计算的精确尺寸
+
+当 `response_format=b64_json` 且没有参考图时，插件会按 Agnes AI 文生图格式发送 `return_base64=true`；带参考图时会在 `extra_body.response_format` 中请求 `b64_json`。默认 `reference_image_mode=base64` 会把本地图片和 URL 参考图统一转成 data URI；如确认参考图是公开可访问 URL，可改为 `auto` 或 `url`。
+
+## minimax_settings（MiniMax 图片生成 API 专用配置）
+
+配置路径：`provider_settings.provider_overrides` 中选择 `minimax` 模板。
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `api_keys` | `[]` | MiniMax API Key 列表，支持多 Key 轮换 |
+| `daily_limit_per_key` | `0` | 每个 Key 每日调用上限，`0` 表示不限制 |
+| `model` | `image-01` | `image-01`（全能力，支持 21:9 与显式宽高）/ `image-01-live`（快速，仅 aspect_ratio，不支持 21:9） |
+| `api_base` | `https://api.minimaxi.com` | API 端点地址，插件会统一调用 `/v1/image_generation` |
+| `response_format` | `base64` | 响应格式：`base64` / `url`。官方 URL 有效期为 24 小时 |
+| `n` | `1` | 单次请求生成图片数量，官方范围 `1-9` |
+| `style_type` | 空 | 画风（**image-01-live 专属**）：`漫画` / `元气` / `中世纪` / `水彩`；留空不传，其他模型配置了自动忽略 |
+| `style_weight` | `0.8` | 画风权重，仅 `style_type` 非空时下发，范围 `(0,1]` |
+| `prompt_optimizer` | `false` | 是否开启 MiniMax 提示词自动优化 |
+| `aigc_watermark` | `false` | 是否添加 AIGC 水印 |
+| `reference_image_mode` | `auto` | 参考图传递方式：`auto` / `base64` / `url` |
+| `subject_reference_type` | `character` | `subject_reference.type`，默认用于人物主体一致性 |
+| `max_reference_images` | `9` | 参考图上限（官方未公布数量上限，按 9 张截取） |
+| `width` / `height` | `0` | 未传 `aspect_ratio` 时可同时设置，范围 `512-2048` 且为 `8` 的倍数；`0` 表示不传 |
+| `seed` | `0` | 固定随机种子，`0` 表示不传 |
+| `proxy` | - | 独立代理地址 |
+
+`minimax` 供应商使用 MiniMax 官方单一图像端点：
+
+- 文生图：`POST /v1/image_generation`
+- 图生图：同一端点，通过 `subject_reference[].image_file` 传入参考图
+
+其他限制与防护：
+
+- prompt 官方上限 1500 字符，超限直接报错（不发起注定失败的服务端调用）
+- `image_file` 官方仅支持 JPG/JPEG/PNG 且小于 10MB：非白名单格式（GIF/WebP/BMP 等）由插件解码后转码为 PNG（动图取首帧），源图或转码产物超过 10MB 直接报错
+- 全部图片被内容安全拦截时，错误信息会附带 `failed_count` 拦截数量
+
+供应商条目的 `resolution` 和 `aspect_ratio` 的适配规则：
+
+| 场景 | resolution | aspect_ratio | 实际行为 |
+|------|-----------|-------------|---------|
+| 1K + 支持比例 | 1K | `1:1`/`16:9`/... | 透传 `aspect_ratio`（MiniMax 原生） |
+| 2K/4K + 支持比例 | 2K/4K | `1:1`/`16:9`/... | 计算显式 `width`/`height`（4K 降级为 2048） |
+| 不支持比例 | 任意 | `4:5`/`5:4` | 计算显式 `width`/`height` |
+| 无比例 + 无 w/h 设置 | 2K/4K | — | 使用 `resolution` 对应的正方形尺寸 |
+| `image-01-live` 模型 | 任意 | 任意 | 仅使用 `aspect_ratio`，不发送 `width`/`height` |
+
+支持的长宽比枚举：`1:1` / `16:9` / `4:3` / `3:2` / `2:3` / `3:4` / `9:16` / `21:9`。`image-01-live` 不支持 `21:9`，插件会自动忽略。
+
+官方文档：
+
+- <https://platform.minimaxi.com/docs/guides/image-generation>
+- <https://platform.minimaxi.com/docs/api-reference/image-generation-t2i>
+- <https://platform.minimaxi.com/docs/api-reference/image-generation-i2i>
+
+## stepfun_settings（StepFun 图片生成 API 专用配置）
+
+配置路径：`provider_settings.provider_overrides` 中选择 `stepfun` 模板。适配 `step-image-edit-2`（文生图 + 编辑；官方 2026-10-10 下线）与 `step-2x-large`（纯文生图）。
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `api_keys` | `[]` | StepFun API Key 列表，支持多 Key 轮换 |
+| `daily_limit_per_key` | `0` | 每个 Key 每日调用上限，`0` 表示不限制 |
+| `model` | `step-image-edit-2` | 图片模型名称；`step-2x-large` 为纯文生图模型，不支持编辑/负向提示词/text_mode。编辑模型官方 2026-10-10 下线，请尽快切换 |
+| `api_base` | `https://api.stepfun.com` | API 端点；同时兼容 `https://api.stepfun.com/step_plan/v1` 写法，自动识别 `/v1` 后缀 |
+| `response_format` | `url` | `url` 返回临时签名链接（`res.stepfun.com`），`b64_json` 返回 base64 并由插件落盘 |
+| `steps` | `0` | 采样步数，`0` 表示不传（服务端默认 edit-2 `8` / 2x-large `50`）；非零值钳位到 [1, 50] |
+| `cfg_scale` | `0` | 提示词引导强度，`0` 表示不传（服务端默认 edit-2 `1.0` / 2x-large `6`）；非零值钳位到 [1.0, 10.0] |
+| `negative_prompt` | `""` | 负向提示词，留空不传；仅 `step-image-edit` 系列支持，其他模型自动忽略并记录日志 |
+| `text_mode` | `false` | 是否启用 `text_mode`；仅 `step-image-edit` 系列支持，其他模型自动忽略并记录日志 |
+| `seed` | `0` | 固定随机种子，`0` 表示不传 |
+| `proxy` | - | 独立代理地址，优先级高于全局代理和环境变量 |
+
+`stepfun` 供应商使用阶跃星辰官方图片端点：
+
+- 文生图：`POST /v1/images/generations`（JSON 请求体）
+- 图生图：`POST /v1/images/edits`（`multipart/form-data`）
+
+尺寸适配规则（按模型自动选择官方支持的预设集合）：
+
+**`step-image-edit-2` 文生图（generations）** 支持五档尺寸：
+
+| 通用尺寸/比例 | 实际下发 |
+|--------------|---------|
+| 正方形 | `1024x1024` |
+| 竖图 9:16 / 3:4 | `768x1360` |
+| 竖图 接近 4:5 | `896x1184` |
+| 横图 16:9 / 4:3 | `1360x768` |
+| 横图 接近 5:4 | `1184x896` |
+
+**`step-2x-large` 文生图（generations）** 支持六档：`256x256` / `512x512` / `768x768` / `1024x1024` / `1280x800`（16:9）/ `800x1280`（9:16），按目标长宽比自动选最近预设。已下线的 `step-1x-medium` 沿用同尺寸表。
+
+**模型级编辑门控**：仅 `step-image-edit` 系列候选参与改图/参考图请求，`step-2x-large` 等纯文生图模型自动跳过。
+
+**图生图（edits）**：
+
+- `step-image-edit-2`：官方仅支持单图输入，传入多图会自动取首张并打 debug 日志；`size` 参数官方明确"该参数不生效"，因此插件不再下发，输出尺寸始终与输入图一致。
+- `step-1x-edit`：`size` 仅在 `512x512` / `768x768` / `1024x1024` 三档内透传。
+
+- 两个模型的 prompt 均为 512 字符硬上限，超限请求直接报错（不发起注定失败的服务端调用）。
+
+其他注意事项：
+
+- 请求被安全审核拦截时，StepFun 会返回 `HTTP 451`，插件统一识别为安全类错误（`category="safety"`，不重试）。
+- `b64_json` 模式下生成的图片会保存为本地文件，避免 URL 过期问题。
+
+官方文档：
+
+- <https://platform.stepfun.com/docs/llm/image-edit>
+- <https://platform.stepfun.com/docs/api-reference/image-edit>
+
+## sensenova_settings（SenseNova（商汤日日新）专用配置）
+
+配置路径：`provider_settings.provider_overrides` 中选择 `sensenova` 模板。支持两个模型：
+
+- `sensenova-u1.5-lite`（默认）：生成与编辑一体，尺寸按档位+长宽比自由换算
+- `sensenova-u1-fast`：纯文生图信息图模型，11 种官方固定尺寸
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `api_keys` | `[]` | SenseNova API Key 列表，控制台获取的 Bearer Token，支持多 Key 轮换 |
+| `daily_limit_per_key` | `0` | 每个 Key 每日调用上限，`0` 表示不限制 |
+| `model` | `sensenova-u1.5-lite` | `sensenova-u1.5-lite`（文生图+编辑）或 `sensenova-u1-fast`（纯文生图） |
+| `api_base` | `https://token.sensenova.cn` | API 端点地址 |
+| `resolution` | `2K` | 分辨率档位（`1K`/`2K`/`4K`），u1.5-lite 按档位像素预算换算尺寸 |
+| `aspect_ratio` | `1:1` | 默认长宽比，快速模式传入覆盖值时优先 |
+| `watermark` | `false` | 是否添加日日新官方水印；仅 u1.5-lite 生效（服务端默认开启，插件显式关闭） |
+| `prompt_extend` | `false` | 提示词自动润色；仅 u1.5-lite 生效（服务端默认开启，插件显式关闭） |
+| `response_format` | `b64_json` | 仅 u1.5-lite 生效：`b64_json` 直接落盘，`url` 为 24 小时有效临时链接 |
+| `default_size` | `2752x1536` | 仅 u1-fast 生效的兜底尺寸，必须为官方 11 种尺寸之一 |
+| `proxy` | - | 独立代理地址，优先级高于全局代理和环境变量 |
+
+`sensenova` 供应商使用 SenseNova 官方图像端点（仅 u1.5-lite 支持编辑）：
+
+- 文生图：`POST /v1/images/generations`
+- 图像编辑（u1.5-lite）：`POST /v1/images/edits`，`images` 数组最多 4 张（官方未公布上限，超出截取），首张为主编辑图；输入仅支持公网 URL 或 `data:image/*;base64,` 形态
+
+**模型级编辑门控**：仅 `sensenova-u1.5` 系列候选参与改图/参考图请求；`sensenova-u1-fast` 带参考图直接报错（不忽略、不发起无效调用）。
+
+尺寸规则：
+
+**`sensenova-u1-fast`** 固定 11 种尺寸，按 `aspect_ratio` 映射：
+
+| 尺寸 | 近似比例 |
+|------|---------|
+| `2048x2048` | 1:1 |
+| `2752x1536` | 16:9 |
+| `1536x2752` | 9:16 |
+| `2368x1760` | 4:3 |
+| `1760x2368` | 3:4 |
+| `2496x1664` | 3:2 |
+| `1664x2496` | 2:3 |
+| `1824x2272` | 4:5 |
+| `2272x1824` | 5:4 |
+| `3072x1376` | 21:9 |
+| `1344x3136` | 超竖长 |
+
+**`sensenova-u1.5-lite`** 按 `resolution` 档位（1K/2K/4K）像素预算 × 长宽比换算，宽高为 [512, 4096] 内的 32 倍数，比例钳位 3:1 以内；编辑场景开启"改图保留参考图尺寸"时不下发 `size`，由服务端自动适配主图。
+
+其他注意事项：
+
+- u1-fast 的图片 URL 有效期 1 小时、u1.5-lite 为 24 小时；配置代理时插件会立即下载落盘
+- `n` 仅 u1-fast 支持（上限 4）；u1.5-lite 固定单张，不发送该参数
+
+官方文档：
+
+- <https://platform.sensenova.cn/docs>
+
+## senseaudio（图片生成专用配置）
+
+在 `provider_settings.provider_overrides` 中添加 `senseaudio` 模板并填写 API Key。此模板接入 SenseAudio 开放平台的独立图片协议，与 `sensenova` 模板分别配置密钥和端点。
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `api_keys` | `[]` | SenseAudio API Key，支持多 Key 轮换 |
+| `model` | `senseaudio-image-2.0-260319` | 可选模型见下表 |
+| `api_base` | `https://api.senseaudio.cn` | 基址，可带 `/v1`，不填完整生成路径 |
+| `request_mode` | `sync` | `sync` 同步返回图片；`async` 提交后自动轮询 |
+| `resolution` | `1K` | 自动尺寸的长边目标档位；按模型白名单取最接近值，不保证精确达到档位 |
+| `aspect_ratio` | `1:1` | 自动尺寸优先匹配最接近比例，再比较长边档位 |
+| `size` | 空 | 固定 `宽x高`，必须在当前模型的官方白名单内；覆盖自动比例与档位 |
+| `max_reference_images` | `1` | 最多 1 张参考图，超出按顺序截断；支持 URL / Data URI，本地文件沿用共享转换管道 |
+| `seed` | 空 | 留空由服务端随机生成；填写整数固定种子，`0` 也会发送 |
+| `poll_interval` | `3` | 异步查询间隔，0.1–30 秒 |
+| `poll_timeout` | `100` | 异步查询预算，1–3600 秒，同时受插件剩余总超时约束 |
+
+`enabled`、`priority`、`daily_limit_per_key`、`model_alias`、`proxy` 沿用公共候选配置。
+
+| 模型 | 提示词上限（Unicode 码位） | 自动档位 | 固定尺寸特点 |
+|------|---------------------------|----------|--------------|
+| `senseaudio-image-2.0-260319` | 6000 | 1K / 2K / 4K | 方图仅 `1024x1024`；横竖图最大长边 3840 |
+| `senseaudio-image-1.0-260319` | 2000 | 1K | 7 种尺寸，方图 `1328x1328` |
+| `doubao-seedream-5-0-260128` | 2000 | 2K / 4K | 16 种尺寸；方图 `2048x2048` / `3072x3072` |
+| `sensenova-u1-fast` | 2000 | 2K | 11 种尺寸，方图 `2048x2048` |
+
+尺寸表完整来源为 [同步图片生成文档](https://docs.senseaudio.cn/api-reference/endpoint/image/sync)。例如 Image 2.0 的 `2K + 16:9` 发送 `2048x1152`，`4K + 1:1` 仍发送 `1024x1024`。自动映射不能精确表达的尺寸可填写 `size`。改图启用“保留参考图尺寸”时省略 `size`，由服务端适配，不保证原始像素尺寸（Image 2.0 实测 1024 方图输入返回 2048 方图）；文生图始终发送尺寸。单个上游任务返回一张图，多张生成沿用插件调度。
+
+协议与错误处理：
+
+- 同步：`POST /v1/image/sync`，读取顶层 `url`。
+- 异步：`POST /v1/image/async` 返回 `task_id`；携带同一 Key 查询 `GET /v1/image/pending?task_id=...`，直到 `completed` 或 `failed`。
+- 查询网络故障、HTTP 429/5xx 只继续查询原任务；查询失败或超时不在当前候选内重新提交。插件仍可能按原有路由尝试下一候选，服务端原任务不会被取消。
+- 配置代理时通过候选代理下载生成图；响应缺少图片或下载失败均不重试生成。
+
+最小配置示例：
+
+```json
+{
+  "provider_settings": {
+    "provider_polling": ["senseaudio"],
+    "provider_overrides": [
+      {
+        "__template_key": "senseaudio",
+        "api_keys": ["你的 SenseAudio API Key"],
+        "model": "senseaudio-image-2.0-260319",
+        "api_base": "https://api.senseaudio.cn",
+        "request_mode": "sync",
+        "resolution": "1K",
+        "aspect_ratio": "1:1",
+        "max_reference_images": 1
+      }
+    ]
+  }
+}
+```
+
+文档核对日期：2026-09-08。已读取 [完整目录](https://docs.senseaudio.cn/llms.txt)、[接口概览](https://docs.senseaudio.cn/api-reference/introduction)、[图片能力介绍](https://docs.senseaudio.cn/guides/image/overview)、[模型列表](https://docs.senseaudio.cn/guides/account/model-list)、同步/异步/查询三个图片端点及 [图片 OpenAPI](https://docs.senseaudio.cn/api-reference/endpoint/image/image.openapi.json)。参考图字段按该平台协议处理，不复用其他供应商同名模型的能力限制。平台的语音、音乐、视频和文本接口不属于本插件接入范围。
+
+## dashscope_settings（DashScope 阿里云百炼专用配置）
+
+配置路径：`provider_settings.provider_overrides` 中选择 `dashscope` 模板。接入 DashScope **原生** multimodal-generation 同步接口（非 OpenAI 兼容格式），支持通义万相 `wan2.7-image-pro` / `wan2.7-image`（文生图 + 多图编辑）、千问图像 `qwen-image-3.0` / `qwen-image-2.0` 系列与 `z-image-turbo`（纯文生图）。
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `api_keys` | `[]` | DashScope API Key 列表（控制台获取的 Bearer Token），支持多 Key 轮换 |
+| `daily_limit_per_key` | `0` | 每个 Key 每日调用上限，`0` 表示不限制 |
+| `model` | `wan2.7-image-pro` | 推荐 `wan2.7-image-pro` / `wan2.7-image`；千问图像可选 `qwen-image-3.0-pro` / `qwen-image-3.0` / `qwen-image-2.0-pro` / `qwen-image-2.0`；`z-image-turbo` 仅快速文生图。仅支持同步调用模型，wan2.5 及更早的纯异步模型不适用 |
+| `endpoint_mode` | `dashscope` | 接入端点：`dashscope` 阿里云百炼官方端点；`token_plan` 千问 AI 平台 Token Plan 套餐端点 |
+| `api_base` | - | 可选覆盖；留空按 `endpoint_mode` 自动选择地址，仅自建反代等特殊场景需要填写 |
+| `max_reference_images` | `9` | 最大参考图数量：wan2.7 / qwen-image-2.0 上限 9 张，qwen-image-3.0 上限 3 张；z-image 系列不支持参考图（直接报错） |
+| `size_mode` | `preset` | `preset` 按分辨率+长宽比换算官方推荐像素；`custom` 直接发送 `custom_size` |
+| `resolution` | `2K` | 分辨率档位（`1K`/`2K`/`4K`）。4K 仅 `wan2.7-image-pro` 文生图支持，带参考图（编辑）及其余模型上限 2K，超出自动降档 |
+| `aspect_ratio` | `1:1` | 默认长宽比，快速模式传入覆盖值时优先 |
+| `custom_size` | `2048*2048` | 仅 `size_mode=custom` 生效。格式 `WxH`（x/×/* 均可，发送时统一为 `W*H`），或 wan2.7 简写 `1K`/`2K`/`4K`。custom 为显式覆盖，原样发送、不参与 `resolution` 的自动降档 |
+| `n` | `1` | 单次生成图片数量，按成功张数计费，超出范围自动钳制 |
+| `watermark` | `false` | 是否添加水印；z-image 系列不支持（自动跳过并记录日志） |
+| `negative_prompt` | - | 负向提示词，wan2.7 与 z-image 系列不支持（自动跳过并记录日志） |
+| `prompt_extend` | `false` | 提示词智能改写。服务端默认开启（增加 3-4 秒延迟）；插件提示词已增强，默认关闭并显式发送。wan2.7 不支持 |
+| `thinking_mode` | `true` | 增强推理，仅 wan2.7 生效；顺序模式下不可用 |
+| `enable_sequential` | `false` | 顺序组图生成，仅 wan2.7 生效；开启后 `n` 上限提高到 12，`thinking_mode` 随之失效 |
+| `proxy` | - | 独立代理地址，优先级高于全局代理和环境变量 |
+
+`dashscope` 供应商使用 DashScope 原生同步端点：
+
+- 文生图 / 图像编辑：`POST /api/v1/services/aigc/multimodal-generation/generation`
+- 生成图片仅返回 URL 且 **24 小时后过期**，provider 会立即下载落盘；下载失败时兜底返回直链
+- 不支持纯异步 legacy 模型（wan2.5 及更早、wanx 系列）；`color_palette`（wan2.7 品牌色）暂不支持配置
+
+### Token Plan（千问 AI 平台套餐）接入
+
+千问 AI 平台 Token Plan 套餐的图像生成接口与 DashScope 原生同步端点结构完全一致（同请求体、同响应格式），切换方式：
+
+- `endpoint_mode` 选 `token_plan`（自动使用 `https://token-plan.cn-beijing.maas.aliyuncs.com`）
+- `api_keys` 填套餐专属 Key（以 `sk-sp-` 为前缀）
+
+个人版 Token Plan 图像生成模型现包括 `qwen-image-3.0-pro` / `qwen-image-3.0` / `wan2.7-image` / `wan2.7-image-pro` / `z-image-turbo`；参数门控与尺寸换算规则与 DashScope 原生端点相同。完整模型列表以千问 AI 平台为准。
+
+参数门控规则（由 provider 按模型自动处理）：
+
+| 参数 | wan2.7 系列 | qwen-image-2.0 / 3.0 系列 | z-image-turbo | 其他（qwen-image-plus/max 等） |
+|------|------------|--------------------|---------------|-------------------------------|
+| `negative_prompt` | 不支持（跳过） | 支持 | 不支持（跳过） | 支持 |
+| `prompt_extend` | 不支持（跳过） | 显式发送 | 不支持（跳过） | 显式发送 |
+| `watermark` | 支持 | 支持 | 不支持（跳过） | 支持 |
+| `thinking_mode` | 支持（非顺序模式） | 不发送 | 不发送 | 不发送 |
+| `enable_sequential` | 支持 | 不发送 | 不发送 | 不发送 |
+| `n` 范围 | 标准 1-4 / 顺序 1-12 | 1-6 | 仅 1 | 仅 1 |
+| 参考图上限 | 9 | qwen-image-2.0：9；qwen-image-3.0：3 | 不支持（报错） | 仅 qwen-image-edit 系列 |
+
+**模型级编辑门控**：仅 wan2.7 / qwen-image-2.0 / qwen-image-3.0 / qwen-image-edit 系列候选参与改图/参考图请求，`z-image-turbo` 等纯文生图模型自动跳过。
+
+preset 模式尺寸换算表（分辨率档位 × 长宽比 → 官方推荐像素）：
+
+| 长宽比 | 4K | 2K | 1K |
+|--------|----|----|----|
+| 1:1 | `4096*4096` | `2048*2048` | `1280*1280` |
+| 16:9 | `4096*2304` | `2688*1536` | `1696*960` |
+| 9:16 | `2304*4096` | `1536*2688` | `960*1696` |
+| 4:3 | `4096*3072` | `2368*1728` | `1472*1104` |
+| 3:4 | `3072*4096` | `1728*2368` | `1104*1472` |
+
+表外比例（`3:2`、`4:5`、`5:4`、`21:9`、`2:3`）按档位总像素预算推算，两边取 16 的倍数并钳位 `[512, 4096]`。
+
+官方文档：
+
+- 文生图：<https://platform.qianwenai.com/docs/developer-guides/image-generation/text-to-image>
+- 图像编辑：<https://platform.qianwenai.com/docs/developer-guides/image-generation/wan-image-editing>
+- Token Plan 接入：<https://platform.qianwenai.com/docs/token-plan/best-practices/multimodal-generation>
+
+
+## modelscope_settings（ModelScope 魔搭社区专用配置）
+
+配置路径：`provider_settings.provider_overrides` 中选择 `modelscope` 模板。接入魔搭社区 API-Inference **异步任务制**接口（插件首个提交+轮询型 provider）。
+
+**定位与前提**：免费兜底渠道，非主渠道。官方单并发、动态限流；需绑定阿里云账号并完成实名认证，按魔粒计费（0.5/1/2 魔粒每车次）。模型清单会上下架，以魔搭社区为准。
+
+**批量并发**：批量生成（`batch_concurrency`）对 `modelscope` 候选固定按 1 并发串行执行，配置更大的批量并发对该渠道不生效；不同候选条目（独立凭证）之间仍互不阻塞。
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `model` | `Qwen/Qwen-Image` | AIGC 模型 ID（如 `Qwen/Qwen-Image`、`MAILAND/majicflus_v1`）；名称含 `edit` 的模型（如 `Qwen/Qwen-Image-Edit`）支持参考图 |
+| `api_base` | `https://api-inference.modelscope.cn` | API 端点地址 |
+| `resolution` | `1K` | 档位 `1K`/`2K`，与长宽比组合换算像素后按模型族钳制 |
+| `aspect_ratio` | `1:1` | 默认长宽比，快速模式传入覆盖值时优先 |
+| `max_reference_images` | `1` | 官方仅证实编辑模型单图输入；非 edit 模型带图请求直接报错 |
+| `negative_prompt` | 空 | 负向提示词，留空不发送（上限 2000 字符） |
+| `steps` | `0` | 推理步数 1-100，超出钳制；`0` 不发送 |
+| `guidance` | `0` | 引导系数 1.5-20，超出钳制；`0` 不发送 |
+| `seed` | `0` | `0` 表示随机 |
+| `loras` | 空 | 单个 LoRA 填 repo id；多个填 JSON 对象（权重和为 1，最多 6 个） |
+| `poll_interval` | `5` | 轮询间隔（秒），官方示例 5 秒 |
+| `poll_timeout` | `100` | 轮询截止（秒），应小于插件总超时（默认 120 秒） |
+
+调用链路（异步任务制）：
+
+- 提交：`POST /v1/images/generations`，请求头 `X-ModelScope-Async-Mode: true`，立即返回 `task_id`
+- 轮询：`GET /v1/tasks/{task_id}`，请求头 `X-ModelScope-Task-Type: image_generation`
+- 终态：`SUCCEED` 返回 `output_images`（公网 URL，配置代理时自动下载落盘）/ `FAILED` 报错（不可重试，含服务端 message）
+
+尺寸规则：`resolution` 档位（1K=1024²/2K=2048² 像素预算）× 长宽比换算为 8 的倍数，单边触界后按比例重算另一边；模型族上限——Qwen-Image 1664、FLUX 1024、Z-Image [512, 2048]、SD 系 [64, 2048]，未知模型保守 [512, 1024]。
+
+**超时重试代价**：轮询超时按可重试错误处理，但重试会重新提交任务（新 `task_id`）并再次消耗魔粒；`poll_timeout` 保持默认即可在插件总超时前主动收尾。
+
+官方文档：<https://modelscope.cn/docs/model-service/API-Inference/intro>
+
+## siliconflow_settings（SiliconFlow 硅基流动专用配置）
+
+配置路径：`provider_settings.provider_overrides` 中选择 `siliconflow` 模板。接入硅基流动**同步单端点**图像接口（文生图与图像编辑共用 `/v1/images/generations`）。
+
+**调用链路（同步）**：`POST /v1/images/generations` 直接返回 `images[].url`，无任务轮询。**官方图片 URL 仅 1 小时有效**，插件解析阶段立即下载落盘（配置代理时走候选级代理），失败才回退直链并告警。
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `model` | `Qwen/Qwen-Image` | 推荐 `Qwen/Qwen-Image`（文生图）、`Kwai-Kolors/Kolors`（批量 1-4 张，单张参考图图生图）、`Qwen/Qwen-Image-Edit-2509`（编辑，最多 3 张参考图）、`Qwen/Qwen-Image-Edit`（经典编辑，单张参考图） |
+| `api_base` | `https://api.siliconflow.cn` | API 端点地址 |
+| `resolution` | `1K` | 档位 `1K`/`2K`，与长宽比组合映射 `image_size` |
+| `aspect_ratio` | `1:1` | 默认长宽比，快速模式传入覆盖值时优先 |
+| `max_reference_images` | `3` | 仅编辑模型生效：Edit-2509 最多 3 张；经典 Edit 截断 1 张；非编辑模型带图直接报错 |
+| `negative_prompt` | 空 | 负向提示词，留空不发送 |
+| `num_inference_steps` | `0` | 推理步数 1-100，超出钳制；`0` 不发送（服务端默认 20） |
+| `guidance_scale` | `0` | 仅 Kolors，0-20，超出钳制；`0` 不发送（服务端默认 7.5） |
+| `seed` | `0` | `0` 表示随机，范围 0-9999999999 |
+
+模型族差异：
+
+- `Kolors`：`image_size` 命中官方预设（1:1 / 3:4 / 1:2 / 9:16，3:4 按 1K/2K 档位区分），支持 `batch_size`（1-4，LLM 工具批量映射）与 `guidance_scale`；支持单张参考图图生图（`image` 键，超出截断）。
+- `Qwen-Image`：`image_size` 命中官方七档预设，档位不影响预设。
+- `Edit` 系列：不传 `image_size`；参考图按 `image`/`image2`/`image3` 键位发送（2509 最多 3 张）。
+- 未命中预设的比例按档位像素预算本地计算（8 对齐；Kolors 长边钳 1440、Qwen-Image 钳 1664，未知模型保守 [512, 1440]）。
+
+错误处理：非 200 响应体形态混杂（JSON 对象 / JSON 字符串 / 空 body），provider 自行解析；官方过载码 `50505` 显式可重试，其余交由框架按状态码通用判断（429/5xx 重试、401/403 多 Key 轮换）。
+
+官方文档：<https://docs.siliconflow.cn/cn/api-reference/images/images-generations>
+
+## gemini_interactions（Gemini Interactions API 专用配置）
+
+Gemini 官方 Interactions 端点（2026-06 GA），承载 Nano Banana 系列模型；与 legacy `google`（generateContent）并存，按需二选一或同时配置。
+
+模板字段：
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `model` | `gemini-3.1-flash-image` | 推荐 `gemini-3.1-flash-image` / `gemini-3-pro-image` / `gemini-3.1-flash-lite-image` |
+| `resolution` | `1K` | `1K`/`2K`/`4K`；lite 仅支持 `1K`，超出自动降级 |
+| `aspect_ratio` | `1:1` | 含 `1:4`/`1:8`/`4:1`/`8:1`，极端比例仅 3.1 系（Flash/Flash-Lite）支持 |
+| `max_reference_images` | `14` | 官方上限 14 张，超出截取 |
+| `enable_text_response` | `false` | 开启后 `response_format` 传数组，同时返回文本与图片 |
+| `enable_grounding` | `false` | 启用 Google 搜索接地（lite 不支持） |
+| `image_search` | `false` | 接地中加入 Image Search（仅 3.1 Flash Image 支持） |
+| `thinking_level` | 空 | `minimal`/`high`，仅 3.1 Flash Image 支持，留空用模型默认 |
+
+行为说明：
+
+- 请求固定 `store: false`，请求内容不在 Google 侧留存；Interactions API 暂不支持自定义 safety settings，配置了也会忽略并记录日志。
+- 自定义 `api_base` 缺版本前缀时自动补 `/v1beta`。
+- 官方文档：<https://ai.google.dev/gemini-api/docs/image-generation>；Imagen 系列已于 2026-08-17 停服，请勿再配置 Imagen 模型。
+
+## vertex_settings（Vertex AI 专用配置）
+
+配置路径：`provider_settings.provider_overrides` 中选择 `vertex` 模板。接入 Google Cloud Vertex AI（Agent Platform）的 Gemini 图像生成端点（`generateContent` 协议，与 `google` 模板同构，但端点与认证方式不同）。
+
+**认证二选一（互斥，一个条目只能配置一个凭证）**：
+
+- **服务账号 JSON 凭证**（`service_account_files`，type=file）：上传 `.json` 文件或直接粘贴密钥 JSON 内容均可（工作台凭证框两者都支持，也可填文件路径；配置页上传的文件保存在插件目录 `files/` 下，记录相对路径）。需具备 Vertex AI User 权限。插件以 RS256 JWT 换取 Bearer 访问令牌并缓存至过期前自动刷新；令牌请求与生成请求走同一代理。
+- **Express API Key**（`api_keys`）：Vertex AI Express 模式的 API Key，最多填一个，走 `https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent`，支持每日限额。
+
+两种凭证互斥：同时配置、上传多个服务账号凭证或填写多个 API Key 的条目在加载时直接报错跳过（studio 保存同样会被校验拦截）。服务账号凭证走项目级端点（`https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent`）；`project_id` 留空时自动从凭证 JSON 的 `project_id` 读取。
+
+模板字段：
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `model` | `gemini-3-pro-image` | 如 `gemini-3-pro-image`、`gemini-3.1-flash-image`、`gemini-2.5-flash-image` |
+| `service_account_files` | `[]` | 服务账号 JSON 凭证：上传文件或直接粘贴 JSON 内容，最多一个 |
+| `api_keys` | 空 | Express 模式 API Key（单个，字符串填写）；与服务账号凭证互斥 |
+| `project_id` | 空 | GCP 项目 ID；服务账号凭证含 project_id 时可留空 |
+| `location` | `global` | 区域，如 `us-central1`、`europe-west4`、`global`（决定端点主机） |
+| `api_base` | 空 | 留空自动推导；填写后以其为根（代理网关场景），缺版本前缀自动补 `/v1` |
+| `resolution` | `1K` | `1K`/`2K`/`4K`（imageConfig.imageSize） |
+| `aspect_ratio` | `1:1` | 标准 14 种长宽比 |
+| `max_reference_images` | `14` | 参考图上限，超出截取 |
+| `person_generation` | 空 | `imageConfig.personGeneration`：`allow_all`/`allow_adult`/`allow_none`；被人物/人脸安全过滤拦截时可尝试 `allow_all` |
+| `enable_text_response` | `false` | 同时返回文本与图片 |
+| `enable_grounding` | `false` | Google 搜索接地 |
+
+安全过滤与错误处理：
+
+- 提示词被拦截（响应含 `promptFeedback.blockReason`）或生成结果被拦截（`finishReason` 为 `IMAGE_SAFETY` / `IMAGE_PROHIBITED_CONTENT` / `PROHIBITED_CONTENT` / `SAFETY` / `BLOCKLIST` / `SPII`）时，报「内容安全过滤未通过」且不可重试，会继续尝试下一候选。
+- `raiFilteredReason` 中的官方支持代码会翻译为类别名（如 `56562880` → 暴力内容、`39322892` → 人物/人脸、`90789179` → 性相关内容），便于定位拦截原因。
+- 429/`RESOURCE_EXHAUSTED` 按配额错误可重试并触发 Key 轮换；401/403 不可重试，直接换下一候选。
+- 模型目录未接入 Vertex 协议，模型名需手动填写（studio 拉取按钮会提示暂不支持）。
+
+依赖：使用服务账号凭证需 `cryptography`（已加入 requirements.txt）；仅用 Express API Key 无额外依赖。
+
+官方文档：<https://docs.cloud.google.com/vertex-ai/generative-ai/docs/multimodal/image-generation>

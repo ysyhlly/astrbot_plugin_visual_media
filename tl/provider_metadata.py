@@ -1,0 +1,216 @@
+"""Canonical provider specs and capability helpers."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Final
+
+from .api_normalize import normalize_api_type
+
+
+@dataclass(frozen=True)
+class ProviderSpec:
+    """Lightweight provider registration metadata."""
+
+    api_type: str
+    provider_path: str
+    supports_image_edit: bool = True
+    settings_attr: str | None = None
+    model_field: str = "model"
+    settings_validator_path: str | None = None
+    settings_normalizer_path: str | None = None
+    edit_capability_path: str | None = None
+    candidate_config_hook_path: str | None = None
+    tool_profile_path: str | None = None
+    capability_profile_path: str | None = None
+    rebuild_on_retry: bool = False
+    retry_error_arg: bool = False
+    parse_errors_with_provider: bool = False
+    # 候选级最大并发（0=不限制；免费单并发渠道设 1，批量任务按候选串行）
+    max_concurrency: int = 0
+    model_catalog_kind: str | None = None
+    # False 表示候选可用非 API Key 凭证（如 service account 文件）代替 api_keys
+    requires_api_keys: bool = True
+    response_reader_path: str | None = None
+    retry_ambiguous_transport_errors: bool = True
+
+
+_PROVIDER_SPECS: Final[tuple[ProviderSpec, ...]] = (
+    ProviderSpec(
+        "google",
+        "tl.api.google.GoogleProvider",
+        capability_profile_path="tl.provider_capabilities.gemini_image_capability",
+        model_catalog_kind="google",
+    ),
+    ProviderSpec(
+        "gemini_interactions",
+        "tl.api.gemini_interactions.GeminiInteractionsProvider",
+        capability_profile_path="tl.provider_capabilities.gemini_image_capability",
+        model_catalog_kind="google",
+    ),
+    ProviderSpec(
+        "vertex",
+        "tl.api.vertex.VertexProvider",
+        settings_attr="vertex_settings",
+        capability_profile_path="tl.provider_capabilities.gemini_image_capability",
+        settings_validator_path="tl.provider_hooks.validate_vertex_settings",
+        requires_api_keys=False,
+        parse_errors_with_provider=True,
+        rebuild_on_retry=True,
+    ),
+    ProviderSpec(
+        "openai",
+        "tl.api.openai_compat.OpenAICompatProvider",
+        model_catalog_kind="openai",
+    ),
+    ProviderSpec(
+        "agnes_ai",
+        "tl.api.agnes_ai.AgnesAIProvider",
+        settings_attr="agnes_ai_settings",
+        capability_profile_path="tl.provider_capabilities.agnes_ai_capability",
+        model_catalog_kind="openai",
+    ),
+    ProviderSpec(
+        "xai",
+        "tl.api.xai.XAIProvider",
+        settings_attr="xai_settings",
+        capability_profile_path="tl.provider_capabilities.xai_capability",
+        model_catalog_kind="xai",
+    ),
+    ProviderSpec(
+        "minimax",
+        "tl.api.minimax.MiniMaxProvider",
+        settings_attr="minimax_settings",
+        capability_profile_path="tl.provider_capabilities.minimax_capability",
+        model_catalog_kind="openai",
+        rebuild_on_retry=True,
+        retry_error_arg=True,
+    ),
+    ProviderSpec(
+        "stepfun",
+        "tl.api.stepfun.StepfunProvider",
+        settings_attr="stepfun_settings",
+        edit_capability_path="tl.provider_hooks.stepfun_edit_capability",
+        capability_profile_path="tl.provider_capabilities.stepfun_capability",
+        model_catalog_kind="openai",
+    ),
+    ProviderSpec(
+        "openai_images",
+        "tl.api.openai_images.OpenAIImagesProvider",
+        settings_attr="openai_images_settings",
+        settings_validator_path="tl.provider_hooks.validate_openai_images_settings",
+        edit_capability_path="tl.provider_hooks.openai_images_edit_capability",
+        candidate_config_hook_path="tl.provider_hooks.openai_images_candidate_config",
+        tool_profile_path="tl.provider_hooks.openai_images_tool_profile",
+        capability_profile_path="tl.provider_capabilities.openai_images_capability",
+        model_catalog_kind="openai",
+        response_reader_path="tl.api.openai_images.read_images_response",
+        retry_ambiguous_transport_errors=False,
+        rebuild_on_retry=True,
+    ),
+    ProviderSpec(
+        "openai_responses",
+        "tl.api.openai_responses.OpenAIResponsesProvider",
+        settings_attr="openai_responses_settings",
+        settings_validator_path="tl.provider_hooks.validate_openai_responses_settings",
+        candidate_config_hook_path="tl.provider_hooks.openai_responses_candidate_config",
+        tool_profile_path="tl.provider_hooks.openai_responses_tool_profile",
+        capability_profile_path="tl.provider_capabilities.openai_responses_capability",
+        response_reader_path="tl.api.openai_responses.read_responses_response",
+        retry_ambiguous_transport_errors=False,
+    ),
+    ProviderSpec(
+        "doubao",
+        "tl.api.doubao.DoubaoProvider",
+        settings_attr="doubao_settings",
+        model_field="endpoint_id",
+        settings_normalizer_path="tl.provider_hooks.normalize_doubao_settings",
+        capability_profile_path="tl.provider_capabilities.doubao_capability",
+        rebuild_on_retry=True,
+        parse_errors_with_provider=True,
+        model_catalog_kind="ark",
+    ),
+    ProviderSpec(
+        "sensenova",
+        "tl.api.sensenova.SenseNovaProvider",
+        supports_image_edit=True,
+        settings_attr="sensenova_settings",
+        edit_capability_path="tl.provider_hooks.sensenova_edit_capability",
+        capability_profile_path="tl.provider_capabilities.sensenova_capability",
+    ),
+    ProviderSpec(
+        "senseaudio",
+        "tl.api.senseaudio.SenseAudioProvider",
+        capability_profile_path="tl.provider_capabilities.senseaudio_capability",
+        parse_errors_with_provider=True,
+        # 异步轮询使用提交时的 Key，轮换后需要同步 request config。
+        rebuild_on_retry=True,
+    ),
+    ProviderSpec(
+        "dashscope",
+        "tl.api.dashscope.DashScopeProvider",
+        settings_attr="dashscope_settings",
+        settings_normalizer_path="tl.provider_hooks.normalize_dashscope_settings",
+        edit_capability_path="tl.provider_hooks.dashscope_edit_capability",
+        capability_profile_path="tl.provider_capabilities.dashscope_capability",
+        parse_errors_with_provider=True,
+    ),
+    ProviderSpec(
+        "modelscope",
+        "tl.api.modelscope.ModelScopeProvider",
+        settings_attr="modelscope_settings",
+        edit_capability_path="tl.provider_hooks.modelscope_edit_capability",
+        capability_profile_path="tl.provider_capabilities.modelscope_capability",
+        model_catalog_kind="openai",
+        parse_errors_with_provider=True,
+        # 轮询须与提交用同一把 Key：轮换后需重建以同步 config.api_key
+        rebuild_on_retry=True,
+        # 免费渠道官方单并发，批量任务按候选串行
+        max_concurrency=1,
+    ),
+    ProviderSpec(
+        "siliconflow",
+        "tl.api.siliconflow.SiliconFlowProvider",
+        settings_attr="siliconflow_settings",
+        edit_capability_path="tl.provider_hooks.siliconflow_edit_capability",
+        capability_profile_path="tl.provider_capabilities.siliconflow_capability",
+        model_catalog_kind="siliconflow",
+        parse_errors_with_provider=True,
+    ),
+)
+
+PROVIDER_TYPES: Final[tuple[str, ...]] = tuple(
+    spec.api_type for spec in _PROVIDER_SPECS
+)
+IMAGE_EDIT_CAPABLE_TYPES: Final[frozenset[str]] = frozenset(
+    spec.api_type for spec in _PROVIDER_SPECS if spec.supports_image_edit
+)
+_PROVIDER_SPEC_BY_TYPE: Final[dict[str, ProviderSpec]] = {
+    spec.api_type: spec for spec in _PROVIDER_SPECS
+}
+
+
+def iter_provider_specs() -> tuple[ProviderSpec, ...]:
+    """Return registered provider specs in schema order."""
+    return _PROVIDER_SPECS
+
+
+def get_provider_spec(api_type: Any) -> ProviderSpec | None:
+    """Return provider spec for a canonical or user-provided provider key."""
+    return _PROVIDER_SPEC_BY_TYPE.get(normalize_api_type(api_type))
+
+
+def is_known_api_type(api_type: Any) -> bool:
+    """Return whether the value is a registered provider key."""
+    return get_provider_spec(api_type) is not None
+
+
+def iter_api_types() -> tuple[str, ...]:
+    """Return registered provider keys in schema order."""
+    return PROVIDER_TYPES
+
+
+def supports_image_edit(api_type: Any) -> bool:
+    """Return whether the provider can process reference images by default."""
+    spec = get_provider_spec(api_type)
+    return bool(spec and spec.supports_image_edit)

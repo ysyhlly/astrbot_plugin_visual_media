@@ -1,0 +1,2398 @@
+"""API 客户端模块。
+
+提供 Google Gemini 与 OpenAI 兼容 API 的客户端实现，
+并负责响应解析、重试调度与参考图预处理等公共逻辑。
+各供应商的实现细节拆到 ``tl/api/`` 下的子模块。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import re
+import urllib.parse
+import urllib.request
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+import aiohttp
+from astrbot.api import logger
+
+from .api import (
+    get_api_provider,
+    get_provider_spec,
+    normalize_api_type,
+    supports_image_edit,
+)
+from .api_headers import apply_api_key_to_headers, extract_api_key_from_headers
+from .api_types import APIError, ApiRequestConfig
+from .core.errors import redact_text, redact_url
+from .generation_scheduler import scheduled_generation
+from .provider_capabilities import (
+    apply_request_overrides,
+    explicit_runtime_parameters,
+    routing_mode,
+    select_candidates,
+)
+from .provider_loader import load_callable
+from .provider_runtime import provider_operation
+from .provider_settings import candidate_is_keyless, candidate_with_overrides
+
+_DOWNLOAD_PROXY_DEFAULT = object()
+
+try:
+    from .reference_image import (
+        REFERENCE_IMAGE_CACHE_DIR,
+        extract_reference_image_source,
+        is_qq_image_host,
+        normalize_reference_image_input,
+    )
+except ImportError:
+    import tempfile
+
+    REFERENCE_IMAGE_CACHE_DIR = (
+        Path(tempfile.gettempdir())
+        / "astrbot_plugin_visual_media"
+        / "download_cache"
+    )
+
+    def extract_reference_image_source(image_input: Any) -> str:
+        return str(image_input or "").strip()
+
+    def is_qq_image_host(host: str) -> bool:
+        return False
+
+    async def normalize_reference_image_input(
+        image_input: Any,
+        *,
+        image_cache_dir=None,
+        image_input_mode="force_base64",
+        session=None,
+        proxy=None,
+    ):
+        return None, None
+
+
+try:
+    from .tl_utils import (
+        encode_file_to_base64,
+        get_plugin_data_dir,
+        resolve_image_source_to_path,
+        save_base64_image,
+        save_image_data,
+        save_image_stream,
+    )
+except ImportError:
+    from pathlib import Path
+
+    async def save_base64_image(
+        base64_data: str, image_format: str = "png"
+    ) -> str | None:
+        """占位符函数"""
+        return None
+
+    async def save_image_data(
+        image_data: bytes, image_format: str = "png"
+    ) -> str | None:
+        """占位符函数"""
+        return None
+
+    async def save_image_stream(
+        stream_reader, image_format: str = "png", target_path=None
+    ):
+        return None
+
+    def encode_file_to_base64(file_path, chunk_size: int = 65536) -> str:
+        return ""
+
+    def get_plugin_data_dir() -> Path:
+        return Path(".")
+
+
+class GeminiAPIClient:
+    """遵循官方 API 规范的 Gemini API 客户端
+
+    特性：
+    - 支持 Google 官方 API 和 OpenAI API
+    - 支持自定义 API Base URL（反代）
+    - 支持任意模型名称
+    - 遵循官方 Gemini API 规范
+    - 支持多 Key 轮换和每日限额（通过 KeyManager）
+    """
+
+    # Google 官方 API 默认地址
+    GOOGLE_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+    # OpenAI API 默认地址
+    OPENAI_API_BASE = "https://api.openai.com/v1"
+
+    def __init__(self, api_keys: list[str]):
+        """
+        初始化 API 客户端
+
+        Args:
+            api_keys: API 密钥列表
+        """
+        self.api_keys = api_keys or []
+        self.current_key_index = 0
+        self._lock = asyncio.Lock()
+        self.proxy = (
+            os.environ.get("HTTPS_PROXY")
+            or os.environ.get("https_proxy")
+            or os.environ.get("HTTP_PROXY")
+            or os.environ.get("http_proxy")
+        )
+        if self.proxy:
+            logger.debug(f"检测到代理配置，使用代理: {redact_text(self.proxy)[:240]}")
+        logger.debug(f"API 客户端已初始化，支持 {len(self.api_keys)} 个 API 密钥")
+        self._session: aiohttp.ClientSession | None = None
+        self._proxy_sessions: dict[str, aiohttp.ClientSession] = {}
+        self._session_lock = asyncio.Lock()
+
+        # KeyManager 实例（由主插件注入，用于多 Key 轮换和每日限额）
+        self._key_manager = None
+        self.provider_candidates: list[Any] = []
+        # 全部启用候选（含未入轮询表条目），仅供 route_all_candidates 的工作台请求路由
+        self.provider_candidates_all: list[Any] = []
+        self._candidate_key_pools: dict[str, list[str]] = {}
+        self._candidate_key_indices: dict[str, int] = {}
+        # 候选级并发闸门（按 spec.max_concurrency 声明；免费单并发渠道串行）
+        self._candidate_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._default_proxy = self.proxy
+
+    async def _get_session(self, proxy: str | None = None) -> aiohttp.ClientSession:
+        """获取或创建可复用的 aiohttp 会话"""
+        proxy = proxy or self.proxy
+        if proxy and proxy.lower().startswith("socks"):
+            existing = self._proxy_sessions.get(proxy)
+            if existing and not existing.closed:
+                return existing
+            async with self._session_lock:
+                existing = self._proxy_sessions.get(proxy)
+                if existing and not existing.closed:
+                    return existing
+                try:
+                    from aiohttp_socks import ProxyConnector
+
+                    connector = ProxyConnector.from_url(proxy)
+                    session = aiohttp.ClientSession(connector=connector)
+                except ImportError:
+                    logger.error(
+                        "SOCKS 代理需要安装 aiohttp-socks: pip install aiohttp-socks"
+                    )
+                    session = aiohttp.ClientSession()
+                self._proxy_sessions[proxy] = session
+                return session
+
+        if self._session and not self._session.closed:
+            return self._session
+        async with self._session_lock:
+            if self._session and not self._session.closed:
+                return self._session
+            self._session = aiohttp.ClientSession()
+            return self._session
+
+    @property
+    def _http_proxy(self) -> str | None:
+        """HTTP 代理参数：SOCKS 代理由 ProxyConnector 处理，此处返回 None"""
+        if self.proxy and self.proxy.lower().startswith("socks"):
+            return None
+        return self.proxy
+
+    def _detach_sessions(self) -> list[aiohttp.ClientSession]:
+        sessions: list[aiohttp.ClientSession] = []
+        if self._session and not self._session.closed:
+            sessions.append(self._session)
+        sessions.extend(
+            session for session in self._proxy_sessions.values() if not session.closed
+        )
+        self._session = None
+        self._proxy_sessions = {}
+        return sessions
+
+    @staticmethod
+    async def _close_sessions(sessions: list[aiohttp.ClientSession]) -> None:
+        for session in sessions:
+            if not session.closed:
+                await session.close()
+
+    def invalidate_session(self):
+        """标记 session 需要重建（下次 _get_session 时自动创建新 session）"""
+        sessions = self._detach_sessions()
+        if not sessions:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._close_sessions(sessions))
+
+    async def close(self):
+        """关闭内部复用的 aiohttp 会话"""
+        await self._close_sessions(self._detach_sessions())
+
+    def set_key_manager(self, key_manager) -> None:
+        """设置 KeyManager 实例（用于多 Key 轮换和每日限额）"""
+        self._key_manager = key_manager
+
+    def set_provider_candidates(
+        self, candidates: list[Any], all_candidates: list[Any] | None = None
+    ) -> None:
+        """设置当前可用的供应商候选列表。
+
+        all_candidates 为全部启用候选（含未入轮询表条目）；缺省时与 candidates 一致。
+        Key 池按全集构建，保证工作台直选未入轮询候选时仍能轮换 Key。
+        """
+        self.provider_candidates = list(candidates or [])
+        self.provider_candidates_all = (
+            list(all_candidates)
+            if all_candidates is not None
+            else list(self.provider_candidates)
+        )
+        self._candidate_key_pools = {}
+        pool_source = self.provider_candidates_all or self.provider_candidates
+        for candidate in pool_source:
+            candidate_id = str(
+                getattr(candidate, "id", None)
+                or normalize_api_type(getattr(candidate, "api_type", ""))
+            )
+            api_keys = list(getattr(candidate, "api_keys", []) or [])
+            if candidate_id and api_keys:
+                self._candidate_key_pools[candidate_id] = api_keys
+                self._candidate_key_indices.setdefault(candidate_id, 0)
+
+    async def set_proxy(self, proxy: str | None) -> None:
+        """切换代理配置，变化时关闭旧 session 以便下次重建。"""
+        proxy = proxy or None
+        if self.proxy == proxy:
+            return
+        await self.close()
+        self.proxy = proxy
+
+    async def get_key_for_api_type(self, api_type: str) -> str | None:
+        """从 KeyManager 获取指定 API 类型的可用 Key
+
+        如果 KeyManager 有该 API 类型的配置，使用 KeyManager 管理的 Key；
+        否则回退到默认的 api_keys 列表。
+
+        Args:
+            api_type: API 类型（如 "doubao"）
+
+        Returns:
+            可用的 API Key
+        """
+        if self._key_manager and self._key_manager.has_provider(api_type):
+            key = await self._key_manager.get_available_key(api_type)
+            if key:
+                return key
+            # KeyManager 返回 None 表示所有 Key 已耗尽
+            logger.warning(f"[KeyManager] {api_type} 所有 Key 今日额度已用尽")
+            return None
+        if api_type in self._candidate_key_pools:
+            pool = self._candidate_key_pools[api_type]
+            index = self._candidate_key_indices.get(api_type, 0)
+            return pool[index % len(pool)]
+        # 回退到默认 Key
+        return await self.get_next_api_key()
+
+    async def rotate_key_for_scope(self, key_scope: str) -> str | None:
+        if key_scope in self._candidate_key_pools:
+            pool = self._candidate_key_pools[key_scope]
+            if not pool:
+                return None
+            index = (self._candidate_key_indices.get(key_scope, 0) + 1) % len(pool)
+            self._candidate_key_indices[key_scope] = index
+            return pool[index]
+
+        await self.rotate_api_key()
+        return await self.get_next_api_key()
+
+    def _provider_setting_attr(self, api_type: str) -> str | None:
+        spec = get_provider_spec(api_type)
+        return spec.settings_attr if spec else None
+
+    def _apply_candidate_settings(self, candidate: Any) -> None:
+        attr = self._provider_setting_attr(getattr(candidate, "api_type", ""))
+        if attr:
+            setattr(self, attr, getattr(candidate, "settings", None) or {})
+
+    @staticmethod
+    def _candidate_model(candidate: Any) -> str:
+        model = getattr(candidate, "model", "")
+        if model:
+            return str(model)
+        settings = getattr(candidate, "settings", None) or {}
+        spec = get_provider_spec(getattr(candidate, "api_type", ""))
+        model_field = spec.model_field if spec else "model"
+        return str(settings.get(model_field) or "")
+
+    @staticmethod
+    def _candidate_api_base(candidate: Any) -> str | None:
+        api_base = getattr(candidate, "api_base", "")
+        if api_base:
+            return str(api_base)
+        settings = getattr(candidate, "settings", None) or {}
+        value = settings.get("api_base")
+        return str(value).strip() if value else None
+
+    @staticmethod
+    def _candidate_proxy(candidate: Any) -> str | None:
+        proxy = getattr(candidate, "proxy", None)
+        if proxy:
+            return str(proxy)
+        settings = getattr(candidate, "settings", None) or {}
+        value = settings.get("proxy")
+        return str(value).strip() if value else None
+
+    @staticmethod
+    def _candidate_supports_image_edit(candidate: Any) -> bool:
+        support_flag = getattr(candidate, "supports_image_edit", None)
+        if support_flag is not None:
+            return bool(support_flag)
+        api_type = getattr(candidate, "api_type", "")
+        spec = get_provider_spec(api_type)
+        if spec and spec.edit_capability_path:
+            settings = getattr(candidate, "settings", None) or {}
+            return bool(load_callable(spec.edit_capability_path)(settings))
+        return supports_image_edit(api_type)
+
+    @staticmethod
+    def _coerce_max_reference_images(value: Any) -> int:
+        try:
+            return max(int(value), 0)
+        except (TypeError, ValueError):
+            return 6
+
+    @staticmethod
+    def _candidate_resolution_values(
+        base_config: ApiRequestConfig, candidate: Any
+    ) -> tuple[str | None, str | None]:
+        if base_config.suppress_resolution:
+            return None, None
+
+        settings = getattr(candidate, "settings", None) or {}
+        resolution = (
+            base_config.resolution
+            if base_config.resolution is not None
+            else (settings.get("resolution") or "1K")
+        )
+        aspect_ratio = (
+            base_config.aspect_ratio
+            if base_config.aspect_ratio is not None
+            else (settings.get("aspect_ratio") or "1:1")
+        )
+
+        return resolution, aspect_ratio
+
+    @staticmethod
+    def _candidate_config_hook_values(
+        base_config: ApiRequestConfig, candidate: Any
+    ) -> dict[str, Any]:
+        api_type = getattr(candidate, "api_type", "")
+        spec = get_provider_spec(api_type)
+        if not spec or not spec.candidate_config_hook_path:
+            return {}
+        settings = getattr(candidate, "settings", None) or {}
+        try:
+            hook = load_callable(spec.candidate_config_hook_path)
+            values = hook(base_config, candidate, settings)
+        except Exception as e:
+            provider_id = getattr(candidate, "provider_id", None) or getattr(
+                candidate, "id", None
+            )
+            logger.warning(
+                "候选配置 hook 执行失败，已忽略: "
+                f"provider_id={provider_id} api_type={api_type} "
+                f"hook={spec.candidate_config_hook_path} err={e}",
+                exc_info=True,
+            )
+            return {}
+        return values if isinstance(values, dict) else {}
+
+    def _build_candidate_config(
+        self, base_config: ApiRequestConfig, candidate: Any
+    ) -> ApiRequestConfig:
+        settings = getattr(candidate, "settings", None) or {}
+        request_settings, effective_image_count = apply_request_overrides(
+            base_config,
+            candidate,
+            settings,
+        )
+        api_type = normalize_api_type(getattr(candidate, "api_type", ""))
+
+        max_refs = self._coerce_max_reference_images(
+            settings.get("max_reference_images", 6)
+        )
+        reference_images = base_config.reference_images
+        if reference_images and max_refs > 0:
+            if len(reference_images) > max_refs:
+                logger.warning(
+                    f"参考图片数量 ({len(reference_images)}) 超过 "
+                    f"{getattr(candidate, 'id', api_type)} 的限制 ({max_refs})，"
+                    f"将截取前 {max_refs} 张"
+                )
+            reference_images = reference_images[:max_refs]
+        elif reference_images and max_refs <= 0:
+            reference_images = []
+
+        resolution, aspect_ratio = self._candidate_resolution_values(
+            base_config, candidate
+        )
+        hook_values = self._candidate_config_hook_values(base_config, candidate)
+        if "resolution" in hook_values:
+            resolution = hook_values["resolution"]
+        if "aspect_ratio" in hook_values:
+            aspect_ratio = hook_values["aspect_ratio"]
+        enable_text_response = bool(settings.get("enable_text_response", False))
+        response_modalities = "TEXT_IMAGE" if enable_text_response else "IMAGE"
+
+        resolution_param_name = (
+            str(settings.get("resolution_param_name") or "").strip() or "image_size"
+        )
+        aspect_ratio_param_name = (
+            str(settings.get("aspect_ratio_param_name") or "").strip() or "aspect_ratio"
+        )
+
+        return replace(
+            base_config,
+            model=self._candidate_model(candidate) or base_config.model,
+            api_type=api_type,
+            api_base=self._candidate_api_base(candidate) or base_config.api_base,
+            api_key=None,
+            candidate_id=getattr(candidate, "id", None) or api_type,
+            resolution=resolution,
+            aspect_ratio=aspect_ratio,
+            enable_grounding=bool(settings.get("enable_grounding", False)),
+            enable_text_response=enable_text_response,
+            response_modalities=response_modalities,
+            force_resolution=bool(settings.get("force_resolution", False)),
+            resolution_param_name=resolution_param_name,
+            aspect_ratio_param_name=aspect_ratio_param_name,
+            reference_images=reference_images if reference_images else None,
+            provider_settings=request_settings,
+            proxy=self._candidate_proxy(candidate) or self._default_proxy,
+            model_alias=getattr(candidate, "model_alias", None),
+            effective_image_count=effective_image_count,
+        )
+
+    @staticmethod
+    def _copy_request_stats(source: ApiRequestConfig, target: ApiRequestConfig) -> None:
+        target.retry_count = source.retry_count
+        target.token_usage = source.token_usage
+        target.retry_note = source.retry_note
+        target.effective_image_count = source.effective_image_count
+        target.successful_candidate_id = source.candidate_id
+        target.successful_provider = source.api_type
+        target.successful_model = source.model
+        target.successful_model_alias = source.model_alias
+
+    def _candidate_key_count(self, key_scope: str) -> int:
+        if self._key_manager and self._key_manager.has_provider(key_scope):
+            return self._key_manager.key_count(key_scope)
+        if key_scope in self._candidate_key_pools:
+            return len(self._candidate_key_pools[key_scope])
+        return len(self.api_keys)
+
+    def _request_http_proxy(
+        self, request_config: ApiRequestConfig | None
+    ) -> str | None:
+        request_proxy = (
+            request_config.proxy if request_config and request_config.proxy else None
+        )
+        if request_proxy:
+            return None if request_proxy.lower().startswith("socks") else request_proxy
+        return self._http_proxy
+
+    @staticmethod
+    def _request_has_proxy(request_config: ApiRequestConfig | None) -> bool:
+        return bool(request_config and request_config.proxy)
+
+    @staticmethod
+    def _validate_and_normalize_b64(
+        raw_data: str, *, context: str = "", allow_relaxed_return: bool = False
+    ) -> str:
+        """
+        校验并归一化 base64：
+        - 去掉前缀/换行
+        - 尝试标准解码失败后回退 urlsafe 解码（补齐 padding）
+        - 再失败尝试宽松过滤/自动补齐 padding 后解码重编码
+        返回可直接使用的纯 base64 字符串，失败抛出异常。
+        """
+        cleaned = (raw_data or "").strip().replace("\n", "")
+        if ";base64," in cleaned:
+            _, _, cleaned = cleaned.partition(";base64,")
+
+        def try_decode(data: str) -> str:
+            base64.b64decode(data, validate=True)
+            return data
+
+        try:
+            return try_decode(cleaned)
+        except Exception:
+            # 回退 urlsafe base64
+            alt = cleaned.replace("-", "+").replace("_", "/")
+            pad_len = (-len(alt)) % 4
+            if pad_len:
+                alt += "=" * pad_len
+            try:
+                return try_decode(alt)
+            except Exception as e:
+                # 最后尝试宽松过滤非法字符/补齐 padding 后解码重编码
+                relaxed = re.sub(r"[^A-Za-z0-9+/=_-]", "", cleaned)
+                pad_len2 = (-len(relaxed)) % 4
+                if pad_len2:
+                    relaxed += "=" * pad_len2
+                try:
+                    raw = base64.b64decode(relaxed, validate=False)
+                    if raw:
+                        return base64.b64encode(raw).decode("utf-8")
+                except Exception:
+                    pass
+                if allow_relaxed_return and relaxed:
+                    return relaxed
+                if allow_relaxed_return and cleaned:
+                    # 仍无法解码时，允许直接回退原始字符串交由下游处理
+                    return cleaned
+                raise APIError(
+                    f"参考图 base64 校验失败{f'（{context}）' if context else ''}，请检查图片后重试。",
+                    None,
+                    "invalid_reference_image",
+                ) from e
+
+    async def get_next_api_key(self) -> str:
+        """获取下一个 API 密钥"""
+        async with self._lock:
+            if not self.api_keys:
+                raise ValueError("API 密钥列表不能为空")
+            key = self.api_keys[self.current_key_index % len(self.api_keys)]
+            return key
+
+    async def rotate_api_key(self):
+        """轮换到下一个 API 密钥"""
+        async with self._lock:
+            if len(self.api_keys) > 1:
+                self.current_key_index = (self.current_key_index + 1) % len(
+                    self.api_keys
+                )
+                logger.debug(
+                    f"已轮换到下一个 API 密钥，当前索引: {self.current_key_index}"
+                )
+
+    async def _prepare_openai_payload(self, config: ApiRequestConfig) -> dict[str, Any]:
+        """向后兼容：委托给 OpenAICompatProvider 构建 payload。"""
+        provider = get_api_provider(config.api_type)
+        req = await provider.build_request(client=self, config=config)
+        return req.payload
+
+    async def _normalize_reference_image_input(
+        self,
+        image_input: Any,
+        image_input_mode: str = "force_base64",
+        image_cache_dir=None,
+        *,
+        request_proxy: str | None = None,
+    ) -> tuple[str | None, str | None]:
+        """Normalize a reference image input with the dedicated normalizer.
+
+        request_proxy: 候选级代理原始串（可含 socks），优先于全局代理；None 走全局。
+        """
+        image_str = extract_reference_image_source(image_input)
+
+        session = None
+        proxy = None
+        if image_str.startswith(("http://", "https://")):
+            parsed_url = urllib.parse.urlparse(image_str)
+            is_qq = is_qq_image_host(parsed_url.netloc or "")
+            if not is_qq:
+                raw_proxy = request_proxy if request_proxy is not None else self.proxy
+                session = await self._get_session(raw_proxy)
+                if raw_proxy and raw_proxy.lower().startswith("socks"):
+                    proxy = None
+                else:
+                    proxy = raw_proxy or None
+
+        return await normalize_reference_image_input(
+            image_input,
+            image_cache_dir=image_cache_dir or REFERENCE_IMAGE_CACHE_DIR,
+            image_input_mode=image_input_mode,
+            session=session,
+            proxy=proxy,
+        )
+
+    async def _process_reference_image(
+        self,
+        image_input: Any,
+        idx: int,
+        image_input_mode: str = "force_base64",
+    ) -> tuple[str | None, str | None, bool]:
+        """
+        统一处理参考图像，返回 (mime_type, data, is_url)。
+
+        处理流程：
+        1. 优先规范化转换为 base64，避免已是 base64 的输入落临时文件再读回
+        2. 规范化失败时再尝试解析为本地文件路径
+        3. QQ 下载器逻辑已整合到 normalize_reference_image_input 和 resolve_image_source_to_path
+
+        Returns:
+            (mime_type, data, is_url):
+            - mime_type: MIME 类型
+            - data: base64 数据或 None（失败时）
+            - is_url: 原始输入是否为 URL
+        """
+        image_str = str(image_input).strip()
+        is_url = image_str.startswith(("http://", "https://"))
+
+        data = None
+        mime_type = None
+
+        # 1. 优先规范化转换，避免 base64/data URL 先写临时文件再重新编码。
+        try:
+            mime_type, data = await self._normalize_reference_image_input(
+                image_input,
+                image_input_mode=image_input_mode,
+            )
+            if data:
+                logger.debug(
+                    f"[_process_reference_image] 规范化转换成功: idx={idx} mime={mime_type}"
+                )
+                return mime_type, data, is_url
+            logger.debug(f"[_process_reference_image] 规范化转换返回空: idx={idx}")
+        except Exception as e:
+            logger.debug(
+                f"[_process_reference_image] 规范化转换失败: idx={idx} err={e}"
+            )
+
+        # 2. 兜底解析为本地文件
+        try:
+            local_path = await resolve_image_source_to_path(
+                image_input,
+                image_input_mode=image_input_mode,
+                api_client=self,
+                download_qq_image_fn=None,
+            )
+            if local_path and Path(local_path).exists():
+                suffix = Path(local_path).suffix.lower().lstrip(".") or "png"
+                mime_type = f"image/{suffix}"
+                data = encode_file_to_base64(local_path)
+                logger.debug(
+                    f"[_process_reference_image] 从本地文件获取成功: idx={idx}"
+                )
+                return mime_type, data, is_url
+        except Exception as e:
+            logger.debug(
+                f"[_process_reference_image] 本地文件解析失败: idx={idx} err={e}"
+            )
+
+        return mime_type, data, is_url
+
+    def _validate_b64_with_fallback(
+        self, data: str, context: str = ""
+    ) -> tuple[str, bool]:
+        """
+        校验 base64 数据，失败时返回透传的原始数据。
+
+        Returns:
+            (result, validated): result 是处理后的数据，validated 表示是否通过校验
+        """
+        try:
+            validated = self._validate_and_normalize_b64(
+                data, context=context, allow_relaxed_return=True
+            )
+            return validated, True
+        except APIError:
+            # 校验失败，透传原始数据（去掉 data URI 前缀）
+            raw = str(data).strip()
+            if ";base64," in raw:
+                _, _, raw = raw.partition(";base64,")
+            return raw, False
+
+    @staticmethod
+    def _ensure_mime_type(mime_type: str | None, default: str = "image/png") -> str:
+        """确保 MIME 类型有效"""
+        if mime_type and mime_type.startswith("image/"):
+            return mime_type
+        return default
+
+    async def _get_api_url(
+        self, config: ApiRequestConfig
+    ) -> tuple[str, dict[str, str], dict[str, Any]]:
+        """
+        根据配置获取 API URL、请求头和负载
+
+        智能处理API路径前缀，无需手动输入/v1或/v1beta
+        """
+        provider = get_api_provider(config.api_type)
+        req = await provider.build_request(client=self, config=config)
+        return req.url, req.headers, req.payload
+
+    @provider_operation("api")
+    @scheduled_generation
+    async def generate_image(
+        self,
+        config: ApiRequestConfig,
+        max_retries: int = 3,
+        total_timeout: int = 120,
+        per_retry_timeout: int = None,
+        max_total_time: int = None,
+    ) -> tuple[list[str], list[str], str | None, str | None]:
+        """
+        生成图像
+
+        Args:
+            config: 请求配置
+            max_retries: 最大重试次数
+            total_timeout: 总超时时间（秒）
+
+        Returns:
+            (image_urls, image_paths, text_content, thought_signature)，如果失败则返回空列表和None
+        """
+        if self.provider_candidates:
+            config.routing_mode = routing_mode(
+                config.requested_provider,
+                config.requested_model,
+            )
+            return await self._generate_image_with_candidates(
+                config=config,
+                max_retries=max_retries,
+                total_timeout=total_timeout,
+                per_retry_timeout=per_retry_timeout,
+                max_total_time=max_total_time,
+            )
+
+        result = await self._generate_image_single(
+            config=config,
+            max_retries=max_retries,
+            total_timeout=total_timeout,
+            per_retry_timeout=per_retry_timeout,
+            max_total_time=max_total_time,
+        )
+        config.successful_candidate_id = config.candidate_id
+        config.successful_provider = config.api_type
+        config.successful_model = config.model
+        config.successful_model_alias = config.model_alias
+        return result
+
+    async def _generate_image_with_candidates(
+        self,
+        config: ApiRequestConfig,
+        max_retries: int = 3,
+        total_timeout: int = 120,
+        per_retry_timeout: int = None,
+        max_total_time: int = None,
+    ) -> tuple[list[str], list[str], str | None, str | None]:
+        has_reference_images = bool(config.reference_images)
+        last_error: APIError | None = None
+        skipped_reasons: list[str] = []
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        required_parameters = explicit_runtime_parameters(config)
+        request_values = {name: getattr(config, name) for name in required_parameters}
+        configured = self.provider_candidates
+        if config.route_all_candidates and self.provider_candidates_all:
+            # 只有工作台请求会置位：路由范围扩至全部启用候选（含未入轮询条目），
+            # 聊天链路（指令/LLM 工具）仍严格限定在轮询表范围内。
+            configured = self.provider_candidates_all
+        if config.generation_settings:
+            if not config.requested_candidate_id:
+                raise APIError(
+                    "临时生成参数必须指定供应商候选",
+                    None,
+                    "invalid_request",
+                    retryable=False,
+                )
+            configured = [
+                candidate_with_overrides(candidate, config.generation_settings)
+                if candidate.id == config.requested_candidate_id
+                else candidate
+                for candidate in configured
+            ]
+        candidates = select_candidates(
+            configured,
+            provider=config.requested_provider,
+            model=config.requested_model,
+            candidate_id=config.requested_candidate_id,
+            has_reference_images=has_reference_images,
+            required_parameters=required_parameters,
+            request_values=request_values,
+        )
+        if not candidates:
+            selections: list[str] = []
+            if config.requested_provider:
+                selections.append(f"供应商={config.requested_provider}")
+            if config.requested_model:
+                selections.append(f"模型/别名={config.requested_model}")
+            if has_reference_images:
+                selections.append("生成模式=image_to_image")
+            if required_parameters:
+                selections.append("参数=" + ",".join(sorted(required_parameters)))
+            detail = "；".join(selections) or "当前配置"
+            raise APIError(
+                f"没有匹配本次请求能力的供应商候选：{detail}",
+                None,
+                "no_available_provider",
+                retryable=False,
+            )
+
+        def coerce_positive_int(value: Any) -> int | None:
+            try:
+                int_value = int(value)
+            except Exception:
+                return None
+            return int_value if int_value > 0 else None
+
+        global_total_time = coerce_positive_int(max_total_time)
+        if global_total_time is None:
+            global_total_time = coerce_positive_int(total_timeout)
+
+        def remaining_time() -> int | None:
+            if global_total_time is None:
+                return None
+            remaining = global_total_time - (loop.time() - started_at)
+            if remaining <= 0:
+                raise APIError("图像生成时间过长，已超时。", None, "timeout")
+            return max(int(remaining), 1)
+
+        for candidate in candidates:
+            candidate_id = str(
+                getattr(candidate, "id", None)
+                or normalize_api_type(getattr(candidate, "api_type", ""))
+            )
+            api_type = normalize_api_type(getattr(candidate, "api_type", ""))
+
+            if has_reference_images and not self._candidate_supports_image_edit(
+                candidate
+            ):
+                reason = f"{candidate_id} 不支持参考图/改图"
+                skipped_reasons.append(reason)
+                logger.info(f"[provider_polling] 跳过候选：{reason}")
+                continue
+
+            if not getattr(candidate, "api_keys", None) and not candidate_is_keyless(
+                api_type, getattr(candidate, "settings", None)
+            ):
+                reason = f"{candidate_id} 未配置 API Key"
+                skipped_reasons.append(reason)
+                logger.error(f"[provider_polling] 跳过候选：{reason}")
+                continue
+
+            try:
+                candidate_max_total_time = remaining_time()
+                candidate_config = self._build_candidate_config(config, candidate)
+
+                logger.info(
+                    f"[provider_polling] 尝试供应商候选 {candidate_id} ({api_type}), "
+                    f"模型={candidate_config.model}"
+                )
+
+                result = await self._generate_image_single(
+                    config=candidate_config,
+                    max_retries=max_retries,
+                    total_timeout=total_timeout,
+                    per_retry_timeout=per_retry_timeout,
+                    max_total_time=candidate_max_total_time,
+                )
+                self._copy_request_stats(candidate_config, config)
+                return result
+            except APIError as e:
+                last_error = e
+                if e.error_type in {"cancelled", "timeout", "outcome_unknown"}:
+                    logger.warning(
+                        f"[provider_polling] 候选 {candidate_id} 因 {e.error_type} 中止：{e.message}"
+                    )
+                    raise
+                logger.warning(
+                    f"[provider_polling] 候选 {candidate_id} 生成失败，继续尝试下一个：{e.message}"
+                )
+            except Exception as e:
+                last_error = APIError(str(e), None, "unknown")
+                logger.warning(
+                    f"[provider_polling] 候选 {candidate_id} 生成异常，继续尝试下一个：{e}"
+                )
+
+        if last_error:
+            raise APIError(
+                f"所有可用供应商候选均生成失败，最后错误：{last_error.message}",
+                last_error.status_code,
+                last_error.error_type,
+                last_error.error_code,
+                last_error.retryable,
+            ) from None
+
+        reason_text = "；".join(skipped_reasons) if skipped_reasons else "没有候选配置"
+        raise APIError(
+            f"没有可用于本次请求的供应商候选：{reason_text}",
+            None,
+            "no_available_provider",
+            retryable=False,
+        )
+
+    def _candidate_semaphore(
+        self, config: ApiRequestConfig
+    ) -> asyncio.Semaphore | None:
+        """按 spec.max_concurrency 返回候选级信号量；未声明返回 None（零开销）。"""
+        spec = get_provider_spec(config.api_type)
+        if spec is None or spec.max_concurrency <= 0:
+            return None
+        key = config.candidate_id or config.api_type
+        semaphore = self._candidate_semaphores.get(key)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(spec.max_concurrency)
+            # 同步代码段内 setdefault，事件循环单线程下无竞态
+            semaphore = self._candidate_semaphores.setdefault(key, semaphore)
+        return semaphore
+
+    async def _generate_image_single(
+        self,
+        config: ApiRequestConfig,
+        max_retries: int = 3,
+        total_timeout: int = 120,
+        per_retry_timeout: int = None,
+        max_total_time: int = None,
+    ) -> tuple[list[str], list[str], str | None, str | None]:
+        # 单并发渠道：同一候选串行执行完整请求生命周期（含重试与轮询），
+        # 不同候选（独立凭证）互不阻塞；成功/失败/超时/取消均经 async with 释放
+        semaphore = self._candidate_semaphore(config)
+        if semaphore is None:
+            return await self._generate_image_single_inner(
+                config=config,
+                max_retries=max_retries,
+                total_timeout=total_timeout,
+                per_retry_timeout=per_retry_timeout,
+                max_total_time=max_total_time,
+            )
+        async with semaphore:
+            return await self._generate_image_single_inner(
+                config=config,
+                max_retries=max_retries,
+                total_timeout=total_timeout,
+                per_retry_timeout=per_retry_timeout,
+                max_total_time=max_total_time,
+            )
+
+    async def _generate_image_single_inner(
+        self,
+        config: ApiRequestConfig,
+        max_retries: int = 3,
+        total_timeout: int = 120,
+        per_retry_timeout: int = None,
+        max_total_time: int = None,
+    ) -> tuple[list[str], list[str], str | None, str | None]:
+        keyless_candidate = candidate_is_keyless(
+            config.api_type, config.provider_settings
+        )
+        if not self.api_keys and not keyless_candidate:
+            raise ValueError("未配置 API 密钥")
+
+        # 使用 KeyManager 获取 Key（支持多 Key 轮换和每日限额）
+        if not config.api_key and not keyless_candidate:
+            key_scope = config.candidate_id or config.api_type
+            key = await self.get_key_for_api_type(key_scope)
+            if key is None:
+                # 所有 Key 今日额度已用尽
+                raise APIError(
+                    f"{key_scope} 的所有 API Key 今日额度已用尽，请明天再试或添加更多 Key。",
+                    None,
+                    "quota_exhausted",
+                    retryable=False,
+                )
+            config.api_key = key
+
+        enable_smart_retry = bool(getattr(config, "enable_smart_retry", True))
+
+        # 获取请求信息
+        url, headers, payload = await self._get_api_url(config)
+
+        logger.debug(f"使用 {config.model} (通过 {config.api_type}) 生成图像")
+        logger.debug(f"API 端点: {redact_url(url)}")
+
+        # 从 payload 中获取实际使用的 size（provider_overrides 可能已覆盖）
+        actual_size = payload.get("size") or config.resolution or "默认"
+        logger.debug(
+            "请求参数概览: refs=%s prompt_len=%s aspect=%s res=%s",
+            len(config.reference_images or []),
+            len(config.prompt or ""),
+            config.aspect_ratio,
+            actual_size,
+        )
+
+        if actual_size != "默认" or config.aspect_ratio:
+            logger.debug(
+                f"分辨率: {actual_size}, 长宽比: {config.aspect_ratio or '默认'}"
+            )
+
+        if config.api_base:
+            logger.debug(f"使用自定义 API Base: {config.api_base}")
+
+        return await self._make_request(
+            url=url,
+            payload=payload,
+            headers=headers,
+            api_type=config.api_type,
+            model=config.model,
+            max_retries=max_retries,
+            total_timeout=total_timeout,
+            api_base=config.api_base,
+            enable_smart_retry=enable_smart_retry,
+            per_retry_timeout=per_retry_timeout,
+            max_total_time=max_total_time,
+            config=config,
+        )
+
+    async def _make_request(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        api_type: str,
+        model: str,
+        max_retries: int,
+        total_timeout: int = 120,
+        api_base: str = None,
+        enable_smart_retry: bool = True,
+        per_retry_timeout: int | None = None,
+        max_total_time: int | None = None,
+        config: ApiRequestConfig | None = None,
+    ) -> tuple[list[str], list[str], str | None, str | None]:
+        """执行 API 请求并处理响应（支持重试、总耗时上限与多 Key 轮换）"""
+
+        # 防御性复制 headers，避免并发请求间因 Key 轮换导致的相互影响
+        headers = dict(headers)
+
+        def coerce_int(value: Any, default: int) -> int:
+            try:
+                return int(value)
+            except Exception:
+                return default
+
+        effective_max_retries = max(coerce_int(max_retries, 1), 1)
+        enable_smart_retry = bool(enable_smart_retry)
+        if not enable_smart_retry:
+            effective_max_retries = 1
+
+        base_timeout = (
+            per_retry_timeout if per_retry_timeout is not None else total_timeout
+        )
+        base_timeout_int = max(coerce_int(base_timeout, total_timeout), 1)
+
+        max_total_time_int = None
+        if max_total_time is not None:
+            mt = coerce_int(max_total_time, 0)
+            if mt > 0:
+                max_total_time_int = mt
+
+        request_proxy = config.proxy if config and config.proxy else None
+        if not request_proxy:
+            request_proxy = self.proxy
+        session = await self._get_session(request_proxy)
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        if config is not None:
+            config.request_deadline = (
+                started_at + max_total_time_int
+                if max_total_time_int is not None
+                else None
+            )
+        last_error: APIError | None = None
+        key_scope = config.candidate_id if config and config.candidate_id else api_type
+
+        async def rotate_key_if_possible(err: APIError) -> str | None:
+            """在可用多 Key 且错误可能与 Key 相关时轮换，并更新 headers。"""
+            if not enable_smart_retry or self._candidate_key_count(key_scope) <= 1:
+                return None
+
+            status = err.status_code
+            if status not in {401, 402, 403, 429} and err.error_type != "quota":
+                return None
+
+            try:
+                # 使用 KeyManager 轮换（支持每日限额，会预扣除额度）
+                if self._key_manager and self._key_manager.has_provider(key_scope):
+                    new_key = await self._key_manager.rotate_key(key_scope)
+                    if not new_key:
+                        logger.warning(
+                            f"[KeyManager] {key_scope} 轮换失败，所有 Key 今日额度已用尽"
+                        )
+                        return None
+                else:
+                    # 无 KeyManager 配置时使用默认轮换
+                    new_key = await self.rotate_key_for_scope(key_scope)
+            except Exception as e:
+                logger.warning(
+                    "轮换 API Key 失败，将继续使用当前 Key: %s",
+                    redact_text(str(e))[:240],
+                )
+                return None
+
+            updated = False
+            if "Authorization" in headers:
+                auth = str(headers.get("Authorization") or "")
+                if auth.lower().startswith("bearer "):
+                    headers["Authorization"] = f"Bearer {new_key}"
+                    updated = True
+            if "x-goog-api-key" in headers:
+                headers["x-goog-api-key"] = new_key
+                updated = True
+            for k in ("X-Api-Key", "X-API-Key", "x-api-key"):
+                if k in headers:
+                    headers[k] = new_key
+                    updated = True
+
+            if not updated:
+                logger.debug("已轮换 API Key，但未能识别需要更新的请求头字段")
+            else:
+                logger.debug(f"已轮换到新的 API Key: ***{new_key[-4:]}")
+
+            return new_key
+
+        def is_retryable(err: APIError) -> bool:
+            """根据错误类型/状态码判断是否值得重试。
+
+            优先使用 err.retryable 字段（由供应商适配器设置），
+            回退到基于状态码和错误类型的通用判断逻辑。
+            """
+            # 优先检查供应商适配器设置的 retryable 字段
+            if hasattr(err, "retryable") and err.retryable is not None:
+                # 如果供应商明确标记为不可重试，直接返回
+                if err.retryable is False:
+                    return False
+                # 如果供应商明确标记为可重试，直接返回
+                if err.retryable is True:
+                    return True
+
+            # 以下为通用的回退逻辑
+            if err.error_type == "no_image_retry":
+                return True
+            if err.error_type in {"timeout", "network"}:
+                return True
+
+            status = err.status_code
+            if status is None:
+                return True
+            if 500 <= status < 600:
+                return True
+            if status in {408, 500, 502, 503, 504}:
+                return True
+            if status == 429:
+                return True
+            if status in {401, 402, 403}:
+                return self._candidate_key_count(key_scope) > 1
+            return False
+
+        for attempt in range(effective_max_retries):
+            if max_total_time_int is not None:
+                elapsed = loop.time() - started_at
+                remaining = max_total_time_int - elapsed
+                if remaining <= 0:
+                    timeout_msg = "图像生成时间过长，已超时。"
+                    raise APIError(timeout_msg, None, "timeout") from None
+
+                attempt_timeout_int = max(min(base_timeout_int, int(remaining)), 1)
+            else:
+                attempt_timeout_int = base_timeout_int
+
+            timeout_cfg = aiohttp.ClientTimeout(
+                total=attempt_timeout_int, sock_read=attempt_timeout_int
+            )
+
+            # 重试时重新构建请求（允许 Provider 进行降级处理，如 response_format 降级）
+            current_url = url
+            current_payload = payload
+            current_headers = dict(headers)  # 始终使用外层 headers（已含轮换后的 key）
+            is_retry = attempt > 0
+            spec = get_provider_spec(api_type)
+            if is_retry and config is not None and spec and spec.rebuild_on_retry:
+                try:
+                    # 重建前同步 config.api_key 为当前选中的 key（保持轮换一致性）
+                    current_key_from_headers = extract_api_key_from_headers(headers)
+                    if current_key_from_headers:
+                        config.api_key = current_key_from_headers
+
+                    provider = get_api_provider(api_type)
+                    provider_kwargs: dict[str, Any] = {
+                        "client": self,
+                        "config": config,
+                        "is_retry": True,
+                    }
+                    if spec.retry_error_arg:
+                        provider_kwargs["retry_error"] = last_error
+                    req = await provider.build_request(**provider_kwargs)
+                    current_url = req.url
+                    current_payload = req.payload
+                    # 重建后用外层 headers 的 key 覆盖，确保轮换结果不被覆盖
+                    current_headers = dict(req.headers)
+                    if current_key_from_headers:
+                        apply_api_key_to_headers(
+                            current_headers, current_key_from_headers
+                        )
+                    logger.debug("[retry] 已重新构建请求（is_retry=True）")
+                except Exception as e:
+                    logger.debug("[retry] 重新构建请求失败，使用原 payload: %s", e)
+                    # 回退到原 payload 并设置标记
+                    current_payload = dict(payload)
+                    current_payload["_is_retry"] = True
+
+            # 注意: KeyManager.get_available_key() 已预扣除额度，无需再做额外扣除
+
+            try:
+                logger.debug(
+                    "发送请求（尝试 %s/%s, timeout=%ss）",
+                    attempt + 1,
+                    effective_max_retries,
+                    attempt_timeout_int,
+                )
+                result = await self._perform_request(
+                    session,
+                    current_url,
+                    current_payload,
+                    current_headers,
+                    api_type,
+                    model,
+                    timeout=timeout_cfg,
+                    api_base=api_base,
+                    request_config=config,
+                )
+                if config is not None:
+                    config.retry_count = attempt
+                return result
+
+            except asyncio.CancelledError:
+                # 只有框架取消才不重试（这是最顶层的超时）
+                logger.debug("请求被框架取消（工具调用总超时），不再重试")
+                timeout_msg = "图像生成时间过长，请求被取消。"
+                raise APIError(timeout_msg, None, "cancelled") from None
+            except Exception as e:
+                if isinstance(e, APIError):
+                    err = e
+                    if not err.error_type:
+                        err.error_type = self._classify_error(e, err.message)
+                else:
+                    err_msg = str(e)
+                    err_type = self._classify_error(e, err_msg)
+                    status_code = getattr(e, "status", None)
+                    err = APIError(err_msg, status_code, err_type)
+                    spec = get_provider_spec(api_type)
+                    if (
+                        spec
+                        and not spec.retry_ambiguous_transport_errors
+                        and isinstance(
+                            e,
+                            (
+                                asyncio.TimeoutError,
+                                aiohttp.ClientConnectionError,
+                                aiohttp.ClientPayloadError,
+                            ),
+                        )
+                        and not isinstance(e, aiohttp.ClientConnectorError)
+                    ):
+                        err = APIError(
+                            "生图连接中断，任务结果未知，已停止自动重试。",
+                            status_code,
+                            "outcome_unknown",
+                            retryable=False,
+                        )
+
+                # 首先检查是否为不可重试错误
+                if not is_retryable(err):
+                    logger.error(f"不可重试错误: {err.message}")
+                    raise err from None
+
+                # 可重试错误，但已用尽重试次数
+                if attempt >= effective_max_retries - 1:
+                    logger.error(
+                        f"达到最大重试次数 ({effective_max_retries})，生成失败: {err.message}"
+                    )
+                    raise err from None
+
+                last_error = err
+                logger.warning(
+                    "可重试错误 (尝试 %s/%s): %s",
+                    attempt + 1,
+                    effective_max_retries,
+                    err.message,
+                )
+
+                await rotate_key_if_possible(err)
+
+                delay = min(2 ** (attempt + 2), 10)
+                logger.debug(f"等待 {delay} 秒后重试...")
+                await asyncio.sleep(delay)
+
+        if last_error:
+            raise last_error from None
+
+        return [], [], None, None
+
+    def _classify_error(self, exception: Exception, error_msg: str) -> str:
+        """分类错误类型"""
+        if isinstance(exception, asyncio.TimeoutError):
+            return "timeout"
+        elif "timeout" in error_msg.lower():
+            return "timeout"
+        elif "connection" in error_msg.lower():
+            return "network"
+        elif isinstance(exception, aiohttp.ClientError):
+            return "network"
+        else:
+            return "unknown"
+
+    def _is_retryable_error(self, error_type: str, exception: Exception) -> bool:
+        """判断错误是否可重试"""
+        # 特殊处理：未生成图像的重试
+        if error_type == "no_image_retry":
+            return True
+
+        # 可重试的错误：超时、网络错误、服务器错误
+        if error_type in ["timeout", "network"]:
+            return True
+
+        # HTTP 状态码判断
+        if hasattr(exception, "status"):
+            status = exception.status
+            # 可重试：408, 500, 502, 503, 504
+            # 不可重试：401, 402, 403, 422, 429（速率限制）
+            if status in [408, 500, 502, 503, 504]:
+                return True
+            elif status in [401, 402, 403, 422, 429]:
+                return False
+
+        return True  # 默认重试未知错误
+
+    async def _perform_request(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        api_type: str,
+        model: str,
+        *,
+        timeout: aiohttp.ClientTimeout | None = None,
+        api_base: str = None,
+        request_config: ApiRequestConfig | None = None,
+    ) -> tuple[list[str], list[str], str | None, str | None]:
+        """执行实际的HTTP请求"""
+        # 检测 multipart 标记（由 openai_images edits 等需要 FormData 的 provider 设置）
+        is_multipart = payload.get("_multipart", False)
+        form_data = payload.get("_form_data") if is_multipart else None
+
+        # 移除内部标记字段，不发送给 API
+        send_payload = {k: v for k, v in payload.items() if not k.startswith("_")}
+
+        logger.debug(
+            "发送请求: url=%s api_type=%s model=%s payload_keys=%s multipart=%s",
+            url[:100],
+            api_type,
+            model,
+            list(send_payload.keys()),
+            is_multipart,
+        )
+
+        # multipart 请求需移除 Content-Type（aiohttp 自动设置 boundary）
+        send_headers = dict(headers)
+        if is_multipart and form_data is not None:
+            send_headers.pop("Content-Type", None)
+
+        request_proxy = self._request_http_proxy(request_config)
+
+        post_kwargs: dict[str, Any] = {
+            "headers": send_headers,
+            "proxy": request_proxy,
+            "timeout": timeout,
+        }
+        if is_multipart and form_data is not None:
+            post_kwargs["data"] = form_data
+        else:
+            post_kwargs["json"] = send_payload
+
+        async with session.post(url, **post_kwargs) as response:
+            logger.debug(f"响应状态: {response.status}")
+            spec = get_provider_spec(api_type)
+            reader = (
+                load_callable(spec.response_reader_path)
+                if spec and spec.response_reader_path
+                else None
+            )
+            if reader and response.status == 200:
+                try:
+                    response_data = await reader(response=response)
+                except (ValueError, TypeError) as exc:
+                    raise APIError(
+                        "生图响应无法解析，任务结果未知，已停止自动重试。",
+                        response.status,
+                        "outcome_unknown",
+                        retryable=False,
+                    ) from exc
+            else:
+                response_text = await response.text()
+                content_type = response.headers.get("Content-Type", "") or ""
+                # Other providers retain their existing JSON/SSE interpretation.
+                try:
+                    response_data = json.loads(response_text) if response_text else {}
+                except json.JSONDecodeError as e:
+                    if (
+                        "text/event-stream" in content_type.lower()
+                        or response_text.strip().startswith("data:")
+                    ):
+                        try:
+                            response_data = self._parse_sse_payload(response_text)
+                            logger.debug("检测到 SSE 响应，已完成 JSON 转换")
+                        except Exception as sse_error:
+                            logger.error(
+                                "SSE 解析失败: %s", redact_text(str(sse_error))[:240]
+                            )
+                            logger.error(
+                                "响应内容前500字符: %s",
+                                redact_text(response_text)[:500],
+                            )
+                            raise APIError(
+                                f"API 返回了无效的 JSON/SSE 响应: {sse_error}",
+                                response.status,
+                            ) from None
+                    else:
+                        logger.error("JSON 解析失败: %s", redact_text(str(e))[:240])
+                        logger.error(
+                            "响应内容前500字符: %s", redact_text(response_text)[:500]
+                        )
+                        raise APIError(
+                            f"API 返回了无效的 JSON 响应: {e}", response.status
+                        ) from None
+
+            self._record_token_usage(request_config, response_data, response.status)
+
+            spec = get_provider_spec(api_type)
+            provider = get_api_provider(api_type)
+
+            async def parse_with_provider(
+                status: int,
+            ) -> tuple[list[str], list[str], str | None, str | None]:
+                parse_kwargs: dict[str, Any] = {
+                    "client": self,
+                    "response_data": response_data,
+                    "session": session,
+                    "api_base": api_base,
+                    "http_status": status,
+                    "request_config": request_config,
+                }
+                if spec and spec.parse_errors_with_provider:
+                    parse_kwargs["is_retry"] = payload.get("_is_retry", False)
+                return await provider.parse_response(**parse_kwargs)
+
+            if response.status == 200:
+                logger.debug("API 调用成功")
+                return await parse_with_provider(response.status)
+            elif response.status in [429, 402, 403]:
+                if spec and spec.parse_errors_with_provider:
+                    return await parse_with_provider(response.status)
+                error_msg = response_data.get("error", {}).get(
+                    "message", f"HTTP {response.status}"
+                )
+                logger.warning(f"API 配额/权限问题: {error_msg}")
+                raise APIError(error_msg, response.status, "quota")
+            elif response.status == 451:
+                # 内容安全审核拒绝
+                error_msg = response_data.get("error", {}).get(
+                    "message", "内容审核未通过"
+                )
+                logger.warning(f"内容安全拦截 (451): {error_msg}")
+                raise APIError(
+                    f"内容安全审核未通过: {error_msg}",
+                    response.status,
+                    "safety",
+                    retryable=False,
+                )
+            else:
+                if spec and spec.parse_errors_with_provider:
+                    return await parse_with_provider(response.status)
+                error_msg = response_data.get("error", {}).get(
+                    "message", f"HTTP {response.status}"
+                )
+                logger.warning(f"API 错误: {error_msg}")
+                raise APIError(error_msg, response.status)
+
+    def _record_token_usage(
+        self,
+        config: ApiRequestConfig | None,
+        response_data: dict[str, Any],
+        http_status: int,
+    ) -> None:
+        if config is None or http_status != 200:
+            return
+        config.token_usage = self._extract_token_usage(response_data)
+
+    @classmethod
+    def _extract_token_usage(
+        cls, response_data: dict[str, Any]
+    ) -> dict[str, int] | None:
+        usage = response_data.get("usage")
+        if isinstance(usage, dict):
+            token_usage = cls._normalize_token_usage(
+                usage,
+                input_keys=("input_tokens", "prompt_tokens", "input_token_count"),
+                output_keys=(
+                    "output_tokens",
+                    "completion_tokens",
+                    "output_token_count",
+                ),
+                total_keys=("total_tokens", "total_token_count"),
+            )
+            if token_usage:
+                return token_usage
+
+        usage_metadata = response_data.get("usageMetadata") or response_data.get(
+            "usage_metadata"
+        )
+        if isinstance(usage_metadata, dict):
+            return cls._normalize_token_usage(
+                usage_metadata,
+                input_keys=("promptTokenCount", "prompt_token_count"),
+                output_keys=("candidatesTokenCount", "candidates_token_count"),
+                total_keys=("totalTokenCount", "total_token_count"),
+            )
+        return None
+
+    @classmethod
+    def _normalize_token_usage(
+        cls,
+        usage: dict[str, Any],
+        *,
+        input_keys: tuple[str, ...],
+        output_keys: tuple[str, ...],
+        total_keys: tuple[str, ...],
+    ) -> dict[str, int] | None:
+        input_tokens = cls._first_usage_value(usage, input_keys)
+        output_tokens = cls._first_usage_value(usage, output_keys)
+        total_tokens = cls._first_usage_value(usage, total_keys)
+        if total_tokens == 0 and (input_tokens or output_tokens):
+            total_tokens = input_tokens + output_tokens
+        if not any((input_tokens, output_tokens, total_tokens)):
+            return None
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        }
+
+    @staticmethod
+    def _first_usage_value(usage: dict[str, Any], keys: tuple[str, ...]) -> int:
+        for key in keys:
+            value = usage.get(key)
+            try:
+                token_count = int(value)
+            except (TypeError, ValueError):
+                continue
+            if token_count > 0:
+                return token_count
+        return 0
+
+    def _parse_sse_payload(self, raw_text: str) -> dict[str, Any]:
+        """解析 text/event-stream 响应，提取最后一个包含有效 payload 的 data 包"""
+
+        events: list[dict[str, Any]] = []
+        data_lines: list[str] = []
+
+        def flush_event():
+            """将累计的 data 行拼接并解析为一个事件"""
+            if not data_lines:
+                return
+            data_text = "\n".join(data_lines).strip()
+            data_lines.clear()
+            if not data_text or data_text == "[DONE]":
+                return
+            try:
+                parsed = json.loads(data_text)
+                if isinstance(parsed, dict):
+                    events.append(parsed)
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    "SSE 事件解析失败: %s | 片段: %s",
+                    e,
+                    data_text[:160],
+                )
+
+        for raw_line in raw_text.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                flush_event()
+                continue
+            if stripped.startswith(":"):
+                # SSE 注释行，直接跳过
+                continue
+            if stripped.startswith("data:"):
+                data_lines.append(stripped.removeprefix("data:").lstrip())
+                continue
+
+            # 少数实现会省略前缀，这里尝试兼容
+            if stripped and stripped != "[DONE]":
+                data_lines.append(stripped)
+
+        flush_event()
+
+        if not events:
+            raise ValueError(
+                f"SSE 响应中未找到有效的 data 事件 (收到 {len(raw_text)} 字符, 片段: {raw_text[:160]!r})"
+            )
+
+        # 优先返回含 candidates/choices/data 字段的事件，避免 STOP 包覆盖有效负载
+        for event in reversed(events):
+            if not isinstance(event, dict):
+                continue
+            if event.get("candidates") or event.get("choices") or event.get("data"):
+                logger.debug(
+                    "SSE 响应共解析 %s 个事件，返回含有效负载的末尾事件",
+                    len(events),
+                )
+                return event
+
+        logger.debug("SSE 响应只包含通用事件，返回最后一个 data 包")
+        return events[-1]
+
+    async def _parse_openai_response(
+        self,
+        response_data: dict,
+        session: aiohttp.ClientSession,
+        api_base: str = None,
+        *,
+        request_config: ApiRequestConfig | None = None,
+    ) -> tuple[list[str], list[str], str | None, str | None]:
+        """解析 OpenAI API 响应"""
+
+        image_urls: list[str] = []
+        image_paths: list[str] = []
+        text_content = None
+        thought_signature = None
+        fail_reasons: list[str] = []
+        fallback_texts = self._collect_fallback_texts(response_data)
+        download_proxy = self._request_http_proxy(request_config)
+        has_request_proxy = self._request_has_proxy(request_config)
+
+        message: dict[str, Any] | None = None
+        if "choices" in response_data and response_data["choices"]:
+            choice = response_data["choices"][0]
+            message = choice.get("message", {})
+        else:
+            message = self._coerce_basic_openai_message(response_data)
+
+        if message:
+            if "choices" not in response_data:
+                logger.debug(
+                    "[openai] 使用非标准字段构造 message，keys=%s",
+                    list(response_data.keys())[:5],
+                )
+            content = message.get("content", "")
+
+            text_chunks: list[str] = []
+            image_candidates: list[str] = []
+            extracted_urls: list[str] = []
+
+            logger.debug(
+                "[openai] 解析响应 choices，content_type=%s images_field=%s",
+                type(content),
+                bool(message.get("images")),
+            )
+
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+
+                    part_type = part.get("type")
+                    if part_type == "text" and "text" in part:
+                        text_val = str(part.get("text", ""))
+                        text_chunks.append(text_val)
+                        extracted_urls.extend(self._find_image_urls_in_text(text_val))
+                    elif part_type == "image_url":
+                        image_obj = part.get("image_url") or {}
+                        if isinstance(image_obj, dict):
+                            url_val = image_obj.get("url")
+                            if url_val:
+                                image_candidates.append(url_val)
+            elif isinstance(content, str):
+                text_chunks.append(content)
+                extracted_urls.extend(self._find_image_urls_in_text(content))
+
+            # 标准 images 字段
+            if message.get("images"):
+                for image_item in message["images"]:
+                    if not isinstance(image_item, dict):
+                        continue
+
+                    # 典型格式：{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+                    image_obj = image_item.get("image_url")
+                    if isinstance(image_obj, dict):
+                        url_val = image_obj.get("url")
+                        if isinstance(url_val, str) and url_val:
+                            image_candidates.append(url_val)
+                    elif isinstance(image_obj, str) and image_obj:
+                        image_candidates.append(image_obj)
+                    # 退化格式：{"url": "..."}
+                    elif isinstance(image_item.get("url"), str):
+                        image_candidates.append(image_item["url"])
+
+            # 合并在文本里解析到的图像 URL
+            if extracted_urls:
+                image_candidates.extend(extracted_urls)
+
+            # 组装文本内容
+            if text_chunks:
+                text_content = " ".join([t for t in text_chunks if t]).strip() or None
+
+            # 按顺序处理图像候选
+            for candidate_url in image_candidates:
+                logger.debug("[openai] 处理候选URL: %s", redact_url(str(candidate_url)))
+                if isinstance(candidate_url, str) and candidate_url.startswith(
+                    "data:image/"
+                ):
+                    image_url, image_path = await self._parse_data_uri(candidate_url)
+                elif isinstance(candidate_url, str):
+                    if candidate_url.startswith("/") and not candidate_url.startswith(
+                        "//"
+                    ):
+                        logger.warning(
+                            "发现相对路径 URL，已跳过: %s", redact_url(candidate_url)
+                        )
+                        continue
+                    # 对于可访问的 http(s) 链接，直接返回 URL，避免重复下载占用带宽
+                    if candidate_url.startswith("http://") or candidate_url.startswith(
+                        "https://"
+                    ):
+                        is_temp_cache = (
+                            "/images/users-" in candidate_url
+                            or "/temp/image/" in candidate_url
+                        )
+                        if is_temp_cache or has_request_proxy or self.proxy:
+                            logger.debug(
+                                "[openai] %s，强制下载: %s",
+                                "临时缓存" if is_temp_cache else "代理模式",
+                                redact_url(candidate_url),
+                            )
+                            image_url, image_path = await self._download_image(
+                                candidate_url,
+                                session,
+                                use_cache=False,
+                                proxy=download_proxy,
+                            )
+                            if image_path:
+                                image_paths.append(image_path)
+                            if image_url and not image_path:
+                                image_urls.append(image_url)
+                            continue
+                        # 其他永久 URL 直接使用
+                        image_urls.append(candidate_url)
+                        logger.debug(
+                            "OpenAI 返回可直接访问的图像链接: %s",
+                            redact_url(candidate_url),
+                        )
+                        continue
+                    image_url, image_path = await self._download_image(
+                        candidate_url,
+                        session,
+                        use_cache=False,
+                        proxy=download_proxy,
+                    )
+                else:
+                    logger.warning(f"跳过非字符串类型的图像URL: {type(candidate_url)}")
+                    continue
+
+                if image_url or image_path:
+                    if image_url:
+                        image_urls.append(image_url)
+                    if image_path:
+                        image_paths.append(image_path)
+
+            # content 中查找内联 data URI
+            if not (image_urls or image_paths):
+                extracted_urls2: list[str] = []
+                extracted_paths2: list[str] = []
+
+                if isinstance(content, str):
+                    (
+                        extracted_urls2,
+                        extracted_paths2,
+                    ) = await self._extract_from_content(content)
+                elif text_content:
+                    (
+                        extracted_urls2,
+                        extracted_paths2,
+                    ) = await self._extract_from_content(text_content)
+
+                if extracted_urls2 or extracted_paths2:
+                    image_urls.extend(extracted_urls2)
+                    image_paths.extend(extracted_paths2)
+
+            # 仅在前面没有提取到结构化图片时，才回退扫描文本中的 URL，
+            if text_content and not (image_urls or image_paths):
+                http_urls = self._find_image_urls_in_text(text_content)
+                for url in http_urls:
+                    is_temp_cache = "/images/users-" in url or "/temp/image/" in url
+                    if is_temp_cache:
+                        logger.debug(
+                            "跳过文本中的临时缓存 URL（已下载）: %s", redact_url(url)
+                        )
+                        continue
+                    if has_request_proxy:
+                        _, image_path = await self._download_image(
+                            url,
+                            session,
+                            use_cache=False,
+                            proxy=download_proxy,
+                        )
+                        if image_path and image_path not in image_paths:
+                            image_paths.append(image_path)
+                        continue
+                    if url not in image_urls:
+                        image_urls.append(url)
+
+                # 松散提取 data:image 片段 —— 仅在尚无图片时作为最终回退
+                if not (image_urls or image_paths):
+                    loose_matches = re.finditer(
+                        r"data:image/([a-zA-Z0-9.+-]+);base64,([-A-Za-z0-9+/=_\\s]+)",
+                        text_content,
+                        flags=re.IGNORECASE,
+                    )
+                    for m in loose_matches:
+                        fmt = m.group(1)
+                        b64_raw = m.group(2)
+                        b64_clean = re.sub(r"\\s+", "", b64_raw)
+                        image_path = await save_base64_image(b64_clean, fmt.lower())
+                        if image_path:
+                            image_urls.append(image_path)
+                            image_paths.append(image_path)
+                            logger.debug(
+                                "[openai] 松散提取 data URI 成功: fmt=%s len=%s",
+                                fmt,
+                                len(b64_clean),
+                            )
+
+        else:
+            logger.debug("[openai] 响应缺少可用的 message 字段，尝试 data/b64 解析")
+
+        if not (image_urls or image_paths) and fallback_texts:
+            fallback_added = await self._append_images_from_texts(
+                fallback_texts,
+                image_urls,
+                image_paths,
+                session=session,
+                request_config=request_config,
+            )
+            if fallback_added and not text_content:
+                text_content = (
+                    " ".join(t.strip() for t in fallback_texts if t and t.strip())
+                    or text_content
+                )
+
+        # OpenAI 格式
+        if not image_urls and not image_paths and response_data.get("data"):
+            for image_item in response_data["data"]:
+                if "url" in image_item:
+                    image_url, image_path = await self._download_image(
+                        image_item["url"],
+                        session,
+                        use_cache=False,
+                        proxy=download_proxy,
+                    )
+                    if image_url:
+                        image_urls.append(image_url)
+                    if image_path:
+                        image_paths.append(image_path)
+                elif "b64_json" in image_item:
+                    image_path = await save_base64_image(image_item["b64_json"], "png")
+                    if image_path:
+                        # 直接使用文件路径，不使用 file:// URI（根据 AstrBot 文档要求）
+                        image_urls.append(image_path)
+                        image_paths.append(image_path)
+
+        if image_urls or image_paths:
+            logger.debug(
+                f"🖼️ OpenAI 收集到 {len(image_paths) or len(image_urls)} 张图片"
+            )
+            return image_urls, image_paths, text_content, thought_signature
+
+        if text_content:
+            detail = (
+                f" | 参考图处理提示: {'; '.join(fail_reasons[:3])}"
+                if fail_reasons
+                else ""
+            )
+            logger.debug(
+                "[openai] 仅返回文本，长度=%s 预览=%s",
+                len(text_content),
+                text_content[:200],
+            )
+            logger.warning(f"OpenAI只返回了文本响应，未生成图像，将触发重试{detail}")
+            logger.debug(f"OpenAI响应内容: {str(response_data)[:1000]}")
+            raise APIError(
+                f"图像生成失败：API只返回了文本响应，正在重试... | 响应预览: {str(response_data)[:300]}",
+                500,
+                "no_image_retry",
+            )
+
+        logger.warning(
+            f"OpenAI 响应格式不支持或未找到图像数据，响应: {str(response_data)[:500]}"
+        )
+        return [], [], None, None
+
+    def _normalize_message_value(self, raw_value: Any) -> dict[str, Any] | None:
+        """归一化任意常见字段为标准 message 结构"""
+        if raw_value is None:
+            return None
+
+        if isinstance(raw_value, dict):
+            if raw_value.get("role") and "content" in raw_value:
+                return raw_value
+
+            if "message" in raw_value:
+                nested = self._normalize_message_value(raw_value.get("message"))
+                if nested:
+                    return nested
+
+            for key in ("content", "text", "output", "result", "response"):
+                if key in raw_value:
+                    nested = self._normalize_message_value(raw_value.get(key))
+                    if nested:
+                        return nested
+
+            return None
+
+        if isinstance(raw_value, list):
+            if raw_value:
+                return {"role": "assistant", "content": raw_value}
+            return None
+
+        if isinstance(raw_value, str):
+            cleaned = raw_value.strip()
+            if cleaned:
+                return {"role": "assistant", "content": cleaned}
+            return None
+
+        return None
+
+    def _coerce_basic_openai_message(
+        self, response_data: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """从常见兼容格式提取 message，兼容 body/content/text 等字段"""
+
+        primary_keys = [
+            "message",
+            "content",
+            "text",
+            "output",
+            "result",
+            "response",
+        ]
+        nested_keys = [
+            "body",
+            "modelOutput",
+            "model_output",
+            "response_body",
+        ]
+
+        for key in primary_keys:
+            normalized = self._normalize_message_value(response_data.get(key))
+            if normalized:
+                return normalized
+
+        for key in nested_keys:
+            value = response_data.get(key)
+            if isinstance(value, (dict, list, str)):
+                normalized = self._normalize_message_value(value)
+                if normalized:
+                    return normalized
+
+        return None
+
+    def _collect_fallback_texts(self, payload: dict[str, Any]) -> list[str]:
+        """收集常见字段中的文本响应，用于兜底提取 Markdown 链接"""
+        if not isinstance(payload, dict):
+            return []
+
+        candidate_keys = (
+            "content",
+            "text",
+            "output",
+            "result",
+            "response",
+            "message",
+        )
+        container_keys = (
+            "body",
+            "response_body",
+            "modelOutput",
+            "model_output",
+            "modelOutputs",
+            "model_outputs",
+        )
+
+        texts: list[str] = []
+
+        def push(value: Any):
+            if value is None:
+                return
+            if isinstance(value, str):
+                cleaned = value.strip()
+                if cleaned:
+                    texts.append(cleaned)
+                return
+            if isinstance(value, list):
+                for item in value:
+                    push(item)
+                return
+            if isinstance(value, dict):
+                for key in candidate_keys:
+                    if key in value:
+                        push(value.get(key))
+
+        for key in candidate_keys:
+            push(payload.get(key))
+
+        for key in container_keys:
+            push(payload.get(key))
+
+        # 去重但保持顺序
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for text in texts:
+            if text not in seen:
+                seen.add(text)
+                ordered.append(text)
+        return ordered
+
+    async def _append_images_from_texts(
+        self,
+        texts: list[str],
+        image_urls: list[str],
+        image_paths: list[str],
+        *,
+        session: aiohttp.ClientSession | None = None,
+        request_config: ApiRequestConfig | None = None,
+    ) -> bool:
+        """从额外的文本字段中提取 http(s)/data URI 图像"""
+
+        appended = False
+        download_proxy = self._request_http_proxy(request_config)
+        should_download_http = bool(session and self._request_has_proxy(request_config))
+        for text in texts:
+            if not text:
+                continue
+
+            http_urls = self._find_image_urls_in_text(text)
+            for url in http_urls:
+                if should_download_http:
+                    _, image_path = await self._download_image(
+                        url,
+                        session,
+                        use_cache=False,
+                        proxy=download_proxy,
+                    )
+                    if image_path and image_path not in image_paths:
+                        image_paths.append(image_path)
+                        appended = True
+                    continue
+                if url not in image_urls:
+                    image_urls.append(url)
+                    appended = True
+
+            extra_urls, extra_paths = await self._extract_from_content(text)
+            for url in extra_urls:
+                if url not in image_urls:
+                    image_urls.append(url)
+                    appended = True
+            for path in extra_paths:
+                if path not in image_paths:
+                    image_paths.append(path)
+                    appended = True
+
+        return appended
+
+    async def _parse_data_uri(self, data_uri: str) -> tuple[str | None, str | None]:
+        """解析 data URI 格式的图像"""
+        try:
+            if ";base64," not in data_uri:
+                logger.error("无效的 data URI 格式")
+                return None, None
+
+            header, base64_data = data_uri.split(";base64,", 1)
+            mime_type = header.replace("data:", "")
+            format_type = mime_type.split("/")[1] if "/" in mime_type else "png"
+
+            image_path = await save_base64_image(base64_data, format_type)
+            if image_path:
+                # 直接使用文件路径，不使用 file:// URI（根据 AstrBot 文档要求）
+                image_url = image_path
+                return image_url, image_path
+        except Exception as e:
+            logger.error(f"解析 data URI 失败: {e}")
+
+        return None, None
+
+    async def _extract_from_content(self, content: str) -> tuple[list[str], list[str]]:
+        """从文本内容中提取所有 data URI 图像，保持顺序"""
+        # OpenAI 兼容接口有时会把图片以 Markdown data URI 形式塞进纯文本
+        # 为了更鲁棒，允许大小写混排、包含 -/_，并跨多行匹配
+        pattern = re.compile(
+            r"data\s*:\s*image/([a-zA-Z0-9.+-]+)\s*;\s*base64\s*,\s*([-A-Za-z0-9+/=_\s]+)",
+            flags=re.IGNORECASE,
+        )
+        matches = pattern.findall(content)
+
+        image_urls: list[str] = []
+        image_paths: list[str] = []
+
+        for image_format, base64_string in matches:
+            # 先简单清洗非法字符，避免因意外插入的符号导致解码失败
+            cleaned_b64 = re.sub(r"[^A-Za-z0-9+/=_-]", "", base64_string)
+            image_path = await save_base64_image(
+                cleaned_b64 or base64_string, image_format.lower()
+            )
+            if image_path:
+                # 直接使用文件路径，不使用 file:// URI
+                image_url = image_path
+                image_urls.append(image_url)
+                image_paths.append(image_path)
+
+        return image_urls, image_paths
+
+    def _find_image_urls_in_text(self, text: str) -> list[str]:
+        """从文本/Markdown中提取可用的 http(s) 图片链接"""
+        if not text:
+            return []
+
+        # Markdown 图片语法与裸露的图片链接
+        markdown_pattern = r"!\[[^\]]*\]\((https?://[^)]+)\)"
+        # Markdown 图片语法中的 data URI（如 ![image](data:image/png;base64,...)）
+        markdown_data_uri_pattern = r"!\[[^\]]*\]\((data:image/[^)]+)\)"
+        raw_pattern = (
+            r"(https?://[^\s)]+\.(?:png|jpe?g|gif|webp|bmp|tiff|avif))(?:\b|$)"
+        )
+        spaced_pattern = r"(https?\s*:\s*/\s*/[^\s)]+)"
+
+        urls: list[str] = []
+        seen: set[str] = set()
+
+        def _push(candidate: str):
+            cleaned = candidate.strip().replace("&amp;", "&").rstrip(").,;")
+            cleaned = cleaned.strip("'\"")
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                urls.append(cleaned)
+
+        for pattern in (markdown_pattern, markdown_data_uri_pattern, raw_pattern):
+            for match in re.findall(pattern, text, flags=re.IGNORECASE):
+                _push(match)
+
+        # 适配带空格的 http:// 片段
+        for match in re.findall(spaced_pattern, text, flags=re.IGNORECASE):
+            compact = re.sub(r"\s+", "", match)
+            if compact.lower().startswith(("http://", "https://")):
+                _push(compact)
+
+        return urls
+
+    async def _download_image(
+        self,
+        image_url: str,
+        session: aiohttp.ClientSession,
+        use_cache: bool = False,
+        proxy: str | None | object = _DOWNLOAD_PROXY_DEFAULT,
+    ) -> tuple[str | None, str | None]:
+        """下载并保存图像，可选择是否使用缓存（默认关闭以避免返回旧图）"""
+        cleaned_url = (
+            image_url.replace("&amp;", "&") if isinstance(image_url, str) else image_url
+        )
+        parsed = urllib.parse.urlparse(cleaned_url)
+        is_http = parsed.scheme in {"http", "https"}
+        cache_key = None
+
+        # 针对 CQ 码图服务器增加专用请求头
+        headers: dict[str, str] = {}
+        if is_http:
+            headers.update(
+                {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+                    ),
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                    "Connection": "keep-alive",
+                }
+            )
+            if "gchat.qpic.cn" in (parsed.netloc or ""):
+                headers["Referer"] = "https://qun.qq.com"
+            elif parsed.scheme and parsed.netloc:
+                headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}"
+
+        # 缓存命中直接返回，减少重复下载与内存占用
+        if cache_key:
+            try:
+                REFERENCE_IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                cached = next(REFERENCE_IMAGE_CACHE_DIR.glob(f"{cache_key}.*"), None)
+                if cached and cached.exists() and cached.stat().st_size > 0:
+                    logger.debug("图像下载命中缓存: %s", redact_url(cleaned_url))
+                    return str(cached), str(cached)
+            except Exception as e:
+                logger.debug("检查图像缓存失败: %s", redact_text(str(e))[:240])
+
+        max_retries = 1
+        retry_interval = 1.0
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.debug(
+                    "正在下载图像: %s 尝试 %s/%s",
+                    redact_url(cleaned_url),
+                    attempt,
+                    max_retries,
+                )
+
+                request_proxy = (
+                    self._http_proxy if proxy is _DOWNLOAD_PROXY_DEFAULT else proxy
+                )
+
+                async with session.get(
+                    cleaned_url,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    proxy=request_proxy,
+                    headers=headers or None,
+                ) as response:
+                    if response.status != 200:
+                        try:
+                            err_text = await response.text()
+                        except Exception:
+                            err_text = ""
+
+                        response_reason = response.reason or ""
+                        response_content_type = response.headers.get("Content-Type", "")
+                        query_params = urllib.parse.parse_qs(parsed.query)
+                        param_issues: list[str] = []
+
+                        # 仅在出现 400 错误时进行参数合法性检查
+                        if response.status == 400:
+                            appid = (query_params.get("appid") or [None])[0]
+                            if appid and not re.fullmatch(r"[A-Za-z0-9]+", appid):
+                                param_issues.append("appid 格式异常（仅允许字母数字）")
+
+                            fileid = (query_params.get("fileid") or [None])[0]
+                            if fileid and not re.fullmatch(r"[A-Za-z0-9._-]+", fileid):
+                                param_issues.append(
+                                    "fileid 格式异常（仅允许字母数字、.、_、-）"
+                                )
+
+                            rkey = (query_params.get("rkey") or [None])[0]
+                            if rkey and re.search(r"[^A-Za-z0-9._-]", rkey):
+                                param_issues.append("rkey 包含特殊字符")
+
+                            spec = (query_params.get("spec") or [None])[0]
+                            if spec and not str(spec).isdigit():
+                                param_issues.append("spec 参数应为数字")
+
+                        # 根据响应内容与校验结果给出建议
+                        suggestions: list[str] = []
+                        if " " in cleaned_url or "%20" in cleaned_url:
+                            suggestions.append("URL格式错误 → 检查URL编码")
+                        if param_issues:
+                            suggestions.append("参数错误 → 检查参数格式")
+                        err_lower = err_text.lower() if err_text else ""
+                        if any(keyword in err_lower for keyword in ["auth", "key"]):
+                            suggestions.append("认证错误 → 检查API密钥")
+                        if any(
+                            keyword in err_lower
+                            for keyword in ["limit", "频率", "限制"]
+                        ):
+                            suggestions.append("服务器限制 → 建议稍后重试")
+                        if not suggestions:
+                            suggestions.append("服务器限制 → 建议稍后重试")
+
+                        logger.error(
+                            "下载图像失败: HTTP %s %s url=%s 响应摘要=%s 建议=%s",
+                            response.status,
+                            response_reason,
+                            redact_url(cleaned_url),
+                            redact_text(err_text[:200])[:200],
+                            "；".join(dict.fromkeys(suggestions)),
+                        )
+
+                        logger.debug(
+                            "HTTP 400 参数检查结果: %s",
+                            "; ".join(param_issues)
+                            if param_issues
+                            else "未发现明显异常",
+                        )
+                        logger.debug("完整请求头: %s", headers or {})
+                        logger.debug(
+                            "User-Agent: %s", (headers or {}).get("User-Agent", "")
+                        )
+                        logger.debug(
+                            "Content-Type: %s, Accept: %s",
+                            (headers or {}).get("Content-Type", "未设置"),
+                            (headers or {}).get("Accept", "未设置"),
+                        )
+                        logger.debug(
+                            "服务器响应详情: status=%s, reason=%s, phrase=%s, content-type=%s",
+                            response.status,
+                            response_reason,
+                            getattr(response, "reason", ""),
+                            response_content_type,
+                        )
+                        logger.debug(
+                            "服务器响应体预览: %s",
+                            redact_text(err_text)[:1000] if err_text else "<empty>",
+                        )
+
+                        if response.status == 400 and attempt < max_retries:
+                            await asyncio.sleep(retry_interval * attempt)
+                            continue
+                        return None, None
+
+                    content_type = response.headers.get("Content-Type", "")
+
+                    if "/" in content_type:
+                        image_format = content_type.split("/")[1].split(";")[0] or "png"
+                    else:
+                        image_format = "png"
+
+                    target_path = None
+                    if cache_key:
+                        target_path = (
+                            REFERENCE_IMAGE_CACHE_DIR / f"{cache_key}.{image_format}"
+                        )
+
+                    image_path = await save_image_stream(
+                        response.content, image_format, target_path=target_path
+                    )
+                    if image_path:
+                        # 直接使用文件路径，不使用 file:// URI（根据 AstrBot 文档要求）
+                        image_url_local = image_path
+                        return image_url_local, image_path
+            except aiohttp.ClientError as e:
+                logger.error("下载图像发生网络异常: %s", redact_text(str(e))[:240])
+            except Exception as e:
+                logger.error("下载图像失败: %s", redact_text(str(e))[:240])
+
+            if attempt < max_retries:
+                await asyncio.sleep(retry_interval * attempt)
+
+        return None, None
+
+
+# 为了兼容性，创建APIClient别名
+APIClient = GeminiAPIClient
+
+# 全局 API 客户端实例
+_api_client: GeminiAPIClient | None = None
+
+
+def get_api_client(api_keys: list[str]) -> GeminiAPIClient:
+    """获取或创建 API 客户端实例"""
+    global _api_client
+    if _api_client is None:
+        _api_client = GeminiAPIClient(api_keys)
+    return _api_client
+
+
+def clear_api_client():
+    """清除全局 API 客户端实例"""
+    global _api_client
+    _api_client = None

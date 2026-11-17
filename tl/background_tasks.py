@@ -1,0 +1,246 @@
+"""Persistent background task records for LLM image generation."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+import os
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from astrbot.api import logger
+
+from .core.errors import redact_text
+
+TERMINAL_STATUSES = {
+    "succeeded",
+    "partial_success",
+    "failed",
+    "interrupted",
+}
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _timestamp(value: datetime | None = None) -> str:
+    return (value or _now()).isoformat()
+
+
+class BackgroundTaskManager:
+    """Keep session-scoped task metadata across plugin reloads."""
+
+    def __init__(self, data_dir: str | Path, retention_hours: int = 24):
+        self.data_dir = Path(data_dir)
+        self.path = self.data_dir / "background_tasks.json"
+        self.retention_hours = max(int(retention_hours), 1)
+        self._lock = asyncio.Lock()
+        self._records: dict[str, dict[str, Any]] = self._load_records()
+        changed = self._mark_stale_tasks_interrupted()
+        changed = self._prune_expired() or changed
+        if changed:
+            self._save_sync()
+
+    def _load_records(self) -> dict[str, dict[str, Any]]:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            logger.warning(
+                f"[后台任务] 读取任务记录失败，将使用空记录: {redact_text(str(exc))[:240]}"
+            )
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        records = raw.get("tasks", raw)
+        return records if isinstance(records, dict) else {}
+
+    def _save_sync(self) -> None:
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = self.path.with_suffix(".json.tmp")
+        payload = json.dumps(
+            {"version": 1, "tasks": self._records},
+            ensure_ascii=False,
+            indent=2,
+        )
+        temp_path.write_text(payload, encoding="utf-8")
+        os.replace(temp_path, self.path)
+
+    async def _save(self) -> None:
+        await asyncio.to_thread(self._save_sync)
+
+    def _mark_stale_tasks_interrupted(self) -> bool:
+        changed = False
+        now_text = _timestamp()
+        for record in self._records.values():
+            if record.get("callback_status") in {"pending", "running"}:
+                record["callback_status"] = "interrupted"
+                changed = True
+            if record.get("status") in {"queued", "running"}:
+                record["status"] = "interrupted"
+                record["updated_at"] = now_text
+                record["message"] = "插件重启，后台任务已中断"
+                changed = True
+        return changed
+
+    def _prune_expired(self) -> bool:
+        cutoff = _now() - timedelta(hours=self.retention_hours)
+        expired: list[str] = []
+        for task_id, record in self._records.items():
+            if record.get("status") in {"queued", "running"}:
+                continue
+            value = record.get("updated_at") or record.get("created_at")
+            try:
+                updated_at = datetime.fromisoformat(str(value))
+                if updated_at.tzinfo is None:
+                    updated_at = updated_at.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                expired.append(task_id)
+                continue
+            if updated_at < cutoff:
+                expired.append(task_id)
+        for task_id in expired:
+            self._records.pop(task_id, None)
+        return bool(expired)
+
+    async def create(
+        self,
+        *,
+        session_id: str,
+        kind: str,
+        routing_mode: str,
+        message: str,
+        total_items: int = 1,
+        plugin_id: str | None = None,
+    ) -> dict[str, Any]:
+        async with self._lock:
+            self._prune_expired()
+            task_id = f"img-{uuid.uuid4().hex[:12]}"
+            now_text = _timestamp()
+            record = {
+                "task_id": task_id,
+                "session_id": str(session_id or "unknown"),
+                "kind": kind,
+                "status": "running",
+                "routing_mode": routing_mode,
+                "message": message,
+                "created_at": now_text,
+                "updated_at": now_text,
+                "total_items": max(int(total_items), 1),
+                "completed_items": 0,
+                "succeeded_items": 0,
+                "failed_items": 0,
+                "current_item": None,
+                "items": [],
+                "delivered_count": 0,
+            }
+            if plugin_id is not None:
+                record["plugin_id"] = plugin_id
+            self._records[task_id] = record
+            await self._save()
+            logger.debug(
+                f"[后台任务] 创建记录: task_id={task_id}, job_id={record.get('job_id')}, "
+                f"kind={kind}, status={record.get('status')}, umo={record.get('session_id')}"
+            )
+            return copy.deepcopy(record)
+
+    async def record_delivery(self, task_id: str) -> dict[str, Any] | None:
+        """累加一次成功交付计数，仅作查询信息，不拦截任何发送。"""
+        async with self._lock:
+            record = self._records.get(task_id)
+            if record is None:
+                return None
+            try:
+                count = int(record.get("delivered_count") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            record["delivered_count"] = max(count, 0) + 1
+            record["updated_at"] = _timestamp()
+            await self._save()
+            return copy.deepcopy(record)
+
+    async def update(
+        self, task_id: str, *, best_effort: bool = False, **changes: Any
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            record = self._records.get(task_id)
+            if record is None:
+                return None
+            record.update(changes)
+            record["updated_at"] = _timestamp()
+            try:
+                await self._save()
+            except Exception as exc:
+                if not best_effort:
+                    raise
+                logger.error(
+                    f"[后台任务] {task_id} 持久化失败，保留内存中的任务结果: {redact_text(exc)[:240]}",
+                    exc_info=True,
+                )
+            if record.get("status") in TERMINAL_STATUSES:
+                logger.debug(
+                    f"[后台任务] 终态切换: task_id={task_id}, job_id={record.get('job_id')}, "
+                    f"kind={record.get('kind')}, status={record.get('status')}, umo={record.get('session_id')}"
+                )
+            return copy.deepcopy(record)
+
+    async def get(self, task_id: str, session_id: str) -> dict[str, Any] | None:
+        async with self._lock:
+            changed = self._prune_expired()
+            if changed:
+                await self._save()
+            record = self._records.get(str(task_id or "").strip())
+            if record is None:
+                return None
+            if record.get("plugin_id") or record.get("session_id") != str(
+                session_id or "unknown"
+            ):
+                raise PermissionError("任务不存在或不属于当前会话")
+            return copy.deepcopy(record)
+
+    async def snapshot_records(self) -> list[dict[str, Any]]:
+        """Internal admin projection; callers must enforce dashboard authorization."""
+        async with self._lock:
+            fields=('task_id','job_id','status','callback_status','delivered_count')
+            return [{key:record.get(key) for key in fields} for record in self._records.values()]
+
+    async def get_for_plugin(
+        self, task_id: str, plugin_id: str
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            if self._prune_expired():
+                await self._save()
+            record = self._records.get(task_id)
+            if record is None:
+                return None
+            if record.get("plugin_id") != plugin_id:
+                raise PermissionError("任务不属于当前插件")
+            return copy.deepcopy(record)
+
+    async def list_for_session(
+        self, session_id: str, limit: int
+    ) -> list[dict[str, Any]]:
+        """按会话返回最近的任务副本，不包含其他会话或插件任务。"""
+
+        async with self._lock:
+            if self._prune_expired():
+                await self._save()
+            session = str(session_id or "unknown")
+            rows = [
+                record
+                for record in self._records.values()
+                if not record.get("plugin_id") and record.get("session_id") == session
+            ]
+            rows.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+            size = max(int(limit), 0)
+            return [copy.deepcopy(record) for record in rows[:size]]
+
+    async def close(self) -> None:
+        async with self._lock:
+            self._mark_stale_tasks_interrupted()
+            await self._save()

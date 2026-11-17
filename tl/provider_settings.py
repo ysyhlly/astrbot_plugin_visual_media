@@ -1,0 +1,144 @@
+"""Shared helpers for reading provider candidate settings."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from typing import Any
+
+from .api_normalize import normalize_api_type
+from .provider_loader import load_callable
+from .provider_metadata import get_provider_spec
+
+
+def candidate_with_overrides(candidate: Any, overrides: dict[str, Any]) -> Any:
+    """构造单次请求候选，保留原候选配置和其它并发任务的默认值。"""
+    if not overrides:
+        return candidate
+    settings = {**candidate.settings, **overrides}
+    changes = {"settings": settings}
+    spec = get_provider_spec(candidate.api_type)
+    if spec and spec.edit_capability_path and hasattr(candidate, "supports_image_edit"):
+        changes["supports_image_edit"] = bool(
+            load_callable(spec.edit_capability_path)(settings)
+        )
+    return replace(candidate, **changes)
+
+
+def candidate_is_keyless(api_type: Any, settings: dict[str, Any] | None) -> bool:
+    """候选是否以非 API Key 凭证（如服务账号文件/粘贴内容）运行，无需轮换 Key。"""
+    spec = get_provider_spec(api_type)
+    if spec is None or spec.requires_api_keys:
+        return False
+    files = (settings or {}).get("service_account_files")
+    if isinstance(files, list) and any(str(item).strip() for item in files):
+        return True
+    return bool(str((settings or {}).get("service_account_json") or "").strip())
+
+
+def _cfg(obj: Any) -> Any:
+    return getattr(obj, "cfg", obj)
+
+
+def first_provider_candidate(config: Any, api_type: str | None = None) -> Any | None:
+    """Return the first configured candidate, optionally constrained by api_type."""
+    cfg = _cfg(config)
+    target = normalize_api_type(api_type) if api_type else ""
+    for candidate in getattr(cfg, "provider_candidates", []) or []:
+        candidate_type = normalize_api_type(getattr(candidate, "api_type", ""))
+        if not target or candidate_type == target:
+            return candidate
+    return None
+
+
+def first_provider_settings(config: Any, api_type: str) -> dict[str, Any]:
+    """Return first settings for a provider without hard-coding legacy fields."""
+    cfg = _cfg(config)
+    target = normalize_api_type(api_type)
+
+    candidate = first_provider_candidate(cfg, target)
+    if candidate is not None:
+        settings = getattr(candidate, "settings", None)
+        return settings if isinstance(settings, dict) else {}
+
+    settings_by_type = getattr(cfg, "provider_settings_by_type", None) or {}
+    values = settings_by_type.get(target) or []
+    if values:
+        settings = values[0]
+        return settings if isinstance(settings, dict) else {}
+
+    spec = get_provider_spec(target)
+    if spec and spec.settings_attr:
+        settings = getattr(cfg, spec.settings_attr, None)
+        if isinstance(settings, dict) and settings:
+            return settings
+
+    overrides = getattr(cfg, "provider_overrides", None) or {}
+    if isinstance(overrides, dict):
+        for key, settings in overrides.items():
+            key_type = normalize_api_type(str(key).split("#", 1)[0])
+            if key_type == target and isinstance(settings, dict):
+                return settings
+
+    return {}
+
+
+def provider_tool_profile(config: Any, api_type: str) -> dict[str, Any]:
+    """Return tool behavior profile for the active first provider candidate."""
+    target = normalize_api_type(api_type)
+    candidate = first_provider_candidate(config, target)
+    if candidate is None:
+        return {"active": False, "settings": {}}
+
+    settings = getattr(candidate, "settings", None)
+    if not isinstance(settings, dict):
+        settings = first_provider_settings(config, target)
+
+    spec = get_provider_spec(target)
+    if spec and spec.tool_profile_path:
+        profile = load_callable(spec.tool_profile_path)(config, settings)
+        if isinstance(profile, dict):
+            profile.setdefault("active", True)
+            profile.setdefault("settings", settings)
+            return profile
+
+    return {"active": True, "settings": settings}
+
+
+def candidate_tool_profile(config: Any, candidate: Any) -> dict[str, Any]:
+    """Return tool behavior for one concrete configured candidate."""
+    if candidate is None:
+        return {"active": False, "settings": {}}
+    api_type = normalize_api_type(getattr(candidate, "api_type", ""))
+    settings = getattr(candidate, "settings", None)
+    if not isinstance(settings, dict):
+        settings = first_provider_settings(config, api_type)
+    spec = get_provider_spec(api_type)
+    if spec and spec.tool_profile_path:
+        profile = load_callable(spec.tool_profile_path)(config, settings)
+        if isinstance(profile, dict):
+            profile.setdefault("active", True)
+            profile.setdefault("settings", settings)
+            return profile
+    return {"active": True, "settings": settings}
+
+
+def first_provider_tool_profile(config: Any) -> dict[str, Any]:
+    """Return tool profile for the active first provider candidate."""
+    candidate = first_provider_candidate(config)
+    if candidate is None:
+        return {"active": False, "settings": {}}
+
+    api_type = normalize_api_type(getattr(candidate, "api_type", ""))
+    settings = getattr(candidate, "settings", None)
+    if not isinstance(settings, dict):
+        settings = first_provider_settings(config, api_type)
+
+    spec = get_provider_spec(api_type)
+    if spec and spec.tool_profile_path:
+        profile = load_callable(spec.tool_profile_path)(config, settings)
+        if isinstance(profile, dict):
+            profile.setdefault("active", True)
+            profile.setdefault("settings", settings)
+            return profile
+
+    return {"active": False, "settings": settings}

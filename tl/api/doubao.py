@@ -1,0 +1,721 @@
+"""Doubao (Volcengine Ark Seedream) image generation provider."""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+import aiohttp
+from astrbot.api import logger
+
+from ..api_types import APIError, ApiRequestConfig
+from ..core.errors import redact_text, redact_url
+from ..plugin_config import DOUBAO_SEQUENTIAL_IMAGES_MAX, DOUBAO_SEQUENTIAL_IMAGES_MIN
+from ..provider_hooks import (
+    DOUBAO_OUTPUT_FORMATS,
+    is_doubao_seedream_5_pro,
+    normalize_doubao_endpoint_mode,
+    normalize_doubao_output_format,
+)
+from ..tl_utils import save_base64_image
+from .base import ProviderRequest
+from .provider_limits import (
+    MAX_REFERENCE_IMAGES_DOUBAO,
+    MAX_REFERENCE_IMAGES_DOUBAO_SEEDREAM_5_PRO,
+)
+from .reference_intake import announce_reference_intake
+from .reference_pipeline import reference_data_uri
+
+# 豆包 API 错误码分类
+# 参考文档: https://www.volcengine.com/docs/82379/1299023
+
+# 不可重试的错误码（需要用户修改输入或配置）
+NON_RETRYABLE_ERRORS = {
+    # 参数错误
+    "MissingParameter",
+    "InvalidParameter",
+    "InvalidEndpoint.ClosedEndpoint",
+    # 敏感内容检测
+    "InputTextRiskDetection",
+    "InputImageRiskDetection",
+    "OutputTextRiskDetection",
+    "OutputImageRiskDetection",
+    "SensitiveContentDetected",
+    "SensitiveContentDetected.SevereViolation",
+    "SensitiveContentDetected.Violence",
+    "InputTextSensitiveContentDetected",
+    "InputImageSensitiveContentDetected",
+    "InputVideoSensitiveContentDetected",
+    "OutputTextSensitiveContentDetected",
+    "OutputImageSensitiveContentDetected",
+    "OutputVideoSensitiveContentDetected",
+    # 图片格式错误
+    "InvalidImageURL.EmptyURL",
+    "InvalidImageURL.InvalidFormat",
+    "InvalidArgumentError.InvalidImageDetail",
+    "InvalidArgumentError.InvalidPixelLimit",
+    # 认证/权限错误
+    "AuthenticationError",
+    "InvalidAccountStatus",
+    "AccessDenied",
+    "OperationDenied.PermissionDenied",
+    "OperationDenied.ServiceNotOpen",
+    "OperationDenied.ServiceOverdue",
+    "AccountOverdueError",
+    # 资源不存在
+    "InvalidEndpointOrModel.NotFound",
+    "ModelNotOpen",
+    "InvalidEndpointOrModel.ModelIDAccessDisabled",
+    # 订阅问题
+    "InvalidSubscription",
+    "UnsupportedModel",
+}
+
+# 可重试的错误码（临时性错误，可稍后重试）
+RETRYABLE_ERRORS = {
+    # 速率限制
+    "RateLimitExceeded.EndpointRPMExceeded",
+    "RateLimitExceeded.EndpointTPMExceeded",
+    "ModelAccountRpmRateLimitExceeded",
+    "ModelAccountTpmRateLimitExceeded",
+    "APIAccountRpmRateLimitExceeded",
+    "ModelAccountIpmRateLimitExceeded",
+    "AccountRateLimitExceeded",
+    "InflightBatchsizeExceeded",
+    # 配额超限（部分可重试）
+    "QuotaExceeded",
+    "SetLimitExceeded",
+    # 服务端错误
+    "ServerOverloaded",
+    "InternalServiceError",
+    "ContentSecurityDetectionError",
+}
+
+# 错误码到用户友好消息的映射
+ERROR_MESSAGES = {
+    # 参数错误
+    "MissingParameter": "请求缺少必要参数，请检查配置。",
+    "InvalidParameter": "请求参数无效，请检查配置。",
+    "InvalidEndpoint.ClosedEndpoint": "推理接入点已关闭或暂时不可用，请稍后重试。",
+    # 敏感内容
+    "InputTextRiskDetection": "输入文本可能包含敏感信息，请修改后重试。",
+    "InputImageRiskDetection": "输入图片可能包含敏感信息，请更换后重试。",
+    "OutputTextRiskDetection": "生成的文字可能包含敏感信息，请修改输入后重试。",
+    "OutputImageRiskDetection": "生成的图片可能包含敏感信息，请修改输入后重试。",
+    "SensitiveContentDetected": "输入内容可能包含敏感信息，请使用其他提示词。",
+    "SensitiveContentDetected.SevereViolation": "输入内容可能包含严重违规信息，请使用其他提示词。",
+    "SensitiveContentDetected.Violence": "输入内容可能包含激进行为相关信息，请使用其他提示词。",
+    "InputTextSensitiveContentDetected": "输入文本可能包含敏感信息，请修改后重试。",
+    "InputImageSensitiveContentDetected": "输入图像可能包含敏感信息，请更换后重试。",
+    "OutputTextSensitiveContentDetected": "生成的文字可能包含敏感信息，请修改输入后重试。",
+    "OutputImageSensitiveContentDetected": "生成的图像可能包含敏感信息，请修改输入后重试。",
+    # 图片格式
+    "InvalidImageURL.EmptyURL": "图片 URL 为空，请提供有效的图片。",
+    "InvalidImageURL.InvalidFormat": "图片格式无效或数据损坏，请更换图片。",
+    # 认证/权限
+    "AuthenticationError": "API 密钥无效，请检查配置。",
+    "InvalidAccountStatus": "账号状态异常，请联系管理员。",
+    "AccessDenied": "没有访问权限，请检查权限设置。",
+    "AccountOverdueError": "账号已欠费，请前往火山引擎费用中心充值。",
+    "OperationDenied.ServiceNotOpen": "模型服务未开通，请前往火山方舟控制台开通。",
+    "OperationDenied.ServiceOverdue": "账单已逾期，请前往火山费用中心充值。",
+    # 资源不存在
+    "InvalidEndpointOrModel.NotFound": "模型或推理接入点不存在，请检查配置。",
+    "ModelNotOpen": "模型服务未开通，请前往火山方舟控制台开通。",
+    # 速率限制
+    "RateLimitExceeded.EndpointRPMExceeded": "请求频率超限 (RPM)，请稍后重试。",
+    "RateLimitExceeded.EndpointTPMExceeded": "Token 用量超限 (TPM)，请稍后重试。",
+    "ModelAccountRpmRateLimitExceeded": "账户模型 RPM 限制已超出，请稍后重试。",
+    "ModelAccountTpmRateLimitExceeded": "账户模型 TPM 限制已超出，请稍后重试。",
+    "ModelAccountIpmRateLimitExceeded": "账户模型 IPM 限制已超出，请稍后重试。",
+    "AccountRateLimitExceeded": "请求频率过高，请降低请求频率后重试。",
+    "ServerOverloaded": "服务资源紧张，请稍后重试。",
+    "QuotaExceeded": "配额已用尽，请稍后重试或联系管理员。",
+    "InternalServiceError": "服务内部错误，请稍后重试。",
+}
+
+
+class DoubaoProvider:
+    name = "doubao"
+
+    # Ark 基础地址与图片生成端点路径
+    ARK_API_BASE = "https://ark.cn-beijing.volces.com"
+    _ENDPOINT_PATHS = {
+        "official": "/api/v3/images/generations",
+        "agent_plan": "/api/plan/v3/images/generations",
+    }
+
+    async def build_request(
+        self,
+        *,
+        client: Any,
+        config: ApiRequestConfig,
+        is_retry: bool = False,
+    ) -> ProviderRequest:  # noqa: ANN401
+        doubao_settings = (
+            getattr(config, "provider_settings", None)
+            or getattr(client, "doubao_settings", None)
+            or {}
+        )
+
+        endpoint_mode = normalize_doubao_endpoint_mode(
+            doubao_settings.get("endpoint_mode")
+        )
+        api_base = self._resolve_api_base(doubao_settings, config)
+        url = f"{api_base}{self._ENDPOINT_PATHS[endpoint_mode]}"
+        # Determine API key: from api_keys list (multi-key rotation) or legacy api_key
+        api_keys = doubao_settings.get("api_keys") or []
+        if not api_keys:
+            legacy_key = doubao_settings.get("api_key")
+            if legacy_key:
+                api_keys = [legacy_key]
+        # Use config.api_key which should already be rotated by the client
+        api_key = config.api_key or (api_keys[0] if api_keys else "")
+
+        # 检查 API key 是否配置
+        if not api_key:
+            raise APIError(
+                "豆包 API 密钥未配置，请在插件设置里面配置至少一个密钥。",
+                None,
+                "ConfigurationError",
+                "MissingApiKey",
+                retryable=False,
+            )
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload = await self._prepare_payload(
+            client=client,
+            config=config,
+            doubao_settings=doubao_settings,
+            is_retry=is_retry,
+        )
+
+        logger.debug(
+            "[doubao] build_request: url=%s model=%s size=%s has_image=%s is_retry=%s payload=%s",
+            url,
+            payload.get("model"),
+            payload.get("size"),
+            bool(payload.get("image")),
+            is_retry,
+            {k: v for k, v in payload.items() if k != "image"},
+        )
+        return ProviderRequest(url=url, headers=headers, payload=payload)
+
+    @classmethod
+    def _resolve_api_base(
+        cls, settings: dict[str, Any], config: ApiRequestConfig
+    ) -> str:
+        """Normalize a configured base so the selected path is appended once."""
+        explicit_base = str(settings.get("api_base") or config.api_base or "").strip()
+        api_base = (explicit_base or cls.ARK_API_BASE).rstrip("/")
+
+        # 兼容用户曾填写的完整官方/Plan Base URL，避免切换模式后重复拼接路径。
+        for suffix in (
+            "/api/plan/v3/images/generations",
+            "/api/v3/images/generations",
+            "/api/plan/v3",
+            "/api/v3",
+        ):
+            if api_base.endswith(suffix):
+                api_base = api_base[: -len(suffix)].rstrip("/")
+                break
+
+        return api_base or cls.ARK_API_BASE
+
+    async def _prepare_payload(
+        self,
+        *,
+        client: Any,
+        config: ApiRequestConfig,
+        doubao_settings: dict[str, Any] | None = None,
+        is_retry: bool = False,
+    ) -> dict[str, Any]:  # noqa: ANN401
+        if doubao_settings is None:
+            doubao_settings = (
+                getattr(config, "provider_settings", None)
+                or getattr(client, "doubao_settings", None)
+                or {}
+            )
+
+        logger.debug(
+            "[doubao] _prepare_payload: doubao_settings keys=%s size=%s size_mode=%s",
+            list(doubao_settings.keys()) if doubao_settings else [],
+            doubao_settings.get("size") or doubao_settings.get("default_size"),
+            doubao_settings.get("size_mode"),
+        )
+
+        # Model: doubao_settings.endpoint_id > config.model > default
+        model = (
+            doubao_settings.get("endpoint_id")
+            or config.model
+            or "doubao-seedream-5-0-260128"
+        )
+        is_seedream_5_pro = is_doubao_seedream_5_pro(model, doubao_settings)
+
+        # Response format: url by default, fallback to b64_json on retry
+        response_format = "b64_json" if is_retry else "url"
+
+        # Watermark: default to false per plugin docs (schema default is false)
+        watermark = doubao_settings.get("watermark")
+        if watermark is None:
+            watermark = False  # Plugin default is false
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "prompt": config.prompt,
+            "response_format": response_format,
+            "output_format": normalize_doubao_output_format(
+                doubao_settings.get("output_format")
+            ),
+            "watermark": bool(watermark),
+        }
+
+        size = self._resolve_size(doubao_settings, config)
+        if size:
+            payload["size"] = size
+
+        # Process reference images (10 for Seedream 5.0 Pro, 14 otherwise)
+        if config.reference_images:
+            image_value = await self._process_reference_images(
+                client=client,
+                config=config,
+                image_inputs=config.reference_images,
+                model=model,
+                settings=doubao_settings,
+            )
+            if image_value:
+                payload["image"] = image_value
+
+        # Prompt optimization mode
+        optimize_mode = doubao_settings.get("optimize_prompt_mode")
+        if optimize_mode in ("standard", "fast"):
+            payload["optimize_prompt_options"] = {"mode": optimize_mode}
+
+        # Seedream 5.0 Pro 不支持组图，不能发送 sequential 字段。
+        seq_mode = doubao_settings.get("sequential_image_generation")
+        if seq_mode == "auto" and not is_seedream_5_pro:
+            payload["sequential_image_generation"] = "auto"
+            max_images = doubao_settings.get("sequential_max_images")
+            if (
+                max_images
+                and isinstance(max_images, int)
+                and DOUBAO_SEQUENTIAL_IMAGES_MIN
+                <= max_images
+                <= DOUBAO_SEQUENTIAL_IMAGES_MAX
+            ):
+                payload["sequential_image_generation_options"] = {
+                    "max_images": max_images
+                }
+        elif seq_mode == "auto":
+            logger.debug(
+                "[doubao] Seedream 5.0 Pro 不支持组图，已忽略 sequential_image_generation"
+            )
+
+        return payload
+
+    def _resolve_size(
+        self, doubao_settings: dict[str, Any], config: ApiRequestConfig
+    ) -> str:
+        """Resolve plugin settings into Doubao's official `size` request field."""
+        size_mode = str(doubao_settings.get("size_mode") or "preset").strip().lower()
+        if size_mode == "custom":
+            custom_size = doubao_settings.get("custom_size")
+            if custom_size:
+                return self._map_resolution(custom_size) or str(custom_size)
+
+        configured_size = doubao_settings.get("size") or doubao_settings.get(
+            "default_size"
+        )
+        if configured_size:
+            return self._map_resolution(configured_size) or str(configured_size)
+        if config.resolution:
+            return self._map_resolution(config.resolution) or str(config.resolution)
+        return "2K"
+
+    @staticmethod
+    def _map_resolution(resolution: str | None) -> str | None:
+        """Map plugin resolution to Doubao `size`.
+
+        Supported by Doubao:
+        - doubao-seedream-5.0-pro: "2K"/"3K"/"4K" or WxH
+        - doubao-seedream-5.0-lite: "2K"/"3K"/"4K" or WxH
+        - doubao-seedream-4.5: "2K"/"4K" only (min 2560x1440=3686400 px)
+        - doubao-seedream-4.0: "1K"/"2K"/"4K" (min 1280x720=921600 px)
+        """
+        if not resolution:
+            return None
+
+        raw = str(resolution).strip()
+        if not raw:
+            return None
+
+        normalized = raw.lower().replace(" ", "").replace("×", "x")
+
+        # WxH format - pass through
+        if re.match(r"^\d{3,5}x\d{3,5}$", normalized):
+            return normalized
+
+        if normalized in {"1k", "1024"}:
+            return "1K"
+        if normalized in {"2k", "2048"}:
+            return "2K"
+        if normalized in {"3k", "3072"}:
+            return "3K"
+        if normalized in {"4k", "4096"}:
+            return "4K"
+
+        # Unknown, default to 2K
+        return "2K"
+
+    async def _process_reference_images(
+        self,
+        *,
+        client: Any,
+        config: ApiRequestConfig,
+        image_inputs: list[Any],
+        model: str | None = None,
+        settings: dict[str, Any] | None = None,
+    ) -> str | list[str] | None:  # noqa: ANN401
+        """Prepare Doubao `image` field for i2i.
+
+        Doubao supports:
+        - Multiple images (2-10 for Seedream 5.0 Pro, 2-14 otherwise)
+
+        Returns:
+        - Single string if only one image
+        - List of strings if multiple images
+        - None if no valid images
+        """
+        if not image_inputs:
+            return None
+        request_settings = settings
+        if not isinstance(request_settings, dict):
+            request_settings = getattr(config, "provider_settings", None)
+        if not isinstance(request_settings, dict):
+            request_settings = {}
+        request_model = (
+            model
+            or request_settings.get("endpoint_id")
+            or getattr(config, "model", None)
+            or ""
+        )
+        max_reference_images = (
+            MAX_REFERENCE_IMAGES_DOUBAO_SEEDREAM_5_PRO
+            if is_doubao_seedream_5_pro(request_model, request_settings)
+            else MAX_REFERENCE_IMAGES_DOUBAO
+        )
+
+        force_b64 = (
+            str(getattr(config, "image_input_mode", "auto")).lower() == "force_base64"
+        )
+
+        processed_images: list[str] = []
+
+        announce_reference_intake(
+            image_inputs,
+            max_reference_images,
+            log_prefix="[doubao] ",
+        )
+
+        for image_input in image_inputs[:max_reference_images]:
+            image_str = str(image_input).strip()
+            if not image_str:
+                continue
+
+            result = await self._process_single_image(
+                client=client,
+                config=config,
+                image_str=image_str,
+                force_b64=force_b64,
+            )
+            if result:
+                processed_images.append(result)
+
+        if not processed_images:
+            return None
+
+        # Return single string for one image, array for multiple
+        if len(processed_images) == 1:
+            return processed_images[0]
+        return processed_images
+
+    async def _process_single_image(
+        self,
+        *,
+        client: Any,
+        config: ApiRequestConfig,
+        image_str: str,
+        force_b64: bool,
+    ) -> str | None:  # noqa: ANN401
+        """Process a single image for Doubao API.
+
+        Returns URL or base64 with data URI prefix.
+        """
+        if not image_str:
+            return None
+
+        # 共享管道：URL 透传（跳过临时缓存）、data URI/裸 base64、本地路径与 force URL 解码
+        data_uri = await reference_data_uri(
+            client,
+            config,
+            image_str,
+            log_prefix="[doubao]",
+            error_label="doubao/i2i",
+            force_b64=force_b64,
+        )
+        if (
+            data_uri is None
+            and force_b64
+            and image_str.startswith(("http://", "https://"))
+        ):
+            # 保持既有语义：非透传 URL 在 force 模式下转换失败时报错由管道抛出；
+            # 此处仅在管道返回 None 且为 URL 时回退为原 URL，避免行为收紧。
+            return image_str
+        if data_uri:
+            logger.debug(
+                "[doubao] prepared i2i image: b64_len=%s",
+                max(len(data_uri) - data_uri.find(",") - 1, 0),
+            )
+        return data_uri
+
+    async def parse_response(
+        self,
+        *,
+        client: Any,
+        response_data: dict[str, Any],
+        session: aiohttp.ClientSession,
+        api_base: str | None = None,
+        http_status: int | None = None,
+        is_retry: bool = False,
+        request_config: ApiRequestConfig | None = None,
+    ) -> tuple[list[str], list[str], str | None, str | None]:  # noqa: ANN401
+        # 防御性检查：response_data 必须是 dict
+        if not isinstance(response_data, dict):
+            logger.warning(
+                "[doubao] 响应格式异常，期望 dict，实际: %s, 内容: %s",
+                type(response_data).__name__,
+                repr(response_data)[:100],
+            )
+            raise APIError(
+                "豆包 API 返回了非预期格式的响应，请稍后重试。",
+                http_status,
+                "MalformedResponse",
+                "InvalidResponseType",
+                retryable=True,
+            )
+
+        # 重试时检测 response_format 是否需要降级（由 tl_api._make_request 标记）
+        if is_retry:
+            logger.debug("[doubao] 重试请求，response_format 降级为 b64_json")
+
+        image_urls: list[str] = []
+        image_paths: list[str] = []
+        text_content = None
+        thought_signature = None
+
+        # 处理顶层错误
+        error_obj = response_data.get("error")
+        if (
+            isinstance(error_obj, dict)
+            and error_obj.get("message")
+            and not response_data.get("data")
+        ):
+            error_code = str(error_obj.get("code") or "")
+            error_type = str(error_obj.get("type") or "")
+            error_message = str(error_obj.get("message") or "")
+
+            # 解析错误并抛出带有详细信息的 APIError
+            raise self._build_api_error(
+                error_code=error_code,
+                error_type=error_type,
+                error_message=error_message,
+                http_status=http_status,
+            )
+        response_output_format = (
+            str(response_data.get("output_format") or "").strip().lower()
+        )
+        output_format = (
+            response_output_format
+            if response_output_format in DOUBAO_OUTPUT_FORMATS
+            else None
+        )
+        if output_format is None and request_config is not None:
+            request_settings = getattr(request_config, "provider_settings", None)
+            if isinstance(request_settings, dict):
+                output_format = normalize_doubao_output_format(
+                    request_settings.get("output_format")
+                )
+        save_extension = output_format or "png"
+
+        data_list = response_data.get("data") or []
+        if isinstance(data_list, list):
+            for item in data_list:
+                if not isinstance(item, dict):
+                    continue
+                # Check for per-image error
+                item_error = item.get("error")
+                if isinstance(item_error, dict) and item_error.get("message"):
+                    error_code = str(item_error.get("code") or "")
+                    error_message = str(item_error.get("message") or "")
+                    # 获取用户友好消息
+                    friendly_message = self._get_friendly_error_message(
+                        error_code, error_message
+                    )
+                    logger.warning(
+                        "[doubao] image generation error: code=%s message=%s",
+                        error_code,
+                        friendly_message,
+                    )
+                    continue
+                url = item.get("url")
+                if isinstance(url, str) and url:
+                    if client._request_has_proxy(request_config):
+                        _, image_path = await client._download_image(
+                            url,
+                            session,
+                            use_cache=False,
+                            proxy=client._request_http_proxy(request_config),
+                        )
+                        if image_path:
+                            image_urls.append(image_path)
+                            image_paths.append(image_path)
+                        else:
+                            logger.warning(
+                                "[doubao] 图片下载未落盘，已跳过该图: url=%s",
+                                redact_url(url),
+                            )
+                        continue
+                    image_urls.append(url)
+                    continue
+                b64_json = item.get("b64_json")
+                if isinstance(b64_json, str) and b64_json:
+                    image_path = await save_base64_image(b64_json, save_extension)
+                    if image_path:
+                        image_urls.append(image_path)
+                        image_paths.append(image_path)
+
+        usage = response_data.get("usage")
+        if isinstance(usage, dict):
+            logger.debug(
+                "[doubao] usage: generated_images=%s output_tokens=%s total_tokens=%s",
+                usage.get("generated_images"),
+                usage.get("output_tokens"),
+                usage.get("total_tokens"),
+            )
+
+        # 如果既没有错误也没有有效数据，抛出错误以便调试
+        if not image_urls and not image_paths:
+            # 检查顶层错误字段（已在上面处理过 dict 格式的错误）
+            error_obj = response_data.get("error")
+            # 如果错误字段存在但格式异常（非预期的 dict），也应该报错
+            if error_obj is not None and not isinstance(error_obj, dict):
+                logger.warning(
+                    "[doubao] 错误字段格式异常，期望 dict，实际: %s 值: %s",
+                    type(error_obj).__name__,
+                    redact_text(error_obj)[:200],
+                )
+                raise APIError(
+                    f"豆包 API 返回了格式异常的错误信息：{str(error_obj)[:100]}",
+                    http_status,
+                    "MalformedError",
+                    "InvalidErrorFormat",
+                    retryable=True,
+                )
+            # error 是 dict 但缺少 message，也视为异常响应
+            if isinstance(error_obj, dict) and not error_obj.get("message"):
+                logger.warning(
+                    "[doubao] 错误字段缺少 message: %s",
+                    redact_text(error_obj)[:200],
+                )
+                raise APIError(
+                    "豆包 API 返回了不完整的错误信息，请稍后重试。",
+                    http_status,
+                    "IncompleteError",
+                    "MissingErrorMessage",
+                    retryable=True,
+                )
+            # 无错误字段但也无有效数据
+            if not error_obj:
+                logger.warning(
+                    "[doubao] 响应中既无错误也无有效图像数据: %s",
+                    redact_text(response_data)[:500],
+                )
+                raise APIError(
+                    "豆包 API 返回了空响应，未生成图像也未返回错误信息。请稍后重试或检查请求参数。",
+                    http_status,
+                    "EmptyResponse",
+                    "NoDataReturned",
+                    retryable=True,
+                )
+
+        return image_urls, image_paths, text_content, thought_signature
+
+    @staticmethod
+    def _get_friendly_error_message(error_code: str, original_message: str) -> str:
+        """获取用户友好的错误消息。"""
+        # 精确匹配
+        if error_code in ERROR_MESSAGES:
+            return ERROR_MESSAGES[error_code]
+
+        # 前缀匹配（处理带参数的错误码如 MissingParameter.xxx）
+        for prefix in ERROR_MESSAGES:
+            if error_code.startswith(prefix):
+                return ERROR_MESSAGES[prefix]
+
+        # 返回原始消息
+        return original_message
+
+    @staticmethod
+    def _is_retryable_error(error_code: str, http_status: int | None = None) -> bool:
+        """判断错误是否可重试。"""
+        # 5xx 服务端错误通常可重试
+        if http_status and 500 <= http_status < 600:
+            return True
+
+        # 429 Too Many Requests 可重试
+        if http_status == 429:
+            return True
+
+        # 精确匹配
+        if error_code in RETRYABLE_ERRORS:
+            return True
+
+        # 前缀匹配
+        for prefix in RETRYABLE_ERRORS:
+            if error_code.startswith(prefix):
+                return True
+
+        # 明确不可重试的错误
+        if error_code in NON_RETRYABLE_ERRORS:
+            return False
+
+        for prefix in NON_RETRYABLE_ERRORS:
+            if error_code.startswith(prefix):
+                return False
+
+        # 默认不可重试
+        return False
+
+    def _build_api_error(
+        self,
+        *,
+        error_code: str,
+        error_type: str,
+        error_message: str,
+        http_status: int | None = None,
+    ) -> APIError:
+        """构建带有详细信息的 APIError。"""
+        friendly_message = self._get_friendly_error_message(error_code, error_message)
+        retryable = self._is_retryable_error(error_code, http_status)
+
+        return APIError(
+            message=friendly_message,
+            status_code=http_status,
+            error_type=error_type or "DoubaoError",
+            error_code=error_code,
+            retryable=retryable,
+        )

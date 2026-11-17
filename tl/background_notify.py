@@ -1,0 +1,258 @@
+"""后台生图完成后，重新激活 AstrBot 主 Agent 处理结果。"""
+
+from __future__ import annotations
+
+import json
+import time
+from typing import Any
+
+from astrbot.api import logger
+
+from .core.errors import redact_text
+from .llm_output import sanitize_task_result
+from .plugin_config import get_session_tool_timeout
+
+try:  # 官方内部 API（_get_session_conv 为私有函数），版本漂移风险防御
+    from astrbot.core.agent.tool import ToolSet
+    from astrbot.core.astr_main_agent import (
+        MainAgentBuildConfig,
+        _get_session_conv,
+        build_main_agent,
+    )
+    from astrbot.core.astr_main_agent_resources import (
+        BACKGROUND_TASK_RESULT_WOKE_SYSTEM_PROMPT,
+    )
+    from astrbot.core.cron.events import CronMessageEvent
+    from astrbot.core.platform.message_session import MessageSession
+    from astrbot.core.provider.entites import ProviderRequest
+    from astrbot.core.tools.message_tools import SendMessageToUserTool
+    from astrbot.core.utils.history_saver import persist_agent_history
+
+    _OFFICIAL_API_READY = True
+except ImportError as e:  # pragma: no cover - 仅低版本框架触发
+    logger.warning(
+        f"[后台结果回灌] AstrBot 官方回灌 API 导入失败，无法激活主 Agent: {e}"
+    )
+    _OFFICIAL_API_READY = False
+    # except 分支显式绑 None：保证模块符号恒存在，便于调用方/测试安全引用
+    ToolSet = MainAgentBuildConfig = _get_session_conv = build_main_agent = None
+    BACKGROUND_TASK_RESULT_WOKE_SYSTEM_PROMPT = CronMessageEvent = None
+    MessageSession = ProviderRequest = SendMessageToUserTool = None
+    persist_agent_history = None
+
+
+def _build_notice_prompt(task_id: str | None, failure_summary: str) -> str:
+    tid = f"（任务号 {task_id}）" if task_id else ""
+    return f"后台图片生成任务{tid}失败。失败摘要：{failure_summary}"
+
+
+def _build_safe_fallback_notice(task_id: str | None) -> str:
+    tid = f"（任务号 {task_id}）" if task_id else ""
+    return f"后台图片生成任务{tid}失败，请稍后重试。"
+
+
+def notify_llm_enabled(plugin: Any) -> bool:
+    cfg = getattr(plugin, "cfg", None)
+    return bool(getattr(cfg, "background_failure_notify_llm", True))
+
+
+def _configured_agent_max_steps(cfg: dict[str, Any]) -> int:
+    value = (
+        cfg.get("agent_runner", {})
+        .get("config", {})
+        .get("misc", {})
+        .get("max_steps", 30)
+    )
+    if isinstance(value, bool):
+        return 30
+    try:
+        return max(int(value), 1)
+    except (TypeError, ValueError):
+        return 30
+
+
+async def notify_llm_background_failure(
+    plugin: Any,
+    event: Any,
+    failure_summary: str,
+    *,
+    scene: str,
+    task_id: str | None = None,
+) -> bool:
+    return await notify_llm_background_result(
+        plugin,
+        event,
+        {"task_id": task_id or "", "result": failure_summary},
+        notice=_build_notice_prompt(task_id, failure_summary),
+        scene=scene,
+    )
+
+
+async def notify_llm_background_result(
+    plugin: Any,
+    event: Any,
+    task_result: dict[str, Any],
+    *,
+    notice: str,
+    scene: str,
+) -> bool:
+    """按官方后台结果回灌路径唤醒主 Agent；返回是否实际送达。"""
+    task_id = str((task_result or {}).get("task_id") or "") or None
+    umo = getattr(event, "unified_msg_origin", None)
+    started_at = time.perf_counter()
+    logger.info(f"[{scene}] 后台结果回灌开始: task_id={task_id}, umo={umo}")
+    try:
+        if not _OFFICIAL_API_READY:
+            raise RuntimeError("AstrBot 官方回灌 API 不可用")
+        context = getattr(plugin, "context", None)
+        # Integrated engines wrap Context for registration ownership. The host
+        # agent validates the concrete Context type, so unwrap at this boundary.
+        context = getattr(context, "host", context)
+        umo = getattr(event, "unified_msg_origin", None)
+        if context is None or not umo:
+            raise RuntimeError("缺少插件 context 或会话标识")
+
+        extras = {"background_task_result": sanitize_task_result(task_result)}
+
+        session = MessageSession.from_str(umo)
+        cron_event = CronMessageEvent(
+            context=context,
+            session=session,
+            message=notice,
+            extras=extras,
+            message_type=session.message_type,
+        )
+        cron_event.role = getattr(event, "role", None)
+        behavior = getattr(plugin, 'media_behavior', None)
+        if behavior:
+            from .delivery_evidence import expected_image_keys
+            behavior.bind(event)
+            cron_event._visual_media_trace = event._visual_media_trace
+            behavior.bind(cron_event)
+            cron_event._visual_generation_task = task_id
+            cron_event._visual_expected_image_keys = expected_image_keys(task_result)
+            cron_event.set_extra('visual_media_confirmed_image_keys', [])
+
+        cfg = context.get_config(umo=umo) or {}
+        provider_settings = cfg.get("provider_settings") or {}
+        config = MainAgentBuildConfig(
+            tool_call_timeout=get_session_tool_timeout(context, umo),
+            streaming_response=provider_settings.get("stream", False),
+            provider_settings=provider_settings,
+        )
+
+        req = ProviderRequest()
+        conv = await _get_session_conv(event=cron_event, plugin_context=context)
+        req.conversation = conv
+        req.contexts = json.loads(conv.history)
+        req.system_prompt += BACKGROUND_TASK_RESULT_WOKE_SYSTEM_PROMPT.format(
+            background_task_result=json.dumps(
+                extras["background_task_result"], ensure_ascii=False
+            )
+        )
+        req.prompt = (
+            "Proceed according to your system instructions. "
+            "Output using same language as previous conversation. "
+            "If you need to deliver the result to the user immediately, "
+            "you MUST use `send_message_to_user` tool to send the message directly to the user, "
+            "otherwise the user will not see the result. "
+            "For generated images in image_urls/image_paths (including batch items), "
+            "you MUST call send_message_to_user with messages containing "
+            "{type: 'image', url: '<image URL>'} or {type: 'image', path: '<local path>'}. "
+            "Send the generated images to the current session, leaving session empty. "
+            "Do not merely describe completion or output Markdown image links. "
+            "Use the supplied locations exactly; do not regenerate completed images. "
+            "After completing your task, summarize and output your actions and results. "
+        )
+        if not req.func_tool:
+            req.func_tool = ToolSet()
+        req.func_tool.add_tool(
+            context.get_llm_tool_manager().get_builtin_tool(SendMessageToUserTool)
+        )
+
+        result = await build_main_agent(
+            event=cron_event,
+            plugin_context=context,
+            config=config,
+            req=req,
+        )
+        if not result:
+            raise RuntimeError("主 Agent 构建失败")
+        async for _ in result.agent_runner.step_until_done(
+            _configured_agent_max_steps(cfg)
+        ):
+            pass
+
+        await persist_agent_history(
+            context.conversation_manager,
+            event=cron_event,
+            req=req,
+            summary_note=f"[BackgroundTask] {notice}",
+        )
+        if not getattr(cron_event, "_has_send_oper", False):
+            logger.warning(f"[{scene}] 后台通知 agent 未成功调用发送工具")
+            logger.warning(
+                f"[{scene}] 后台回灌未触发发送工具: task_id={task_id}, umo={umo}"
+            )
+            return False
+        if behavior:
+            from .delivery_evidence import background_delivery_confirmed
+            if not background_delivery_confirmed(cron_event, task_result):
+                logger.warning('[VisualMedia] generated image delivery not fully confirmed: task_id=%s', task_id)
+                return False
+        await _bump_delivery_count(plugin, task_result, scene=scene)
+        logger.info(
+            f"[{scene}] 后台结果回灌完成: task_id={task_id}, umo={umo}, "
+            f"elapsed={time.perf_counter() - started_at:.2f}s, sent=True"
+        )
+        return True
+    except Exception as e:
+        logger.warning(
+            f"[{scene}] 后台结果回灌失败: task_id={task_id}, umo={umo}, error={redact_text(e)[:240]}"
+        )
+        return False
+
+
+async def _bump_delivery_count(
+    plugin: Any,
+    task_result: dict[str, Any],
+    *,
+    scene: str,
+) -> None:
+    """回灌 agent 确认调用发送工具后累加交付计数；失败不影响发送结果。"""
+    task_id = str((task_result or {}).get("task_id") or "").strip()
+    if task_id:
+        from .background_dispatch import bump_delivery_count
+
+        await bump_delivery_count(plugin, task_id, scene=scene)
+
+
+async def report_background_failure(
+    plugin: Any,
+    event: Any,
+    failure_summary: str,
+    *,
+    scene: str,
+    task_id: str | None = None,
+) -> bool:
+    """工具触发的后台失败统一出口：按配置回灌 LLM，否则沿用直发。"""
+    if notify_llm_enabled(plugin):
+        delivered = await notify_llm_background_failure(
+            plugin, event, failure_summary, scene=scene, task_id=task_id
+        )
+        if delivered:
+            return True
+        direct_notice = _build_safe_fallback_notice(task_id)
+    else:
+        direct_notice = failure_summary
+    try:
+        await event.send(event.plain_result(direct_notice))
+    except Exception as e:
+        logger.warning(
+            f"[{scene}] 失败结果直发兜底失败: task_id={task_id}, umo={getattr(event, 'unified_msg_origin', None)}, error={redact_text(e)[:240]}"
+        )
+        return False
+    logger.info(
+        f"[{scene}] 失败结果直发兜底成功: task_id={task_id}, umo={getattr(event, 'unified_msg_origin', None)}"
+    )
+    return True

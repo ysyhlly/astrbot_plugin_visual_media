@@ -1,0 +1,726 @@
+"""Provider/model capabilities shared by routing and LLM tools."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .api_normalize import normalize_api_type
+from .provider_hooks import is_doubao_seedream_5_pro
+from .provider_loader import load_callable
+from .provider_metadata import get_provider_spec
+
+TEXT_TO_IMAGE = "text_to_image"
+IMAGE_TO_IMAGE = "image_to_image"
+
+_RESOLUTIONS = ["1K", "2K", "4K"]
+# 全渠道比例并集：Gemini 3.1 Flash 极端比例 + xAI 官方宽幅枚举。
+# 不支持某比例的渠道由 provider 层钳制/忽略，路由层不做按值过滤。
+SUPPORTED_ASPECT_RATIOS: tuple[str, ...] = (
+    "1:1",
+    "16:9",
+    "4:3",
+    "3:2",
+    "9:16",
+    "4:5",
+    "5:4",
+    "21:9",
+    "3:4",
+    "2:3",
+    "1:4",
+    "1:8",
+    "4:1",
+    "8:1",
+    "2:1",
+    "1:2",
+    "19.5:9",
+    "9:19.5",
+    "20:9",
+    "9:20",
+)
+_ASPECT_RATIOS = list(SUPPORTED_ASPECT_RATIOS)
+
+# Gemini 图像模型分层：10 档标准比例全系通用；
+# 极端 4 档（1:4/1:8/4:1/8:1）仅 3.1 系（flash 与 flash-lite）支持。
+_GEMINI_STANDARD_RATIOS: tuple[str, ...] = (
+    "1:1",
+    "2:3",
+    "3:2",
+    "3:4",
+    "4:3",
+    "4:5",
+    "5:4",
+    "9:16",
+    "16:9",
+    "21:9",
+)
+_GEMINI_EXTREME_RATIOS: tuple[str, ...] = ("1:4", "1:8", "4:1", "8:1")
+
+
+def gemini_image_family(model: str) -> str:
+    """按模型名子串分层（对 -preview 等后缀天然兼容）。"""
+    m = str(model or "").lower()
+    if "flash-lite-image" in m:
+        return "lite"
+    if "3.1-flash-image" in m:
+        return "flash31"
+    if "3-pro-image" in m:
+        return "pro"
+    if "2.5-flash-image" in m:
+        return "legacy2_5"
+    return "unknown"
+
+
+def gemini_image_capability(candidate: Any) -> dict[str, Any]:
+    """Google 系图像模型按家族声明分辨率/比例；不支持的参数不进工作台。
+
+    官方限制：lite 仅 1K 且无接地；2.5 系无 image_size 档位（固定 ~1K）
+    且无接地；pro 10 档比例；3.1 flash 14 档（含极端）+ image_search。
+    """
+    family = gemini_image_family(_model(candidate))
+    ratio_standard = {
+        "type": "string",
+        "enum": list(_GEMINI_STANDARD_RATIOS),
+        "default_source": "provider_config",
+    }
+    ratio_full = {
+        "type": "string",
+        "enum": list(_GEMINI_STANDARD_RATIOS) + list(_GEMINI_EXTREME_RATIOS),
+        "default_source": "provider_config",
+    }
+    tiers = {
+        "type": "string",
+        "enum": ["1K", "2K", "4K"],
+        "default_source": "provider_config",
+    }
+    if family == "lite":
+        profile = _profile(
+            candidate,
+            parameters={
+                "resolution": {
+                    "type": "string",
+                    "enum": ["1K"],
+                    "default_source": "provider_config",
+                },
+                "aspect_ratio": ratio_full,
+            },
+        )
+        # lite 不支持接地；image_search 仅 3.1 flash 支持
+        profile["unsupported_settings"] = {"enable_grounding", "image_search"}
+        return profile
+    if family == "legacy2_5":
+        # 2.5 系固定 ~1K 输出：不声明 resolution（运行时跳过 image_size 注入）
+        profile = _profile(candidate, parameters={"aspect_ratio": ratio_standard})
+        profile["unsupported_settings"] = {
+            "resolution",
+            "enable_grounding",
+            "image_search",
+        }
+        return profile
+    if family == "pro":
+        return _profile(
+            candidate,
+            parameters={"resolution": tiers, "aspect_ratio": ratio_standard},
+        )
+    if family == "flash31":
+        return _profile(
+            candidate,
+            parameters={"resolution": tiers, "aspect_ratio": ratio_full},
+        )
+    return _profile(candidate)
+
+
+def _model(candidate: Any) -> str:
+    return str(getattr(candidate, "model", "") or "").strip()
+
+
+def _settings(candidate: Any) -> dict[str, Any]:
+    value = getattr(candidate, "settings", None)
+    return value if isinstance(value, dict) else {}
+
+
+def _base_parameters(*, supports_edit: bool, native_batch_limit: int) -> dict[str, Any]:
+    parameters: dict[str, Any] = {
+        "resolution": {
+            "type": "string",
+            "enum": _RESOLUTIONS,
+            "default_source": "provider_config",
+        },
+        "aspect_ratio": {
+            "type": "string",
+            "enum": _ASPECT_RATIOS,
+            "default_source": "provider_config",
+        },
+        "image_count": {
+            "type": "integer",
+            "minimum": 1,
+            "native_request_maximum": max(int(native_batch_limit), 1),
+        },
+    }
+    if supports_edit:
+        parameters.update(
+            {
+                "use_reference_images": {"type": "boolean", "default": False},
+                "include_user_avatar": {"type": "boolean", "default": False},
+                "reference_image_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "preserve_reference_image_size": {
+                    "type": "boolean",
+                    "default_source": "plugin_config",
+                },
+            }
+        )
+    return parameters
+
+
+def _profile(
+    candidate: Any,
+    *,
+    native_batch_limit: int = 1,
+    parameters: dict[str, Any] | None = None,
+    request_setting_map: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    supports_edit = bool(getattr(candidate, "supports_image_edit", False))
+    limit = max(int(native_batch_limit), 1)
+    merged = _base_parameters(
+        supports_edit=supports_edit,
+        native_batch_limit=limit,
+    )
+    merged.update(parameters or {})
+    return {
+        "generation_modes": [
+            TEXT_TO_IMAGE,
+            *([IMAGE_TO_IMAGE] if supports_edit else []),
+        ],
+        "parameters": merged,
+        "native_batch_limit": limit,
+        "request_setting_map": dict(request_setting_map or {}),
+    }
+
+
+def agnes_ai_capability(candidate: Any) -> dict[str, Any]:
+    # 档位式 size + ratio 原生输出，分辨率枚举比全局默认多 3K
+    return _profile(
+        candidate,
+        parameters={
+            "resolution": {
+                "type": "string",
+                "enum": ["1K", "2K", "3K", "4K"],
+                "default_source": "provider_config",
+            },
+        },
+    )
+
+
+def xai_capability(candidate: Any) -> dict[str, Any]:
+    # 官方白名单与全局并集不同（含 auto，无 4:5/5:4/21:9），按渠道精确声明
+    from .api.xai import SUPPORTED_ASPECT_RATIOS
+
+    return _profile(
+        candidate,
+        native_batch_limit=10,
+        parameters={
+            "resolution": {
+                "type": "string",
+                "enum": ["1K", "2K"],
+                "default_source": "provider_config",
+            },
+            "quality": {
+                "type": "string",
+                "enum": ["low", "medium", "auto"],
+                "default_source": "provider_config",
+            },
+            "aspect_ratio": {
+                "type": "string",
+                "enum": sorted(SUPPORTED_ASPECT_RATIOS),
+                "default_source": "provider_config",
+            },
+        },
+        request_setting_map={"quality": "quality", "image_count": "n"},
+    )
+
+
+def minimax_capability(candidate: Any) -> dict[str, Any]:
+    # 官方：21:9 仅 image-01；显式宽高（2K 级）也仅 image-01，live 固定 ~1K 档
+    is_live = _model(candidate).lower() == "image-01-live"
+    ratios = ["1:1", "16:9", "4:3", "3:2", "2:3", "3:4", "9:16"] + (
+        [] if is_live else ["21:9"]
+    )
+    return _profile(
+        candidate,
+        native_batch_limit=9,
+        parameters={
+            "resolution": {
+                "type": "string",
+                "enum": ["1K", "2K"] if not is_live else ["1K"],
+                "default_source": "provider_config",
+            },
+            "aspect_ratio": {
+                "type": "string",
+                "enum": ratios,
+                "default_source": "provider_config",
+            },
+            "watermark": {
+                "type": "boolean",
+                "default_source": "provider_config",
+            },
+        },
+        request_setting_map={"watermark": "aigc_watermark", "image_count": "n"},
+    )
+
+
+def stepfun_capability(candidate: Any) -> dict[str, Any]:
+    # negative_prompt/text_mode 仅 step-image-edit 系列支持，其余模型不声明
+    if not _model(candidate).lower().startswith("step-image-edit"):
+        return _profile(candidate)
+    return _profile(
+        candidate,
+        parameters={
+            "negative_prompt": {
+                "type": "string",
+                "default_source": "provider_config",
+            }
+        },
+        request_setting_map={"negative_prompt": "negative_prompt"},
+    )
+
+
+def openai_images_capability(candidate: Any) -> dict[str, Any]:
+    from .api.openai_image_options import gpt_image_quality_values
+    from .api.openai_images import _is_gpt_image_model
+
+    model = _model(candidate).lower()
+    if model == "dall-e-3":
+        quality_values = ["hd", "standard"]
+    elif model == "dall-e-2":
+        quality_values = ["standard"]
+    elif model.startswith(("gpt-image", "chatgpt-image")):
+        quality_values = gpt_image_quality_values(model)
+    else:
+        quality_values = ["auto", "high", "medium", "low", "hd", "standard"]
+    return _profile(
+        candidate,
+        native_batch_limit=min(max(int(_settings(candidate).get("n", 1)), 1), 10)
+        if _is_gpt_image_model(model) and not _settings(candidate).get("stream")
+        else 1,
+        parameters={
+            "quality": {
+                "type": "string",
+                "enum": quality_values,
+                "default_source": "provider_config",
+            },
+        },
+        request_setting_map={
+            "quality": "quality",
+            **({"image_count": "n"} if _is_gpt_image_model(model) else {}),
+        },
+    )
+
+
+def openai_responses_capability(candidate: Any) -> dict[str, Any]:
+    from .api.openai_image_options import gpt_image_quality_values
+
+    return _profile(
+        candidate,
+        parameters={
+            "quality": {
+                "type": "string",
+                "enum": gpt_image_quality_values(_model(candidate)),
+                "default_source": "provider_config",
+            },
+        },
+        request_setting_map={"quality": "quality"},
+    )
+
+
+def doubao_capability(candidate: Any) -> dict[str, Any]:
+    settings = _settings(candidate)
+    model = _model(candidate) or str(settings.get("endpoint_id") or "").strip()
+    is_seedream_5_pro = is_doubao_seedream_5_pro(model, settings)
+    # Seedream 5.0 Pro 仅支持单图。
+    sequential = (
+        settings.get("sequential_image_generation") == "auto" and not is_seedream_5_pro
+    )
+    try:
+        configured_limit = int(settings.get("sequential_max_images", 1))
+    except (TypeError, ValueError):
+        configured_limit = 1
+    native_limit = min(max(configured_limit, 1), 15) if sequential else 1
+    setting_map = {"watermark": "watermark"}
+    if sequential:
+        setting_map["image_count"] = "sequential_max_images"
+    return _profile(
+        candidate,
+        native_batch_limit=native_limit,
+        parameters={
+            "watermark": {
+                "type": "boolean",
+                "default_source": "provider_config",
+            }
+        },
+        request_setting_map=setting_map,
+    )
+
+
+def sensenova_capability(candidate: Any) -> dict[str, Any]:
+    model = _model(candidate).lower()
+    if model.startswith("sensenova-u1.5"):
+        return _profile(
+            candidate,
+            native_batch_limit=1,
+            parameters={
+                "watermark": {
+                    "type": "boolean",
+                    "default_source": "provider_config",
+                }
+            },
+            request_setting_map={"watermark": "watermark", "image_count": "n"},
+        )
+    return _profile(
+        candidate,
+        native_batch_limit=4,
+        request_setting_map={"image_count": "n"},
+    )
+
+
+def senseaudio_capability(candidate: Any) -> dict[str, Any]:
+    from .api.senseaudio import DEFAULT_MODEL, MODEL_RATIOS, MODEL_RESOLUTIONS
+
+    model = _model(candidate) or DEFAULT_MODEL
+    profile = _profile(
+        candidate,
+        parameters={
+            "resolution": {
+                "type": "string",
+                "enum": list(MODEL_RESOLUTIONS.get(model, ("1K",))),
+                "default_source": "provider_config",
+            },
+            "aspect_ratio": {
+                "type": "string",
+                "enum": list(MODEL_RATIOS.get(model, ("1:1",))),
+                "default_source": "provider_config",
+            },
+            "seed": {"type": "integer", "default_source": "provider_config"},
+        },
+    )
+    if _settings(candidate).get("size"):
+        # 固定尺寸覆盖自动映射，避免工作台继续提供无效的比例/档位覆盖。
+        for name in ("resolution", "aspect_ratio"):
+            profile["parameters"].pop(name)
+        profile["unsupported_settings"] = {"resolution", "aspect_ratio"}
+    return profile
+
+
+def dashscope_capability(candidate: Any) -> dict[str, Any]:
+    settings = _settings(candidate)
+    model = _model(candidate).lower()
+    is_wan27 = model.startswith("wan2.7")
+    is_zimage = model.startswith("z-image")
+    if is_wan27 and bool(settings.get("enable_sequential", False)):
+        native_limit = 12
+    elif is_wan27:
+        native_limit = 4
+    elif model.startswith(("qwen-image-2.0", "qwen-image-3.0")):
+        native_limit = 6
+    else:
+        native_limit = 1
+    parameters: dict[str, Any] = {}
+    setting_map = {"image_count": "n"}
+    # 官方 4K 档仅 wan2.7-image-pro 支持（且仅文生图）；其余为 W*H 像素约束
+    if is_wan27 or model.startswith("qwen-image"):
+        parameters["resolution"] = {
+            "type": "string",
+            "enum": (
+                ["1K", "2K", "4K"] if model == "wan2.7-image-pro" else ["1K", "2K"]
+            ),
+            "default_source": "provider_config",
+        }
+    if not is_zimage:
+        # z-image 为纯文生图最小参数集，不支持 watermark/negative_prompt
+        parameters["watermark"] = {
+            "type": "boolean",
+            "default_source": "provider_config",
+        }
+        setting_map["watermark"] = "watermark"
+    if not is_wan27 and not is_zimage:
+        parameters["negative_prompt"] = {
+            "type": "string",
+            "default_source": "provider_config",
+        }
+        setting_map["negative_prompt"] = "negative_prompt"
+    return _profile(
+        candidate,
+        native_batch_limit=native_limit,
+        parameters=parameters,
+        request_setting_map=setting_map,
+    )
+
+
+def modelscope_capability(candidate: Any) -> dict[str, Any]:
+    # 仅 1K/2K 档（像素上限 2K）；seed 仅声明不参与运行期注入（request_setting_map 不消费 seed）
+    return _profile(
+        candidate,
+        parameters={
+            "resolution": {
+                "type": "string",
+                "enum": ["1K", "2K"],
+                "default_source": "provider_config",
+            },
+            "negative_prompt": {
+                "type": "string",
+                "default_source": "provider_config",
+            },
+            "seed": {"type": "integer", "default_source": "provider_config"},
+        },
+        request_setting_map={"negative_prompt": "negative_prompt"},
+    )
+
+
+def siliconflow_capability(candidate: Any) -> dict[str, Any]:
+    # 按模型族分层：仅 Kolors 支持批量（batch_size 1-4）；seed 仅声明不参与运行期注入（request_setting_map 不消费 seed）
+    # 比例枚举按渠道可表达范围覆写（[512,1440] 边界放不下 4:1/8:1/1:4/1:8）
+    from .api.siliconflow import SUPPORTED_ASPECT_RATIOS, _model_family
+
+    is_kolors = _model_family(_model(candidate)) == "kolors"
+    return _profile(
+        candidate,
+        native_batch_limit=4 if is_kolors else 1,
+        parameters={
+            "aspect_ratio": {
+                "type": "string",
+                "enum": list(SUPPORTED_ASPECT_RATIOS),
+                "default_source": "provider_config",
+            },
+            "resolution": {
+                "type": "string",
+                "enum": ["1K", "2K"],
+                "default_source": "provider_config",
+            },
+            "negative_prompt": {
+                "type": "string",
+                "default_source": "provider_config",
+            },
+            "seed": {"type": "integer", "default_source": "provider_config"},
+        },
+        request_setting_map={
+            **({"image_count": "batch_size"} if is_kolors else {}),
+            "negative_prompt": "negative_prompt",
+        },
+    )
+
+
+def candidate_capability(candidate: Any) -> dict[str, Any]:
+    """Return the effective tool capability for one configured candidate."""
+    spec = get_provider_spec(getattr(candidate, "api_type", ""))
+    if spec and spec.capability_profile_path:
+        value = load_callable(spec.capability_profile_path)(candidate)
+        if isinstance(value, dict):
+            return value
+    return _profile(candidate)
+
+
+def candidate_reference_limit(candidate: Any) -> int:
+    """结合候选预截断与 provider 实际消费数量计算参考图上限。"""
+    if not getattr(candidate, "supports_image_edit", False):
+        return 0
+    from .api import provider_limits as limits
+
+    settings = _settings(candidate)
+    try:
+        configured = max(int(settings.get("max_reference_images", 6)), 0)
+    except (TypeError, ValueError):
+        configured = 6
+    api_type = normalize_api_type(getattr(candidate, "api_type", ""))
+    model = _model(candidate).lower()
+    native = {
+        "google": limits.MAX_REFERENCE_IMAGES_GOOGLE,
+        "gemini_interactions": limits.MAX_REFERENCE_IMAGES_GEMINI_INTERACTIONS,
+        "openai": limits.MAX_REFERENCE_IMAGES_OPENAI_COMPAT,
+        "minimax": limits.MAX_REFERENCE_IMAGES_MINIMAX,
+        "sensenova": limits.MAX_REFERENCE_IMAGES_SENSENOVA_U15,
+        "senseaudio": limits.MAX_REFERENCE_IMAGES_SENSEAUDIO,
+        "stepfun": 1,
+    }.get(api_type, configured)
+    if api_type == "xai":
+        from .api.xai import _MAX_EDIT_IMAGES
+
+        native = _MAX_EDIT_IMAGES
+    elif api_type == "doubao":
+        native = (
+            limits.MAX_REFERENCE_IMAGES_DOUBAO_SEEDREAM_5_PRO
+            if is_doubao_seedream_5_pro(model, settings)
+            else limits.MAX_REFERENCE_IMAGES_DOUBAO
+        )
+    elif api_type == "dashscope":
+        native = (
+            limits.MAX_REFERENCE_IMAGES_DASHSCOPE_QWEN3
+            if model.startswith("qwen-image-3.0")
+            else limits.MAX_REFERENCE_IMAGES_DASHSCOPE
+        )
+    elif api_type == "modelscope":
+        native = (
+            min(configured, 99)
+            if settings.get("max_reference_images")
+            else limits.MAX_REFERENCE_IMAGES_MODELSCOPE
+        )
+    elif api_type == "siliconflow":
+        from .api.siliconflow import _model_family
+
+        native = (
+            1
+            if _model_family(model) in {"kolors", "qwen-image-edit"}
+            else limits.MAX_REFERENCE_IMAGES_SILICONFLOW
+        )
+    elif api_type == "openai_images":
+        from .api.openai_images import _is_gpt_image_model
+
+        native = 16 if _is_gpt_image_model(model) else 1
+    return min(configured, native)
+
+
+def routing_mode(provider: Any = None, model: Any = None) -> str:
+    has_provider = bool(str(provider or "").strip())
+    has_model = bool(str(model or "").strip())
+    if has_provider and has_model:
+        return "provider_model_retry"
+    if has_provider:
+        return "provider_retry"
+    if has_model:
+        return "model_polling"
+    return "full_polling"
+
+
+def routing_description(mode: str) -> str:
+    return {
+        "provider_model_retry": "正在指定供应商和模型内部重试生成",
+        "provider_retry": "正在当前供应商内部按配置模型重试生成",
+        "model_polling": "正在按指定模型跨供应商轮询生成",
+        "full_polling": "正在按已配置供应商和模型轮询生成",
+        "mixed": "正在按各批量条目指定的供应商和模型路由生成",
+    }.get(mode, "正在生成图片")
+
+
+def explicit_runtime_parameters(config: Any) -> set[str]:
+    required: set[str] = set()
+    if getattr(config, "negative_prompt", None) not in (None, ""):
+        required.add("negative_prompt")
+    if getattr(config, "watermark", None) is not None:
+        required.add("watermark")
+    if getattr(config, "quality", None) not in (None, ""):
+        required.add("quality")
+    return required
+
+
+def parse_model_selector(
+    selector: str, candidates: list[Any]
+) -> tuple[str | None, str | None, bool]:
+    """识别 ``供应商/模型``、``供应商/``、模型名或别名，命令与 LLM 工具共用。
+
+    返回 (provider, model, 是否识别成功)。无法识别时不回退到默认路由，由调用方决定
+    是原样保留文本还是报错。
+    """
+
+    text = str(selector or "")
+    if not text.strip():
+        return None, None, False
+    if "/" in text:
+        provider_part, model_part = text.split("/", 1)
+        if provider_part and select_candidates(candidates, provider=provider_part):
+            return provider_part, model_part or None, True
+        if select_candidates(candidates, model=text):
+            return None, text, True
+        return None, None, False
+    if select_candidates(candidates, model=text):
+        return None, text, True
+    return None, None, False
+
+
+def select_candidates(
+    candidates: list[Any],
+    *,
+    provider: Any = None,
+    model: Any = None,
+    candidate_id: str | None = None,
+    has_reference_images: bool = False,
+    required_parameters: set[str] | None = None,
+    request_values: dict[str, Any] | None = None,
+) -> list[Any]:
+    """Filter candidates without changing their configured polling order."""
+    provider_name = normalize_api_type(provider) if provider else ""
+    model_name = str(model or "").strip()
+    required = set(required_parameters or ())
+    values = request_values or {}
+    selected: list[Any] = []
+    for candidate in candidates or []:
+        if (
+            candidate_id is not None
+            and str(getattr(candidate, "id", "")) != candidate_id
+        ):
+            continue
+        if (
+            provider_name
+            and normalize_api_type(getattr(candidate, "api_type", "")) != provider_name
+        ):
+            continue
+        alias = str(getattr(candidate, "model_alias", "") or "").strip()
+        if model_name and model_name not in {_model(candidate), alias}:
+            continue
+        capability = candidate_capability(candidate)
+        modes = set(capability.get("generation_modes") or ())
+        if has_reference_images and IMAGE_TO_IMAGE not in modes:
+            continue
+        supported = set((capability.get("parameters") or {}).keys())
+        if not required.issubset(supported):
+            continue
+        descriptors = capability.get("parameters") or {}
+        invalid_value = False
+        for name, value in values.items():
+            descriptor = descriptors.get(name) or {}
+            allowed = descriptor.get("enum")
+            if allowed and value not in allowed:
+                invalid_value = True
+                break
+        if invalid_value:
+            continue
+        selected.append(candidate)
+    return selected
+
+
+def apply_request_overrides(
+    config: Any,
+    candidate: Any,
+    settings: dict[str, Any],
+) -> tuple[dict[str, Any], int]:
+    """Apply request-scoped tool values to a copied candidate settings mapping."""
+    result = settings
+
+    def set_request_value(name: str, value: Any) -> None:
+        nonlocal result
+        if result is settings:
+            result = dict(settings)
+        result[name] = value
+
+    capability = candidate_capability(candidate)
+    setting_map = capability.get("request_setting_map") or {}
+    for request_name in ("negative_prompt", "watermark", "quality"):
+        value = getattr(config, request_name, None)
+        setting_name = setting_map.get(request_name)
+        if value is not None and setting_name:
+            set_request_value(setting_name, value)
+
+    native_limit = max(int(capability.get("native_batch_limit") or 1), 1)
+    try:
+        requested_count = max(int(getattr(config, "image_count", 1) or 1), 1)
+    except (TypeError, ValueError):
+        requested_count = 1
+    count_setting = setting_map.get("image_count")
+    generation_settings = getattr(config, "generation_settings", None) or {}
+    if count_setting in generation_settings:
+        requested_count = min(
+            requested_count, max(int(generation_settings[count_setting]), 1)
+        )
+    effective_count = min(requested_count, native_limit)
+    if count_setting and result.get(count_setting) != effective_count:
+        set_request_value(count_setting, effective_count)
+    return result, effective_count

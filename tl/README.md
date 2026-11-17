@@ -1,0 +1,647 @@
+# tl 模块接口说明
+
+本文档记录 `tl/` 目录内各文件的职责、主要接口和调用边界，供维护者修改插件内部逻辑时快速定位。这里的接口不是对外稳定 API，除非特别说明，默认只服务于本插件内部。
+
+## 总体调用链
+
+```text
+main.py
+  ├─ ConfigLoader -> PluginConfig
+  ├─ GeminiAPIClient -> tl/api/* Provider
+  ├─ ImageGenerator -> GeminiAPIClient.generate_image()
+  ├─ ImageHandler / AvatarHandler -> 收集参考图
+  ├─ MessageSender -> 发送生成结果和 NapCat Stream 兜底
+  ├─ VisionHandler / image_splitter / sticker_cutter -> 表情包切分
+  ├─ RateLimiter -> 群限制与限流
+  ├─ KeyManager -> provider_overrides 多 Key 轮换
+  └─ GeminiImageGenerationTool / Query Tools -> AstrBot LLM Tools
+       ├─ provider_capabilities -> 路由、参数能力、原生批量上限
+       ├─ BackgroundTaskManager -> 持久化任务状态
+       └─ batch_generation -> 命名批量编排与结果发送
+```
+
+## 稳定内部入口
+
+其他插件应通过主插件的 `get_service(api_version=1)` 获取公开服务，协议见 [其他插件接入指南](../docs/plugin-api.md)。服务在 `plugin_service.py` 中协商 `api_version`（只接受真正的 int 1），`capabilities()` 声明固定 `features`（`image.generate`、`image.tasks`、`image.callbacks`）；它管理服务就绪、插件任务及回调；`generation_scheduler.py` 在共用 API 入口管理全入口 FIFO 并发，以下内部入口不构成对外兼容承诺。
+
+| 入口 | 位置 | 作用 |
+|------|------|------|
+| `PluginConfig` | `plugin_config.py` | 运行时配置数据对象 |
+| `ConfigLoader.load()` | `plugin_config.py` | 从 AstrBot 配置加载、迁移、归一化插件配置 |
+| `GeminiAPIClient.generate_image()` | `tl_api.py` | 生图 API 请求统一入口 |
+| `get_api_client()` / `clear_api_client()` | `tl_api.py` | API 客户端单例管理 |
+| `ImageGenerator.generate_image_core()` | `image_generator.py` | 指令与 LLM Tool 共用的核心生图逻辑 |
+| `GeminiImageGenerationTool.call()` | `llm_tools.py` | AstrBot FunctionTool 调用入口 |
+| `GeminiImageLookupTool.call()` | `llm_query_tools.py` | 按 kind 查询模型、模板、生成记录和后台任务 |
+| `GeminiImageShareTool.call()` | `llm_query_tools.py` | 由请求者本人共享或取消共享自己的生成记录 |
+| `BackgroundTaskManager` | `background_tasks.py` | 持久化、隔离和清理后台任务记录 |
+| `GeminiImageBatchTool.call()` | `llm_tools.py` | 批量生图 FunctionTool 调用入口 |
+| `MessageSender.dispatch_send_results()` | `message_sender.py` | 图片、文本、合并转发发送结果构造入口 |
+| `MessageSender.send_results_with_stream_retry()` | `message_sender.py` | 直接发送结果；原始发送失败后按阈值尝试 NapCat Stream API 兜底 |
+| `ImageHandler.fetch_images_from_event()` | `image_handler.py` | 从消息事件收集参考图和头像图 |
+| `AvatarHandler.get_avatar_reference()` | `avatar_handler.py` | 获取用户头像参考图 |
+| `split_image()` | `image_splitter.py` | 表情包切图入口 |
+| `create_zip()` | `image_splitter.py` | 切图结果打包 |
+| `get_api_provider()` | `api/registry.py` | 根据 `api_type` 获取供应商实现 |
+
+## 数据类型
+
+### `api_types.py`
+
+| 接口 | 类型 | 说明 |
+|------|------|------|
+| `ApiRequestConfig` | `dataclass` | Provider 请求配置，包含模型、提示词、API 类型、参考图、分辨率、比例、图片输入模式等字段 |
+| `APIError` | `Exception` | API 层统一异常，携带 `status_code`、`error_type`、`error_code`、`retryable` |
+
+典型 `ApiRequestConfig` 字段：
+
+```python
+ApiRequestConfig(
+    model="...",
+    prompt="...",
+    api_type="openai",
+    api_base=None,
+    api_key=None,
+    resolution="1K",
+    aspect_ratio="1:1",
+    reference_images=[],
+    image_input_mode="force_base64",
+)
+```
+
+### `api/base.py`
+
+| 接口 | 类型 | 说明 |
+|------|------|------|
+| `ProviderRequest` | `dataclass(frozen=True)` | Provider 构建出的请求对象：`url`、`headers`、`payload` |
+| `ApiProvider` | `Protocol` | 所有 provider 必须实现的协议 |
+
+Provider 协议：
+
+```python
+async def build_request(
+    self, *, client: Any, config: ApiRequestConfig
+) -> ProviderRequest: ...
+
+
+async def parse_response(
+    self,
+    *,
+    client: Any,
+    response_data: dict[str, Any],
+    session: aiohttp.ClientSession,
+    api_base: str | None = None,
+    http_status: int | None = None,
+) -> tuple[list[str], list[str], str | None, str | None]: ...
+```
+
+`parse_response()` 返回 `(image_urls, image_paths, text_content, thought_signature)`。
+
+## 配置模块
+
+### `plugin_config.py`
+
+| 接口 | 说明 |
+|------|------|
+| `PluginConfig` | 插件运行时配置数据类，集中保存 API、图像生成、快速模式、服务、限流等配置 |
+| `ConfigLoader(raw_config, data_dir=None)` | 配置加载器 |
+| `ConfigLoader.load()` | 入口方法，返回 `PluginConfig` |
+| `provider_settings_by_type` | 运行时派生字段，按 `api_type` 保存所有有效候选 settings 列表 |
+| `*_settings` | 兼容旧字段，仅投影每个 provider 的首个有效候选 |
+
+`ConfigLoader` 还负责：
+
+- v1.9.0 前旧配置迁移。
+- 写入 `.migration_v1.9.0.done` 迁移标记。
+- 生成 `config_backup_pre_v1.9.0_*.json` 备份。
+- 加载 `provider_overrides`、`quick_mode_settings`、`rate_limit_rules`。
+- 根据 `ProviderSpec` 执行配置校验、归一化、候选能力判断和旧字段回填。
+
+### `openai_image_size.py`
+
+| 接口 | 说明 |
+|------|------|
+| `normalize_size_mode(value)` | 校验并归一化 `preset/custom` |
+| `normalize_custom_size_input(value)` | 将 `2048 × 1152`、`2048×1152` 等归一化为 `2048x1152` |
+| `validate_custom_size(value)` | 校验 OpenAI Images 自定义尺寸约束 |
+| `derive_custom_size_from_preset_params(resolution, aspect_ratio)` | 从旧预设 `1K/2K/4K + 比例` 推导合法 `WxH` |
+| `resolve_openai_custom_size(size_candidate, resolution_candidate, aspect_ratio_candidate, settings)` | 按显式 `size`、预设参数、配置 `custom_size` 的优先级解析最终尺寸 |
+
+常量：
+
+| 常量 | 说明 |
+|------|------|
+| `CUSTOM_SIZE_MAX_EDGE` | 最大边长，当前 `3840` |
+| `CUSTOM_SIZE_MIN_PIXELS` / `CUSTOM_SIZE_MAX_PIXELS` | 总像素范围 |
+| `PRESET_RESOLUTIONS` | `1K` / `2K` / `4K` |
+| `PRESET_ASPECT_RATIOS` | 内部支持的比例枚举 |
+
+## API 客户端与 Provider
+
+### `tl_api.py`
+
+| 接口 | 说明 |
+|------|------|
+| `GeminiAPIClient(api_keys)` | API 客户端，负责会话、代理、Key 轮换、请求发送、重试和响应解析 |
+| `GeminiAPIClient.set_key_manager(key_manager)` | 注入 `KeyManager` |
+| `GeminiAPIClient.get_key_for_api_type(api_type)` | 按供应商获取可用 Key |
+| `GeminiAPIClient.generate_image(config)` | 生图请求统一入口 |
+| `GeminiAPIClient.close()` | 关闭内部 `aiohttp.ClientSession` |
+| `get_api_client(api_keys)` | 获取模块级 API 客户端单例 |
+| `clear_api_client()` | 清理模块级 API 客户端单例 |
+
+内部关键步骤：
+
+```text
+generate_image()
+  -> _get_api_url()
+  -> get_api_provider(api_type).build_request()
+  -> _make_request()
+  -> provider.parse_response()
+```
+
+`tl_api.py` 仅保留通用兼容解析方法；新 provider 的请求构建和响应解析应放在 `tl/api/` 中实现，并通过 `ProviderSpec` 接入。
+
+### Provider 注册元数据
+
+| 接口 | 说明 |
+|------|------|
+| `api_normalize.normalize_api_type(api_type)` | 小写、去空格、`-` 转 `_` |
+| `provider_metadata.ProviderSpec` | 供应商唯一代码注册元数据 |
+| `provider_metadata.iter_provider_specs()` | 按 schema 顺序返回所有 provider spec |
+| `provider_metadata.get_provider_spec(api_type)` | 返回 canonical provider spec |
+| `api/registry.get_api_provider(api_type)` | 按 `ProviderSpec.provider_path` 懒加载 provider 单例，未知值回退 `OpenAICompatProvider` |
+
+当前 spec 顺序与 `_conf_schema.json` 中 `provider_settings.provider_overrides.templates` 严格一致，不再提供别名。
+供应商实现与接入说明统一见 [适配器开发指南](../docs/新增API供应商.md)。
+
+### Provider 公共辅助模块
+
+以下模块抽出 provider 间的共享逻辑，新供应商应优先复用：
+
+| 模块 | 主要接口 | 说明 |
+|------|----------|------|
+| `provider_metadata.py` | `ProviderSpec` / `iter_provider_specs()` / `get_provider_spec()` | provider 唯一代码注册点，保持轻量导入 |
+| `provider_loader.py` | `load_callable(path)` | 懒加载 provider class 和 spec hook |
+| `provider_hooks.py` | 配置校验、归一化、候选配置、工具 profile hook | 承载 provider 专属行为，调用方由 spec 字段声明 |
+| `provider_settings.py` | `first_provider_settings()` / `first_provider_tool_profile()` | 共享 provider settings 读取 helper，避免只读旧 `*_settings` 字段 |
+| `provider_capabilities.py` | `candidate_capability()` / `select_candidates()` / `apply_request_overrides()` | 集中声明生成模式、工具参数、原生批量上限和候选过滤规则 |
+| `api/provider_limits.py` | `MAX_REFERENCE_IMAGES_GOOGLE` / `MAX_REFERENCE_IMAGES_DOUBAO` / `MAX_REFERENCE_IMAGES_DOUBAO_SEEDREAM_5_PRO` / `MAX_REFERENCE_IMAGES_OPENAI_COMPAT` / `MAX_REFERENCE_IMAGES_MINIMAX` / `MAX_REFERENCE_IMAGES_DASHSCOPE` | 集中维护各 provider 参考图上限常量（`Final[int]`） |
+| `api/reference_intake.py` | `announce_reference_intake(references, max_count, *, log_prefix="")` | 参考图接收阶段统一日志，返回 `(收到数量, 采用数量)` |
+| `api/data_uri.py` | `format_data_uri(b64_data, mime_type=None)` / `strip_data_uri_prefix(s)` / `looks_like_base64(s)` | data URI 与 base64 字符串的格式化/识别助手 |
+| `api/param_utils.py` | `coerce_int()` / `coerce_float()` / `ensure_prompt_length()` | 共享参数钳制与 prompt 硬上限校验 |
+| `api/reference_pipeline.py` | `load_reference_bytes()` / `reference_data_uri()` / `transcode_to_supported_mime()` / `select_persistent_source_urls()` | 参考图输入解析唯一共享层：data URI/裸 base64/本地路径（file:// 转换）/URL（候选代理透传、临时缓存过滤），供 edits 原始字节、data URI 形态、白名单转码与任务源链接记录复用；tl/api 内禁止私写参考图 b64decode（测试断言守门） |
+| `api/reference_values.py` | `resolve_reference_api_values(...)` / `normalize_image_mime(...)` | URL / data URI 列表归一化与 JPG/PNG 白名单转码，均委托 reference_pipeline |
+| `api/compat_utils.py` | `origin_from_api_base()` / `is_temp_cache_url()` / `find_markdown_relative_image_urls()` / `build_generation_config()` / `resolve_relative_url()` | 已下线 zai / grok2api 沉淀的网关兼容辅助（相对路径图片、临时缓存 URL、generation_config 约定） |
+
+详见 [docs/新增API供应商.md](../docs/新增API供应商.md)。
+
+### `api/openai_compat.py`
+
+OpenAI Chat Completions 兼容 provider，默认兜底 provider。
+
+| 接口 | 说明 |
+|------|------|
+| `OpenAICompatProvider.build_request()` | 构造 `/v1/chat/completions` 请求 |
+| `OpenAICompatProvider.parse_response()` | 解析 OpenAI 兼容响应 |
+| `_prepare_payload()` | 子类可覆盖的请求体构建 hook |
+| `_handle_special_candidate_url()` | 子类可覆盖的特殊图片 URL 处理 hook |
+| `_find_additional_image_urls_in_text()` | 子类可覆盖的文本图片链接提取 hook |
+
+### `api/google.py`
+
+Google/Gemini 官方 provider。
+
+| 接口 | 说明 |
+|------|------|
+| `GoogleProvider.build_request()` | 构造 Google Gemini 请求 |
+| `GoogleProvider.parse_response()` | 解析 Gemini 响应 |
+| `_prepare_payload()` | 组装 `contents`、参考图和 generation config |
+| `_parse_gresponse()` | 从响应中提取图片、文本和 `thought_signature` |
+
+### `api/gemini_interactions.py`
+
+Gemini Interactions API（Nano Banana 系列）provider。
+
+| 接口 | 说明 |
+|------|------|
+| `GeminiInteractionsProvider.build_request()` | 构造 `/v1beta/interactions` 请求（`input` 内容块、`store: false`） |
+| `GeminiInteractionsProvider.parse_response()` | 解析 `steps[]` 中 model_output/thought 的图像与文本块 |
+| `_normalize_params()` | 模型分层钳制：lite 仅 1K，极端比例仅 3.1 Flash Image |
+| `_build_response_format()` | 按 `enable_text_response` 生成单对象或数组形式 |
+
+### `api/openai_images.py`
+
+OpenAI Images 原生端点 provider。
+
+| 接口 | 说明 |
+|------|------|
+| `OpenAIImagesProvider.build_request()` | 根据是否有参考图选择 `generations` 或 `edits` |
+| `OpenAIImagesProvider.parse_response()` | 解析 `data[].url` / `data[].b64_json` 与 usage |
+| `_prepare_generations_payload()` | 文生图 JSON 请求体 |
+| `_prepare_edits_payload()` | 改图 multipart 请求体 |
+| `_is_gpt_image_model(model)` | 判断 GPT image 系列 |
+| `_get_size_mapping(model)` | 按模型族选择预设尺寸映射 |
+| `_resolve_size_value(model, resolution, settings)` | 计算最终 `size` |
+
+### `api/agnes_ai.py`
+
+Agnes AI 图片生成 provider。
+
+| 接口 | 说明 |
+|------|------|
+| `AgnesAIProvider.build_request()` | 构造 `/v1/images/generations` JSON 请求 |
+| `AgnesAIProvider.parse_response()` | 解析 `data[].url` / `data[].b64_json` 图片响应 |
+| `_prepare_payload()` | 组装 `model`、`prompt`、`size` 和 `extra_body` |
+| `_to_image_input()` | 按 `reference_image_mode` 生成参考图 URL 或 data URI |
+
+### `api/xai.py`
+
+xAI Images 官方 provider。
+
+| 接口 | 说明 |
+|------|------|
+| `XAIProvider.build_request()` | 构造 `/v1/images/generations` 或 `/v1/images/edits` 请求 |
+| `XAIProvider.parse_response()` | 解析 `url` / `b64_json` 图片响应 |
+| `_prepare_generations_payload()` | 文生图请求体 |
+| `_prepare_edits_payload()` | 改图请求体，参考图转 `data URI` |
+| `_to_image_url()` | 统一把本地/URL/base64 输入转换为 xAI 可用图片引用 |
+
+### `api/minimax.py`
+
+MiniMax 图片生成官方 provider。
+
+| 接口 | 说明 |
+|------|------|
+| `MiniMaxProvider.build_request()` | 构造 `/v1/image_generation` JSON 请求 |
+| `MiniMaxProvider.parse_response()` | 解析 `data.image_urls` / `data.image_base64` 响应 |
+| `_prepare_payload()` | 组装模型、比例、生成数量、水印、提示词优化和参考图；根据 `resolution` 和 `aspect_ratio` 自动选择 `aspect_ratio` 或显式 `width`/`height` |
+| `_map_resolution()` | 供应商条目的 `resolution`（1K/2K/4K）映射为目标像素尺寸（4K 降级为 2048） |
+| `_compute_dimensions_from_ratio()` | 从 W:H 比例和目标长边计算 `width`/`height`，自动对齐 8 的倍数并钳制 512-2048 |
+| `_build_subject_reference()` | 构造 MiniMax `subject_reference` |
+| `_to_image_file()` | 参考图按配置透传 URL 或转为 `data URI` |
+
+### `api/doubao.py`
+
+火山引擎 Ark / 豆包 Seedream provider。
+
+| 接口 | 说明 |
+|------|------|
+| `DoubaoProvider.build_request()` | 构造 `endpoint_mode` 对应的 `/api/v3/images/generations` 或 `/api/plan/v3/images/generations` 请求 |
+| `DoubaoProvider.parse_response()` | 解析 URL/base64 响应并处理错误码 |
+| `_prepare_payload()` | 组装模型、尺寸、水印、输出格式、组图、参考图等参数；Seedream 5.0 Pro 自动禁用组图并限制参考图数量，推理点 ID 可通过 `model_capability` 声明能力 |
+| `_map_resolution()` | 将内部 `1K/2K/4K` 或具体尺寸映射为豆包尺寸 |
+| `_process_reference_images()` | 处理图生图参考图 |
+| `_build_api_error()` | 将豆包错误转为 `APIError` |
+
+### `api/sensenova.py`
+
+SenseNova（商汤日日新）provider，按模型分派：`sensenova-u1.5-lite`（文生图 + `/v1/images/edits` 编辑，32 倍数自由尺寸）与 `sensenova-u1-fast`（纯文生图，11 种固定尺寸；带参考图直接报错）。
+
+| 接口 | 说明 |
+|------|------|
+| `SenseNovaProvider.build_request()` | 按 u1.5 / u1-fast 分派文生图或编辑请求 |
+| `SenseNovaProvider.parse_response()` | 解析 `data[].url` / `data[].b64_json` 响应 |
+| `_resolve_size()` / `_resolve_u15_size()` | u1-fast 固定尺寸映射 / u1.5 档位+长宽比换算 32 倍数尺寸 |
+
+### `api/dashscope.py`
+
+DashScope（阿里云百炼）provider，接入原生 multimodal-generation 同步端点，支持 wan2.7 / qwen-image-2.0 / qwen-image-3.0 系列（文生图 + 多图编辑）与 z-image-turbo（纯文生图）；返回 URL 24 小时过期，故解析时强制下载落盘。
+
+| 接口 | 说明 |
+|------|------|
+| `DashScopeProvider.build_request()` | 构造 `input.messages` + `parameters` 请求，按模型门控参数 |
+| `DashScopeProvider.parse_response()` | 解析 `output.choices[].message.content[].image`，立即下载落盘 |
+| `_resolve_size()` | preset 档位+比例查官方推荐表或按像素预算推算，custom 直接透传 |
+| `_build_api_error()` | 将 DashScope 错误码转为带重试语义的 `APIError` |
+
+### `api/stepfun.py`
+
+StepFun provider。
+
+| 接口 | 说明 |
+|------|------|
+| `StepfunProvider.build_request()` | 根据是否有参考图选择 `/v1/images/generations` 或 `/v1/images/edits` |
+| `StepfunProvider.parse_response()` | 解析 StepFun 图像响应 |
+| `_is_temp_cache_url()` | 判断是否为需立即下载的临时缓存 URL |
+
+## 图像生成与 LLM Tool
+
+### `image_generator.py`
+
+| 接口 | 说明 |
+|------|------|
+| `ImageGenerator(...)` | 核心图像生成处理器 |
+| `update_config(**kwargs)` | 热更新配置字段 |
+| `generate_image_core(...)` | 不直接发送消息；支持供应商/模型路由、请求级可选参数和图片数量，返回成功状态和生成结果 |
+| `get_request_stats()` | 返回当前异步任务最终成功的候选、重试和 token 统计 |
+
+返回格式：
+
+```python
+(True, (image_urls, image_paths, text_content, thought_signature))
+(False, "错误消息")
+```
+
+工具调用与指令调用统一使用插件 `total_timeout` 作为生成总上限；框架 `tool_call_timeout` 仅用于计算前台等待/转后台时机。
+
+### `llm_tools.py`
+
+| 接口 | 说明 |
+|------|------|
+| `GeminiImageGenerationTool` | AstrBot FunctionTool 实现（单图） |
+| `GeminiImageBatchTool` | AstrBot FunctionTool 实现（批量，参数 `tasks`） |
+| `GeminiImageGenerationTool.refresh_from_plugin()` | 根据当前插件配置刷新工具描述和参数 schema |
+| `GeminiImageGenerationTool.call()` | LLM Tool 调用入口 |
+| `_build_call_tool_result()` | 将图片结果封装为仅文本的 `CallToolResult`，只列本地路径或 URL，不内联图片数据 |
+| `ToolBackgroundDelivery` / `ToolBatchDelivery` | `v2_tool_delivery.py` 中承接 v2 调度器后台完成/失败投递并反向激活主 Agent |
+
+核心工具参数包括：
+
+```text
+单图：prompt + template + references + model + resolution + aspect_ratio + options + deliver
+
+批量（gemini_image_batch）：tasks[].name/prompt/image_count
++ 顶层默认值（model、template、references、resolution、aspect_ratio、options）
+```
+
+### `provider_capabilities.py` / `llm_query_tools.py`
+
+- `candidate_capability()` 是模型生成模式、请求参数和原生批量上限的运行时事实来源。
+- `select_candidates()` 必须保持配置顺序；显式路由或参数不匹配时不得回退到过滤范围外。
+- 默认查询只返回供应商、原始模型、别名和生成模式，`detail=true` 才返回生图工具实际接受的模型参数。
+
+### `background_tasks.py` / `batch_generation.py`
+
+- 后台记录按 `unified_msg_origin` 隔离并落盘，重启时将未完成任务标记为 `interrupted`。
+- 批量任务以命名条目为并发单位；条目内部遵循供应商原生单次上限并在返回不足时继续补齐。
+- 最终发送保持输入顺序，任务状态区分 `succeeded`、`partial_success`、`failed` 和 `interrupted`。
+
+### WebUI 创作台（`generation_tracker.py` / `web_studio_service.py` / `web_api.py`）
+
+- `GenerationTracker`：全来源（指令/LLM 工具/LLM 批量/工作台）生成记录，创建即落盘 `generation_history.json`，SSE 有界队列扇出（快照+增量+resync）；`begin/update/complete/fail` + `import_legacy`（启动迁入存量图）+ `tracking_context`（ContextVar 传播批量父子关系）。记录含 `source_urls`：持久 http(s) 源链接经 `is_temp_cache_url` 过滤、去重、上限 20 条/2048 字符；写入及 API 读取均去掉 query、fragment 与 userinfo，旧记录只在响应中脱敏、不回写磁盘。
+- `WebStudioService`：工作台生成编排（全局并发准入、循环补足目标张数、partial_success）、gallery 归档（本地复制/远程流式下载、容量整组淘汰）、上传校验与运行租约（流式截断+魔数+像素+配额，父子任务引用计数保护过期清理和容量淘汰）、`capabilities()` 扁平候选列表（白名单字段）。工作台任务归档成功或失败都记录脱敏源 URL（仅供追溯，签名参数不再保留）；批量父任务聚合子任务 `source_urls`。
+- 指令/LLM 路径的归档只是历史副本（图片按原始来源发送）：`TrackerProjection` 与 `record_generation_success` 在归档异常或不完整时记 `partial_success` 并用 `update(error=…)` 注明原因，不再 fail，同时把交付源里的 http(s) URL 写入 `source_urls`；仅工作台路径（投递依赖画廊）归档失败才 fail。归档远程下载超时 30s（与发送侧网络条件一致），逐跳执行出站检查，最多手动重定向 3 次。
+- `WebStudioAPI`：薄 HTTP 适配层，路由前缀 `/astrbot_plugin_gemini_image_generation/webui/`，标准 `{status/data}` 信封；注册时统一检查宿主身份、面板/API Key 授权与 POST CSRF 头；图片经 `image_b64` 端点走 bridge 传输（插件页 iframe 为不透明源沙箱，`<img>` 直连不带 Cookie 必 401）。
+- JSON 请求体超限由端点经 `_service_error()` 保留 413（生成、偏好保存、历史删除）；JSON 解析或结构校验失败仍为 400。
+- 工作台参数弹窗使用独立 `GenerationSettingsEditor` 草稿，确认后才替换已应用参数并记忆；关闭、取消、模型切换或销毁均丢弃草稿。确认态编辑器离屏保存，不随长表单撑开侧栏；旧 `expanded` 偏好不再控制界面。
+- `ProviderConfigService`（`studio_providers.py`）：`GET/POST webui/providers` 只读写供应商配置，schema 驱动表单与按条目身份保留密钥，和限流页共用保存锁；不把缺省值补写到原始条目。
+- 配置响应使用 `Cache-Control: no-store`，`values` 不返回 Key 原文，`secrets.api_keys` 仅提供数量与末 4 位掩码预览；修改统一走 keep/replace/append/clear，后端仍兼容旧数组提交并稳定去重。
+- `VisionProviderDirectory`（`studio_vision_providers.py`）只投影本体 LLM 配置的 ID/模型/来源/加载状态，`GET webui/vision-providers` 支持独立刷新，不返回本体凭据。
+- `ModelCatalogService`（`model_catalog.py`）由 `ProviderSpec.model_catalog_kind` 声明协议，独立会话与任务负责限时、限流、分页、响应边界及卸载取消；`POST webui/providers/models` 使用连接草稿并在发请求前执行共享出站检查，视觉查询只借用本体实例。
+- 本体 bridge 错误只传字符串；模型查询的目标确认以成功信封中的 `confirmation_required`/`target` 传递，未确认不发请求。输入的重复 blur/change 不重建目录按钮，避免首次点击失效。
+- `ProviderRuntime`（`provider_runtime.py`）：命令、LLM、Studio 与 API 生成的同步准入门，兼顾已挂入但尚未执行的后台任务；卸载先封门并等待配置事务。
+- `StudioTemplateService`（`studio_templates.py`）：提示词广场的模板增删改、恢复内置默认、AI 可用开关与 JSON 包导入导出，以及在线检索、同步、导入为本地副本、上传（先预览后发送）与密钥操作；预览图由画廊图复制进 `template_assets/`，不参与画廊容量清理，删除模板时一并清理。
+- `HubTemplateSource`（`template_hub.py`）：在线模板源客户端，只实现 `TemplateSource` 协议与目录快照下载；URL 拼接强制 https 并丢弃空查询值，请求经 `check_outbound_url`，错误按 429/401/403/5xx/其他 4xx 分别映射，密钥只进 `Authorization` 头。
+- `TemplateHubCache`（`template_cache.py`）：目录快照本地缓存，按 ETag 哈希增量同步（首次直连下载、以响应自带 ETag 为准）、原子写 `template_hub_cache.json`、坏记录逐条跳过；本地加权检索（名称/标签/说明/正文 = 3/2/1.5/1，中文子串匹配），解析 `hub:<id>`。
+- `ProviderApplication`（`provider_application.py`）：空闲窗口预构建配置和工具能力，关闭闲置会话后保存、应用或回滚客户端及模块引用，保留共享 `cfg` 身份。
+- `KeyManager.clone_for_config()`：先严格恢复并持久化用量检查点，再重建候选索引；`api_key_usage.__shared_keys_v1` 按供应商类型、Key 保存计数，兼容原候选桶，排序和重启不会重置用量。
+- `pages/studio/provider-config.js/css`：独立、懒加载的二级 Tab 配置视图；表格与弹窗分离，密钥草稿只留内存，Pointer Events 手柄提供鼠标／触摸排序及键盘替代。
+- `editor.keys` 独立维护密钥管理草稿，替换当前弹窗主体而不叠加 Modal；批量导入、行编辑、取消与完成分层处理。返回条目时仅确认的 Key 变更写入 `editor.entry`，并丢弃过期模型目录结果。
+- 模型目录的 OpenAI 协议同时用于 Agnes AI、MiniMax、阶跃星辰、ModelScope；识别 MiniMax `/image_generation` 完整路径并保留套餐/网关前缀，不改变生成端点或构造静态模型列表。
+
+### `thought_signature.py`
+
+| 接口 | 说明 |
+|------|------|
+| `log_thought_signature_debug(label, thought_signature)` | 仅输出受限长度的调试信息，避免大字段污染日志或上下文 |
+
+## 图片收集、头像和发送
+
+### `image_handler.py`
+
+| 接口 | 说明 |
+|------|------|
+| `ImageHandler(api_client=None, max_reference_images=6)` | 图片收集和过滤处理器 |
+| `update_config(api_client=None, max_reference_images=None)` | 热更新配置 |
+| `is_valid_base64_image_str(value)` | 判断字符串是否为有效图片 base64 |
+| `filter_valid_reference_images(images, source)` | 过滤 URL/data URI/base64 形式的参考图 |
+| `download_qq_image(url, event=None)` | QQ/nt.qq/qpic 图片特殊下载逻辑 |
+| `fetch_images_from_event(event, include_at_avatars=False)` | 从当前消息、引用消息、合并转发、@ 头像中收集图片 |
+| `clean_text_content(text)` | 清理消息文本中的图片标记 |
+
+`fetch_images_from_event()` 返回：
+
+```python
+(message_images, avatar_images)
+```
+
+### `avatar_handler.py`
+
+| 接口 | 说明 |
+|------|------|
+| `AvatarHandler(auto_avatar_reference=False)` | 头像参考图处理器 |
+| `update_config(auto_avatar_reference)` | 热更新自动头像配置 |
+| `get_avatar_reference(event)` | 获取发送者或 @ 用户头像，返回 base64/data URL 列表 |
+| `should_use_avatar(event)` | 判断是否启用头像参考 |
+| `should_use_avatar_for_prompt(event, prompt)` | 结合提示词和 @ 用户判断是否启用头像 |
+| `prompt_contains_avatar_keywords(prompt)` | 判断提示词是否包含头像关键词 |
+| `parse_mentions(event)` | 从消息组件解析 @ 用户 ID |
+
+### `message_sender.py`
+
+| 接口 | 说明 |
+|------|------|
+| `MessageSender(enable_text_response=False, max_inline_image_size_mb=2.0, napcat_stream_threshold_mb=2.0, show_duration_stats=True, show_retry_stats=True, show_token_usage_stats=True)` | 消息发送处理器 |
+| `update_config(enable_text_response=None, max_inline_image_size_mb=None, napcat_stream_threshold_mb=None, show_duration_stats=None, show_retry_stats=None, show_token_usage_stats=None)` | 热更新发送配置 |
+| `is_aioqhttp_event(event)` | 判断是否为 aiocqhttp 平台 |
+| `safe_send(event, payload)` | 发送失败时兜底返回错误提示 |
+| `send_api_duration(event, api_duration, send_duration=None, retry_count=0, retry_note=None, token_usage=None)` | 发送耗时、重试次数和可用 token 用量统计 |
+| `clean_text_content(text)` | 移除 Markdown 图片等不可发送内容 |
+| `strip_known_image_refs(text, image_refs)` | 从文本中移除已识别图片引用，避免重复发送 |
+| `prepare_text_content(text, image_refs=None)` | 统一清理待发送文本 |
+| `merge_available_images(image_urls, image_paths)` | URL 与本地路径合并去重，URL 优先 |
+| `build_forward_image_component(image, force_base64=False)` | 构造 AstrBot 图片组件 |
+| `dispatch_send_results(...)` | 按单图、多图、合并转发策略发送结果 |
+| `send_results_with_stream_retry(...)` | 发送失败时筛选达到阈值的本地图片，调用 `upload_file_stream()` 后重试 |
+
+## 表情包切分与视觉识别
+
+### `image_splitter.py`
+
+| 接口 | 说明 |
+|------|------|
+| `LegacySmartMemeSplitter` | 旧版边缘/网格检测器 |
+| `SmartMemeSplitter` | 当前智能表情包网格检测器 |
+| `AIMemeSplitter` | 根据指定行列进行视觉辅助切分 |
+| `ai_split_with_rows_cols(image_path, rows, cols, output_dir, file_prefix, base_image)` | 使用行列数执行切分 |
+| `resolve_split_source_to_path(source, image_input_mode="force_base64", api_client=None, download_qq_image_fn=None, logger_obj=logger)` | 将切图输入源解析为本地路径 |
+| `split_image(image_path, rows=6, cols=4, output_dir=None, bboxes=None, manual_rows=None, manual_cols=None, use_sticker_cutter=False, ai_rows=None, ai_cols=None)` | 切图主入口 |
+| `create_zip(files, output_filename=None)` | 打包切图文件 |
+
+`split_image()` 优先级：
+
+```text
+bboxes -> manual_rows/manual_cols -> ai_rows/ai_cols -> 自适应贴纸切分 -> SmartMemeSplitter -> StickerCutter fallback
+```
+
+### `sticker_cutter.py`
+
+| 接口 | 说明 |
+|------|------|
+| `Region` | 检测区域数据类，包含 `box`、`area`、`center`、`is_main` |
+| `StickerCutter` | 主体 + 附件吸附切分算法 |
+| `AdaptiveStickerSplitter` | 自适应黑描边贴纸切分器，优先输出透明裁剪图 |
+| `StickerCutter.process_image(img, debug=False)` | 先尝试 `AdaptiveStickerSplitter`，失败后回退主体吸附算法，返回裁剪图和调试图 |
+
+`StickerCutter` 内部流程：
+
+```text
+_prepare_foreground()
+  -> _find_all_regions()
+  -> _classify_regions()
+  -> _attach_regions()
+  -> _suppress_overlapping()
+  -> _convert_to_transparent()
+```
+
+### `vision_handler.py`
+
+| 接口 | 说明 |
+|------|------|
+| `VisionHandler(context, api_client=None, vision_provider_id="", vision_model="", enable_llm_crop=True, sticker_bbox_rows=6, sticker_bbox_cols=4)` | 视觉识别处理器 |
+| `update_config(...)` | 热更新视觉识别配置 |
+| `extract_llm_text(resp)` | 从 AstrBot LLMResponse 中提取文本 |
+| `inject_vision_system_prompt(event, req)` | 给视觉裁剪请求注入 system prompt |
+| `llm_detect_and_split(image_path)` | 使用视觉 LLM 返回裁剪框后调用 `split_image()` |
+| `detect_grid_rows_cols(image_path)` | 使用视觉模型识别网格行列 |
+
+## 提示词和帮助页
+
+### `enhanced_prompts.py`
+
+| 接口 | 说明 |
+|------|------|
+| `enhance_prompt_for_gemini(prompt)` | 兼容保留，目前直接返回原提示词 |
+| `get_avatar_prompt(prompt)` | 头像快速模式提示词 |
+| `get_poster_prompt(prompt)` | 海报快速模式提示词 |
+| `get_wallpaper_prompt(prompt)` | 壁纸快速模式提示词 |
+| `get_card_prompt(prompt)` | 卡片快速模式提示词 |
+| `get_mobile_prompt(prompt)` | 手机壁纸快速模式提示词 |
+| `get_sticker_prompt(prompt="", rows=4, cols=4)` | 中文表情包提示词 |
+| `get_q_version_sticker_prompt(prompt="", rows=4, cols=4)` | 英文 Q 版表情包提示词 |
+| `get_figure_prompt(prompt, style_type=1)` | 手办化提示词，`1` 为 PVC，`2` 为树脂 GK |
+| `enhance_prompt_for_figure(prompt)` | 兼容旧接口，等价于 `get_figure_prompt(prompt, 1)` |
+| `get_generation_prompt(prompt)` | 普通生图提示词 |
+| `get_modification_prompt(prompt)` | 改图提示词 |
+| `get_auto_modification_prompt(prompt)` | 快捷模式自动改图提示词 |
+| `get_style_change_prompt(style, prompt="")` | 风格转换提示词 |
+| `get_sticker_bbox_prompt(rows=6, cols=4)` | 视觉裁剪框识别提示词 |
+| `get_vision_crop_system_prompt()` | 视觉裁剪 system prompt |
+| `get_grid_detect_prompt()` | 网格行列识别提示词 |
+| `build_quick_prompt(prompt, skip_figure_enhance=False)` | 快捷模式统一提示词构建，返回 `(enhanced_prompt, is_modification_request)` |
+
+### `help_renderer.py`
+
+| 接口 | 说明 |
+|------|------|
+| `ensure_font_downloaded()` | local 渲染模式下确保中文字体可用 |
+| `get_template_path(templates_dir, theme_settings, extension=".html")` | 按主题配置选择帮助页模板 |
+| `render_text(template_data)` | 纯文本帮助页 |
+| `render_local_pillow(templates_dir, theme_settings, template_data)` | 使用 Pillow 渲染帮助页图片，返回 bytes |
+
+## 限流、Key 管理和工具函数
+
+### `rate_limiter.py`
+
+| 接口 | 说明 |
+|------|------|
+| `RateLimiter(config, get_kv=None, put_kv=None)` | 全局与 UMO 滑动窗口，首次恢复与双额度扣减共用准入锁 |
+| `get_group_id_from_event(event)` / `allows_group(event)` | 群访问名单检查，不使用裸群号计数 |
+| `check_and_consume(event, cost=1)` | 保留聊天入口二元返回值，批量按逻辑子任务数消费 |
+| `acquire(umo, cost=1)` / `refund(token)` | 原子预留及启动失败回滚；Studio 传 `umo=None` 仅检查全局 |
+| `reset()` / `close()` | 清空状态／关闭准入并等待延迟计数落盘 |
+
+`limit_config.py` 统一 schema 加载与 WebUI 校验；`studio_limits.py` 负责窄范围配置保存、版本冲突、迁移备份和本体 UMO 查询（`ConversationV2.user_id` 与别名集合，仅投影身份，不读聊天正文）。Web API 的 `limits`（GET/POST）与 `sessions`（GET）沿用宿主鉴权及标准信封，保存不重载插件。新计数 KV 为 `rate_limit_buckets_v2`，旧群桶保留；旧规则与旧未过期计数采取显式迁移／窗口等待保护，详见 [配置说明](../docs/config.md#limit_settings)。
+
+群限制模式与名单通过同一个 `limits` 接口成对更新，旧客户端省略二者时不重置。保存后将名单转换为运行时 `set`；聊天准入在限流锁内复核访问权限，避免等待热保存期间仍按旧名单扣减放行。首次提交群访问字段另存 `group_access_config_backup.json`。
+
+`check_and_consume()` 返回：
+
+```python
+(True, None)
+(False, "提示消息")
+```
+
+### `key_manager.py`
+
+| 接口 | 说明 |
+|------|------|
+| `KeyUsageRecord` | 单个 Key 的使用记录 |
+| `ProviderKeyManager` | 单个 provider 的 Key 状态 |
+| `KeyManager(config, get_kv=None, put_kv=None)` | 全局 API Key 轮换和每日限额管理 |
+| `has_provider(api_type)` | 判断该 provider 是否有独立 Key 配置 |
+| `get_available_key(api_type)` | 获取并预扣指定 provider 的可用 Key |
+| `rotate_key(api_type)` | 轮换到下一个可用 Key |
+| `get_key_status(api_type)` | 返回 Key 数量、每日限额、今日使用量等状态 |
+
+### `reference_image.py`
+
+参考图输入归一化模块，负责 provider 发送前的 MIME/base64 标准化。
+
+| 接口 | 说明 |
+|------|------|
+| `normalize_reference_image_input()` | 将 data URI、base64、本地文件、file://、http(s) URL 统一为 `(mime_type, base64_data)` |
+| `coerce_reference_image_bytes()`、`coerce_reference_image()` | 将图片字节/base64 转成 provider 支持的 PNG/JPEG/WEBP/HEIC/HEIF |
+| `check_reference_image_cache()`、`save_reference_image_cache()` | 管理参考图下载缓存（位于 AstrBot 临时目录下的插件专属子目录，由 AstrBot 统一清理） |
+| `build_reference_image_headers()`、`is_qq_image_host()` | 构建参考图下载请求头并处理 QQ 图床特殊规则 |
+
+### `tl_utils.py`
+
+该文件是共享工具集合，接口较多，按职责分组如下。
+
+| 分组 | 主要接口 | 说明 |
+|------|----------|------|
+| 路径 | `get_plugin_data_dir()`、`get_temp_dir()`、`get_shared_temp_dir()` | 获取插件数据目录和 AstrBot 共享临时目录（临时文件由 AstrBot 统一清理） |
+| Base64 | `encode_file_to_base64()`、`save_base64_image()`、`is_valid_base64_image_str()` | 图片 base64 编码、保存和校验 |
+| 图片保存 | `save_image_stream()`、`save_image_data()`、`cleanup_image_cache_by_size()` | 下载流保存、二进制保存（聊天会话写入工作区 `astrbot_plugin_gemini_image_generation/` 子目录，其余写入插件 `images/`）；工作区按全部会话总量、插件目录按目录做容量清理 |
+| 图片源解析 | `collect_image_sources()`、`resolve_image_source_to_path()` | 从 AstrBot 事件或任意来源解析图片 |
+| QQ 头像 | `download_qq_avatar()`、`AvatarManager`、`download_qq_avatar_legacy()` | 头像下载（纯内存 base64，不落盘） |
+| NapCat Stream | `upload_file_stream()` | 复用当前 NapCat/OneBot 连接上传本地文件并返回可发送路径 |
+| 错误展示 | `format_error_message()` | 已迁移到 `tl/format_error.py`，此处保留 re-export shim 维持向后兼容 |
+
+注意事项：
+
+- `normalize_reference_image_input()` 是 API provider 处理参考图时的核心工具，通过 `GeminiAPIClient._normalize_reference_image_input()` 复用。
+- `resolve_image_source_to_path()` 是 `/切图` 将 URL/base64/data URI 转成本地文件的核心工具。
+- `AvatarManager` 负责头像获取，通常通过 `AvatarHandler` 或 `ImageHandler` 间接使用。
+- `upload_file_stream()` 只作为发送失败后的兜底路径使用，常规图片发送仍由 `MessageSender.dispatch_send_results()` 构造。
+
+### `session_image_dir.py`
+
+| 接口 | 说明 |
+|------|------|
+| `bind_session_image_dir(event, context)` / `reset_session_image_dir(token)` | 在生成入口按会话绑定/还原生成图保存目录（工作区下的 `astrbot_plugin_gemini_image_generation/` 子目录，位于框架本地文件发送白名单内），ContextVar 传播到后台任务；按 `computer_use_runtime` 对齐白名单根（local 用项目感知解析，其余用会话默认根） |
+| `current_session_image_dir()` | 返回已绑定目录；工作区解析失败时抛出不可重试 `APIError`（不落盘），未绑定返回 `None` |
+| `cleanup_session_images_by_size(max_size_mb)` | 按全部会话工作区插件名子目录的总量做容量清理（最旧优先），防跨会话累积 |
+
+### `format_error.py`
+
+| 接口 | 说明 |
+|------|------|
+| `format_error_message(error)` | 根据异常类型生成用户友好的中文错误提示（含 API Key、配额、超时、安全过滤等分类）。从 `tl_utils.py` 抽出，`tl_utils.format_error_message` 仍可用作 re-export |
+
+### `api_headers.py`
+
+| 接口 | 说明 |
+|------|------|
+| `extract_api_key_from_headers(headers)` | 从 `Authorization`/`x-goog-api-key`/`X-Api-Key`/`Api-Key` 等多种头格式中提取 Key |
+| `apply_api_key_to_headers(headers, api_key)` | 将 Key 写回所有匹配的头字段（原地修改），用于 Key 轮换 |
+
+## `tl/api/__init__.py` 与 `tl/__init__.py`
+
+| 文件 | 作用 |
+|------|------|
+| `tl/__init__.py` | 包初始化文件，重新导出常用类与函数（`PluginConfig`、`AvatarHandler`、`ImageHandler`、`MessageSender`、`split_image` 等） |
+| `tl/api/__init__.py` | 重新导出 `get_api_provider()`、`normalize_api_type()` |
+
+## 修改建议
+
+- 新增 API 供应商时，优先在 `tl/api/` 新增 provider，并在 `tl/provider_metadata.py` 增加 `ProviderSpec`；`api/registry.py` 只负责懒加载。
+- 只调整请求参数结构时，优先继承 `OpenAICompatProvider` 并覆盖 `_prepare_payload()`。
+- 新增配置项时，保持 `_conf_schema.json`、加载/消费路径及受影响文档一致；供应商特有行为才修改 `ProviderSpec`/hook，按实际行为补充或复用配置测试。
+- 修改 OpenAI Images 尺寸逻辑时，优先集中在 `openai_image_size.py`，避免 provider、LLM Tool、快速模式各自实现一套校验。
+- 修改发送结果格式时，同时检查 `MessageSender.dispatch_send_results()` 和 `llm_tools._build_call_tool_result()`。
+- 修改切图逻辑时，优先保持 `split_image()` 的优先级顺序稳定，避免影响 `/快速 表情包` 和 `/切图` 两条路径。
+
+开发环境、验证范围和提交整理规则见 [开发与验证](../docs/development.md)。

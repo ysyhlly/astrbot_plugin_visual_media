@@ -1,0 +1,11 @@
+# Validated Linux / Python 3.12 plugin dependency set. Not an AstrBot core lockfile.
+Pillow==12.3.0
+PyYAML==6.0.3
+quart==0.22.0
+RapidFuzz==3.14.6
+aiohttp-socks==0.12.0
+cryptography==50.0.1
+numpy==2.2.6
+opencv-python-headless==5.0.0.93
+scikit-image==0.26.0
+scipy==1.18.1

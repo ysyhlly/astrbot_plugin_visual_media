@@ -1,0 +1,18 @@
+name: astrbot_plugin_visual_media
+display_name: 视觉工坊
+desc: 独立集成表情收集检索、图片生成改图、角色参考和生成图收藏。
+version: 0.5.0-rc.1
+author: visual_media
+repo: https://github.com/ysyhlly/astrbot_plugin_visual_media
+astrbot_version: ">=4.29.4,<5"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - qq_official_webhook
+  - discord
+  - telegram
+  - weixin_oc
+
+views:
+  - name: workshop
+    title: 视觉工坊
