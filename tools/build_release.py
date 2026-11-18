@@ -6,7 +6,29 @@ import hashlib
 import json
 import re
 import zipfile
+import subprocess
 from pathlib import Path
+
+def release_metadata(root):
+    """Identify clean checkouts and preserve the commit recorded by git archive."""
+    raw = (root / "metadata.yaml").read_bytes()
+    marker = b"$Format:%H$"
+    if marker not in raw or not (root / ".git").exists():
+        return raw
+    try:
+        if subprocess.check_output(
+            ["git", "-C", str(root), "status", "--porcelain"], stderr=subprocess.DEVNULL, timeout=5
+        ).strip():
+            return raw
+        revision = subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "--verify", "HEAD"], stderr=subprocess.DEVNULL, timeout=5
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return raw
+    if len(revision) not in (40, 64) or any(c not in b"0123456789abcdef" for c in revision):
+        return raw
+    return raw.replace(marker, revision)
+
 
 ROOT_FILES = {
     "__init__.py",
@@ -88,6 +110,7 @@ def build(root: Path, output: Path):
     if not re.fullmatch(r"[0-9A-Za-z.+-]+", version):
         raise ValueError("Invalid release version")
     output.mkdir(parents=True, exist_ok=True)
+    metadata_raw = release_metadata(root)
     files = []
     for file in sorted(root.rglob("*")):
         rel = file.relative_to(root)
@@ -111,7 +134,7 @@ def build(root: Path, output: Path):
             or file.name.endswith("_config.json")
         ):
             raise ValueError("Runtime/private data found in source tree: " + str(rel))
-        raw = file.read_bytes()
+        raw = metadata_raw if rel.as_posix() == "metadata.yaml" else file.read_bytes()
         if file.suffix in {
             ".py",
             ".json",

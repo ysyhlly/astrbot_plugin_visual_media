@@ -95,10 +95,10 @@ async def test_character_delivery_precedes_async_check_and_only_mismatch_alerts(
     assert delivered_event.is_set()
     assert not sent_notices
 
-    # Unblock background verification and wait one yield for mismatch follow-up delivery.
+    # Wait for the task that persists the check and sends the follow-up.
     check_gate.set()
     await asyncio.wait_for(check_done.wait(), timeout=2.0)
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(asyncio.gather(*tuple(owner.library._check_tasks)), timeout=3.0)
     assert len(sent_notices) == 1
     assert "图1发色偏红" in "".join(sent_notices[0][1])
 
@@ -130,7 +130,7 @@ async def test_character_delivery_precedes_async_check_and_only_mismatch_alerts(
         }
     )
     await asyncio.wait_for(unknown_done.wait(), timeout=2.0)
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(asyncio.gather(*tuple(owner.library._check_tasks)), timeout=3.0)
     assert len(sent_notices) == 1
 
 
