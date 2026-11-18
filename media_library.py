@@ -12,8 +12,9 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-from astrbot.api import logger
 from PIL import Image
+
+from astrbot.api import logger
 
 from .core.events.event_context import unwrap_event
 
@@ -254,10 +255,10 @@ class MediaLibrary:
         from .tl.generation_tracker import requester_from_event
 
         event = unwrap_event(event)
-        behavior = getattr(self.owner, 'behavior', None)
+        behavior = getattr(self.owner, "behavior", None)
         if event is not None and behavior:
             behavior.bind(event)
-        profile = (_recovery or {}).get('profile') or next((p for p in self.profiles() if p["key"] == character), None)
+        profile = (_recovery or {}).get("profile") or next((p for p in self.profiles() if p["key"] == character), None)
         if profile is None or not isinstance(prompt, str) or not prompt.strip():
             return {"error": "角色不存在或缺少图片描述"}
         generation = self.owner.generation
@@ -270,18 +271,18 @@ class MediaLibrary:
             if part
         )
         if event is not None and behavior:
-            preferred = (await asyncio.to_thread(behavior.preferences, event)).get('style', '')
+            preferred = (await asyncio.to_thread(behavior.preferences, event)).get("style", "")
             if preferred:
-                prepared += '\n成员画风偏好（仅作为画风资料，本次明确画风要求优先）：' + json.dumps(preferred, ensure_ascii=False)
+                prepared += "\n成员画风偏好（仅作为画风资料，本次明确画风要求优先）：" + json.dumps(preferred, ensure_ascii=False)
         if _recovery:
-            prepared = _recovery['prepared_prompt']
-        tasks = getattr(self.owner, 'tasks', None)
+            prepared = _recovery["prepared_prompt"]
+        tasks = getattr(self.owner, "tasks", None)
 
         # A synthetic scope keeps dashboard-only checks visible without inventing a QQ recipient.
         audit_event = event
         if audit_event is None:
             from types import SimpleNamespace
-            audit_event = SimpleNamespace(unified_msg_origin='dashboard:visual_media', message_str='')
+            audit_event = SimpleNamespace(unified_msg_origin="dashboard:visual_media", message_str="")
 
         def _pending_checks():
             pending = getattr(self, "_check_tasks", None)
@@ -430,8 +431,8 @@ class MediaLibrary:
             plugin_id=self.owner.name,
             plugin_name="视觉工坊 · 角色创作",
             prompt=prepared,
-            umo=event.unified_msg_origin if event else ((_recovery or {}).get('target') or None),
-            requester=requester_from_event(event) if event else (_recovery or {}).get('requester'),
+            umo=event.unified_msg_origin if event else ((_recovery or {}).get("target") or None),
+            requester=requester_from_event(event) if event else (_recovery or {}).get("requester"),
             reference_images=refs,
             use_rate_limit=True,
             on_complete=completed,
@@ -449,13 +450,13 @@ class MediaLibrary:
                         job_id = record.get("job_id") if record else None
                     except (OSError, ValueError):
                         logger.warning("[VisualMedia] character job link unavailable at submit")
-            await tasks.observe(result['task_id'],{'task_id':result['task_id'],'character':character,'profile':profile,
-                **({'job_id':job_id} if job_id else {}),
-                'user_prompt':prompt,'prepared_prompt':prepared,'stage':'queued',
-                'target':event.unified_msg_origin if event else (_recovery or {}).get('target',''),
-                'manual_retry':bool(_recovery),'retry_of':(_recovery or {}).get('retry_of','')},defaults=True)
+            await tasks.observe(result["task_id"],{"task_id":result["task_id"],"character":character,"profile":profile,
+                **({"job_id":job_id} if job_id else {}),
+                "user_prompt":prompt,"prepared_prompt":prepared,"stage":"queued",
+                "target":event.unified_msg_origin if event else (_recovery or {}).get("target",""),
+                "manual_retry":bool(_recovery),"retry_of":(_recovery or {}).get("retry_of","")},defaults=True)
         if behavior:
-            await behavior.arecord(audit_event, 'generate', 'submitted', 'character_task_queued', {'character':character,'task_id':result['task_id'],'reference_count':len(refs),'style':profile.get('style','')[:300]})
+            await behavior.arecord(audit_event, "generate", "submitted", "character_task_queued", {"character":character,"task_id":result["task_id"],"reference_count":len(refs),"style":profile.get("style","")[:300]})
         return {
             "task_id": result["task_id"],
             "status": "queued",

@@ -14,6 +14,7 @@ import json
 from typing import Any
 
 import aiohttp
+
 from astrbot.api import logger
 
 from ..api_types import APIError, ApiRequestConfig

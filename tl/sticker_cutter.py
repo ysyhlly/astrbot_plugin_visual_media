@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
+
 from astrbot.api import logger
 
 # (x1, y1, x2, y2)

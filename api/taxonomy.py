@@ -14,6 +14,7 @@ from ..core.util.normalization import (
 )
 from ..core.util.safe_io import safe_remove_file
 
+
 class TaxonomyRoutes:
     # ── Categories ────────────────────────────────────────────
 
@@ -24,7 +25,7 @@ class TaxonomyRoutes:
 
     async def _categories_list(self):
         try:
-            cats = {key: 0 for key in self._get_category_keys()}
+            cats = dict.fromkeys(self._get_category_keys(), 0)
             for meta in self._get_index().values():
                 if isinstance(meta, dict):
                     c = str(meta.get("category", "unknown"))

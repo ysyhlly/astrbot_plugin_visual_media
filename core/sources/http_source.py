@@ -8,12 +8,17 @@ import ipaddress
 import json
 import re
 import socket
+from collections.abc import Mapping
 from pathlib import PurePosixPath
-from typing import Any, Mapping
+from typing import Any
 from urllib.parse import quote_plus, urljoin, urlsplit
 
-from .models import ExternalSourceError, ExternalSourceSecurityError, SourceInspection, SourceItem
-
+from .models import (
+    ExternalSourceError,
+    ExternalSourceSecurityError,
+    SourceInspection,
+    SourceItem,
+)
 
 _TUN_FAKE_IP_RANGE = ipaddress.ip_network("198.18.0.0/15")
 _SENSITIVE_HEADERS = frozenset({"authorization", "x-api-key"})

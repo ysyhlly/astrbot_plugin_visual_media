@@ -10,14 +10,13 @@ from unittest.mock import AsyncMock
 
 import numpy as np
 import pytest
-from PIL import Image
-
 from astrbot_plugin_visual_media import character_check
 from astrbot_plugin_visual_media.core.search.embedding_service import EmbeddingService
 from astrbot_plugin_visual_media.media_behavior import MediaBehavior
 from astrbot_plugin_visual_media.tl import background_dispatch
 from astrbot_plugin_visual_media.tools.build_release import build
 from astrbot_plugin_visual_media.world_reference_access import expected_directory
+from PIL import Image
 from test_media_behavior import candidate, event
 
 

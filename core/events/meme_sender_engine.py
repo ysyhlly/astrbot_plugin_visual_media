@@ -11,7 +11,7 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Image as MessageImage
 
 from ..processing.natural_emotion_analyzer import EmotionQuery
-from ..search.jev_selector import JevSelector, JevSelectionError
+from ..search.jev_selector import JevSelectionError, JevSelector
 from ..search.punctuation_emotion import punctuation_emotion_weights
 from .event_context import get_event_session_key
 

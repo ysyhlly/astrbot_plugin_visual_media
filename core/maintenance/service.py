@@ -7,11 +7,10 @@ from typing import TYPE_CHECKING
 
 from astrbot.api import logger
 
-from .retention import library_counts
 from ..db.index_manager import delete_index_paths
-
-from ..util.safe_io import safe_remove_file
 from ..util.normalization import canonicalize_path
+from ..util.safe_io import safe_remove_file
+from .retention import library_counts
 
 if TYPE_CHECKING:
     from ...main import Main  # noqa: F401

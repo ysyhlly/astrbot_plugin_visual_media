@@ -6,8 +6,8 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
-from ..util.blacklist import add_blacklist_hash
 from ..db.index_manager import delete_index_paths
+from ..util.blacklist import add_blacklist_hash
 from ..util.meme_presentation import image_display_title, image_source_label
 from ..util.normalization import normalize_scope_mode
 from ..util.safe_io import safe_remove_file

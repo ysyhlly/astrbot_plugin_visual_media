@@ -189,9 +189,9 @@ class EmbeddingService:
         return 0
 
     def _provider_identity(self, provider) -> str:
-        model = provider.get_model() if callable(getattr(provider, 'get_model', None)) else ''
-        cfg = getattr(provider, 'provider_config', {})
-        endpoint = cfg.get('embedding_api_base', '') if isinstance(cfg, dict) else ''
+        model = provider.get_model() if callable(getattr(provider, "get_model", None)) else ""
+        cfg = getattr(provider, "provider_config", {})
+        endpoint = cfg.get("embedding_api_base", "") if isinstance(cfg, dict) else ""
         return json.dumps([type(provider).__module__, type(provider).__qualname__,
                            self._extract_provider_id(provider), model, endpoint,
                            self._get_provider_dim(provider)], ensure_ascii=False)
@@ -208,14 +208,14 @@ class EmbeddingService:
         self._observed_identity, self._observed_dim = identity, dimension
         self._provider_dim = dimension
         if (first or changed) and self._get_provider_dim(provider) != dimension:
-            logger.info(f'[Embedding] 使用模型实际维度 {dimension}（面板填写 {self._get_provider_dim(provider)}）')
+            logger.info(f"[Embedding] 使用模型实际维度 {dimension}（面板填写 {self._get_provider_dim(provider)}）")
         if changed:
             self._retire_faiss()
             self.invalidate_cache()
-            db = getattr(self.plugin, 'db_service', None)
+            db = getattr(self.plugin, "db_service", None)
             if db is not None:
                 self._schedule_db_refresh(db)
-            raise ValueError('嵌入输出维度已变化，已安排后台重建')
+            raise ValueError("嵌入输出维度已变化，已安排后台重建")
 
     def _schedule_db_refresh(self, db: Any) -> None:
         """Queue full search refresh off the event loop when a loop is running."""
@@ -274,17 +274,17 @@ class EmbeddingService:
             self._retire_faiss()
             await self._close_retired_faiss()
             self.invalidate_cache()
-            await EmbeddingProviderAdapter(self, provider).get_embedding('表情包')
+            await EmbeddingProviderAdapter(self, provider).get_embedding("表情包")
             if self._provider_identity(provider) != identity:
-                self._observed_identity = ''
-                raise ValueError('嵌入模型在请求期间发生变化')
-            db = getattr(self.plugin, 'db_service', None)
+                self._observed_identity = ""
+                raise ValueError("嵌入模型在请求期间发生变化")
+            db = getattr(self.plugin, "db_service", None)
             if db is not None:
                 signature = self._fallback_signature(provider)
-                previous = await asyncio.to_thread(db.get_meta_value, 'embedding_active_signature')
+                previous = await asyncio.to_thread(db.get_meta_value, "embedding_active_signature")
                 if previous != signature:
                     await asyncio.to_thread(db.enqueue_search_refresh, db.get_all_paths())
-                    await asyncio.to_thread(db.set_meta_value, 'embedding_active_signature', signature)
+                    await asyncio.to_thread(db.set_meta_value, "embedding_active_signature", signature)
 
     # ═══════════════════════════════════════════════════
     #  可用性
@@ -320,6 +320,7 @@ class EmbeddingService:
 
         try:
             import faiss  # noqa: F401
+
             from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
         except ImportError:
             logger.info("[Embedding] faiss 未安装，降级 numpy")
@@ -328,14 +329,14 @@ class EmbeddingService:
 
         try:
             data_dir = self._resolve_data_dir()
-            signature = self._fallback_signature(provider).split(':')[-1][:24]
+            signature = self._fallback_signature(provider).split(":")[-1][:24]
             db_path = f"{data_dir}/emoji_faiss_{signature}.db"
             index_path = f"{data_dir}/emoji_faiss_{signature}.index"
             needs_backfill = not Path(db_path).is_file() or not Path(index_path).is_file()
 
             self._faiss_db = FaissVecDB(db_path, index_path, EmbeddingProviderAdapter(self, provider))
             if needs_backfill:
-                db = getattr(self.plugin, 'db_service', None)
+                db = getattr(self.plugin, "db_service", None)
                 if db is not None:
                     self._schedule_db_refresh(db)
             self._faiss_available = True
@@ -527,7 +528,7 @@ class EmbeddingService:
         try:
             await self._ensure_provider_ready()
         except Exception as exc:
-            self.warning_rate_limited("probe", f'[Embedding] 模型检测等待重试: {exc}')
+            self.warning_rate_limited("probe", f"[Embedding] 模型检测等待重试: {exc}")
             return False
 
         text = self._build_search_text(entry)

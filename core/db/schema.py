@@ -5,7 +5,6 @@ import sqlite3
 from astrbot.api import logger
 
 
-
 class DatabaseSchema:
     def _init_schema(self) -> None:
         """初始化数据库表结构。"""

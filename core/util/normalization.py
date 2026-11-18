@@ -8,7 +8,6 @@ import posixpath
 import re
 from typing import Any
 
-
 _METADATA_SEPARATOR_RE = re.compile(r"[,，、;；\n\t]+")
 _CSV_SEPARATOR_RE = re.compile(r",")
 _CATEGORY_KEY_RE = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")

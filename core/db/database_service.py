@@ -4,23 +4,21 @@
 import asyncio
 import json
 import sqlite3
-import time
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
 
-from ..util.normalization import canonicalize_path, normalize_label_list
 from ..processing.semantic_schema import SEARCH_METADATA_FIELDS
-
-
-from .schema import DatabaseSchema
-from .source_repository import SourceRepository
+from ..util.normalization import canonicalize_path, normalize_label_list
+from .embedding_repository import EmbeddingRepository
 from .library_queries import LibraryQueries
 from .pending_repository import PendingRepository
-from .embedding_repository import EmbeddingRepository
+from .schema import DatabaseSchema
+from .source_repository import SourceRepository
 
 
 class DatabaseService(

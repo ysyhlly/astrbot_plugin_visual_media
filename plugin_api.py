@@ -7,27 +7,30 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-
 from astrbot.api import logger
 
-from .core.util.blacklist import add_blacklist_hash
+from .api.external_sources import ExternalSourceRoutes
+from .api.image_mutations import ImageMutationRoutes
+from .api.library import LibraryRoutes
+from .api.maintenance import MaintenanceRoutes
+from .api.pending import PendingRoutes
+from .api.preferences import PreferenceRoutes
+from .api.taxonomy import TaxonomyRoutes
 from .core.db.index_manager import refresh_search_entry
 from .core.processing.semantic_schema import SEARCH_METADATA_FIELDS
+from .core.util.blacklist import add_blacklist_hash
 from .core.util.normalization import (
     canonicalize_path,
     normalize_character_key,
     normalize_label_list,
     normalize_scope_mode,
 )
-from .core.util.safe_io import commit_image_file, safe_remove_file, unique_image_path, write_image_file
-
-from .api.library import LibraryRoutes
-from .api.preferences import PreferenceRoutes
-from .api.external_sources import ExternalSourceRoutes
-from .api.pending import PendingRoutes
-from .api.image_mutations import ImageMutationRoutes
-from .api.maintenance import MaintenanceRoutes
-from .api.taxonomy import TaxonomyRoutes
+from .core.util.safe_io import (
+    commit_image_file,
+    safe_remove_file,
+    unique_image_path,
+    write_image_file,
+)
 
 PLUGIN_NAME = "astrbot_plugin_visual_media"
 
@@ -406,7 +409,7 @@ class PluginAPI(
             known = {c["key"] for c in result}
             for cat_key, count in counts.items():
                 if cat_key not in known:
-                    result.append({"key": cat_key or '', "name": cat_key or '待识图', "count": count})
+                    result.append({"key": cat_key or "", "name": cat_key or "待识图", "count": count})
         result.sort(key=lambda x: x["count"], reverse=True)
         return result
 

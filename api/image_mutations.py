@@ -13,6 +13,7 @@ from astrbot.api import logger
 from ..core.db.index_manager import delete_index_paths
 from ..core.util.safe_io import safe_remove_file
 
+
 class ImageMutationRoutes:
     # ── Upload / Update / Delete ──────────────────────────────
 

@@ -6,16 +6,15 @@ from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
 
 import pytest
-
-from astrbot_plugin_visual_media.media_settings import MediaSettings
-from astrbot_plugin_visual_media.media_behavior import MediaBehavior
-from astrbot_plugin_visual_media.media_runtime import MediaRuntime
-from astrbot_plugin_visual_media.media_receipts import image_receipt
 from astrbot_plugin_visual_media.character_check import (
     check_character,
     parse_check_response,
 )
-from test_media_behavior import event, candidate
+from astrbot_plugin_visual_media.media_behavior import MediaBehavior
+from astrbot_plugin_visual_media.media_receipts import image_receipt
+from astrbot_plugin_visual_media.media_runtime import MediaRuntime
+from astrbot_plugin_visual_media.media_settings import MediaSettings
+from test_media_behavior import candidate, event
 
 
 @pytest.mark.parametrize(
@@ -295,6 +294,7 @@ def test_zero_version_upgrade_keeps_existing_rows_and_future_version_fails(tmp_p
 
 def test_faiss_missing_falls_back_to_numpy(monkeypatch):
     import builtins
+
     from astrbot_plugin_visual_media.core.search.embedding_service import (
         EmbeddingService,
     )

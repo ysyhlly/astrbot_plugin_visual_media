@@ -12,11 +12,16 @@ from astrbot.api.event import AstrMessageEvent
 
 from ..events.emoji_delivery import send_qq_image_as_sticker
 from ..events.event_context import get_event_platform_name, unwrap_event
-
-from .text_similarity import calculate_hybrid_similarity, tokenize_for_bm25, _extract_words, _has_negation_prefix
-from .embedding_service import EmbeddingService
 from ..util.normalization import canonicalize_path
+from .embedding_service import EmbeddingService
 from .search_features import entry_category, parse_tags, prepare_entry_text_features
+from .text_similarity import (
+    _extract_words,
+    _has_negation_prefix,
+    calculate_hybrid_similarity,
+    tokenize_for_bm25,
+)
+
 
 class MemeSmartSelectService:
     """负责智能选择表情包。"""

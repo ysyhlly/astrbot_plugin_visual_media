@@ -1,6 +1,7 @@
 """Keep SDK vector storage while pacing requests and reporting observed dimensions."""
 
 import asyncio
+
 import numpy as np
 
 from ..util.model_requests import is_rate_limited, model_request_gate
@@ -31,7 +32,7 @@ class EmbeddingProviderAdapter:
     def _validate(self, vectors):
         array = np.asarray(vectors, dtype=np.float32)
         if array.ndim != 2 or not array.shape[0] or not array.shape[1] or not np.isfinite(array).all():
-            raise ValueError('嵌入模型返回了无效向量')
+            raise ValueError("嵌入模型返回了无效向量")
         self.service._record_dimension(self.provider, array.shape[1])
         return array.tolist()
 
@@ -39,17 +40,17 @@ class EmbeddingProviderAdapter:
         identity = self.service._provider_identity(self.provider)
         vector = await self._request(lambda: self.provider.get_embedding(text))
         if identity != self.service._provider_identity(self.provider):
-            raise ValueError('嵌入模型在请求期间发生变化')
+            raise ValueError("嵌入模型在请求期间发生变化")
         return self._validate([vector])[0]
 
     async def get_embeddings(self, texts):
-        if callable(getattr(self.provider, 'get_embeddings', None)):
+        if callable(getattr(self.provider, "get_embeddings", None)):
             identity = self.service._provider_identity(self.provider)
             vectors = await self._request(lambda: self.provider.get_embeddings(texts))
             if identity != self.service._provider_identity(self.provider):
-                raise ValueError('嵌入模型在请求期间发生变化')
+                raise ValueError("嵌入模型在请求期间发生变化")
             if len(vectors) != len(texts):
-                raise ValueError('嵌入模型返回的向量数量与请求不一致')
+                raise ValueError("嵌入模型返回的向量数量与请求不一致")
             return self._validate(vectors)
         return [await self.get_embedding(text) for text in texts]
 
@@ -57,7 +58,7 @@ class EmbeddingProviderAdapter:
         # Reuse the framework's batch implementation with one task and one outer
         # attempt: shared pacing/retries already happen inside get_embeddings.
         from astrbot.core.provider.provider import EmbeddingProvider
-        batch = getattr(EmbeddingProvider, 'get_embeddings_batch', None)
+        batch = getattr(EmbeddingProvider, "get_embeddings_batch", None)
         if callable(batch):
             return await batch(self, texts, batch_size=batch_size, tasks_limit=1,
                                max_retries=1, progress_callback=progress_callback)

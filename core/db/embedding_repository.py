@@ -5,8 +5,6 @@ import time
 from typing import Any
 
 
-
-
 class EmbeddingRepository:
     def get_search_refresh_generations(self, paths: list[str]) -> dict[str, int]:
         generations = {}

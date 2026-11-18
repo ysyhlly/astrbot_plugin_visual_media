@@ -1,13 +1,15 @@
 """Build private install/source archives from an explicit allowlist (no publishing)."""
 
 from __future__ import annotations
+
 import argparse
 import hashlib
 import json
 import re
-import zipfile
 import subprocess
+import zipfile
 from pathlib import Path
+
 
 def release_metadata(root):
     """Identify clean checkouts and preserve the commit recorded by git archive."""

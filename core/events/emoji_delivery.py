@@ -21,10 +21,11 @@ async def send_qq_image_as_sticker(
     if not getattr(plugin, "send_meme_as_qq_sticker", True):
         return False
     try:
+        from aiocqhttp.exceptions import ActionFailed
+
         from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
             AiocqhttpMessageEvent,
         )
-        from aiocqhttp.exceptions import ActionFailed
     except ImportError:
         return False
     if not isinstance(event, AiocqhttpMessageEvent):

@@ -3,24 +3,24 @@
 import json
 import time
 
-
 import pytest
 
 pytest.importorskip("astrbot_plugin_chat_dynamics")
+from astrbot_plugin_chat_dynamics.core.agent_bridge import AstrBotAgentBridge
 from astrbot_plugin_chat_dynamics.integration.test_persona_agent import (
     host_fixture as host_fixture,
 )
-from astrbot_plugin_chat_dynamics.core.agent_bridge import AstrBotAgentBridge
-from astrbot.core.provider.entities import LLMResponse
+from astrbot_plugin_visual_media.core.tools import joint_prefetch
+from test_media_library import generated
+
 from astrbot.core.pipeline.context_utils import call_event_hook as real_hook
+from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.star.star import StarMetadata, star_map
 from astrbot.core.star.star_handler import (
     EventType,
     StarHandlerMetadata,
     StarHandlerRegistry,
 )
-from astrbot_plugin_visual_media.core.tools import joint_prefetch
-from test_media_library import generated
 
 
 @pytest.mark.asyncio
@@ -41,8 +41,8 @@ async def test_native_four_mode_plan(
     owner, host_fixture, monkeypatch, mode, has_candidates, poke_supported
 ):
     """Exercise the actual request hook, native runner and response parser together."""
-    from astrbot.core.pipeline import context_utils
     from astrbot.core import astr_agent_hooks
+    from astrbot.core.pipeline import context_utils
 
     ctx, event, calls = host_fixture
     if mode == "poke":
@@ -152,8 +152,8 @@ async def test_native_four_mode_plan(
 async def test_cd_native_bridge_invokes_real_visual_hook(
     owner, host_fixture, monkeypatch, text, wants_meme
 ):
-    from astrbot.core.pipeline import context_utils
     from astrbot.core import astr_agent_hooks
+    from astrbot.core.pipeline import context_utils
 
     ctx, e, calls = host_fixture
     e.message_str = text
@@ -239,10 +239,11 @@ async def test_cd_native_bridge_invokes_real_visual_hook(
 async def test_native_runner_dispatches_real_image_receipt_hook(
     owner, host_fixture, monkeypatch
 ):
-    from astrbot.core.pipeline import context_utils
-    from astrbot.core import astr_agent_hooks
-    from astrbot.core.tools.message_tools import SendMessageToUserTool
     from astrbot_plugin_visual_media.tl.delivery_evidence import expected_image_keys
+
+    from astrbot.core import astr_agent_hooks
+    from astrbot.core.pipeline import context_utils
+    from astrbot.core.tools.message_tools import SendMessageToUserTool
 
     ctx, e, calls = host_fixture
     url = "https://example.invalid/generated.png"

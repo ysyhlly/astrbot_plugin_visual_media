@@ -4,9 +4,9 @@ import sqlite3
 
 import pytest
 from astrbot_plugin_visual_media.tools.migrate_legacy import (
-    migrate,
-    OLD_MEMES,
     OLD_GENERATION,
+    OLD_MEMES,
+    migrate,
 )
 
 

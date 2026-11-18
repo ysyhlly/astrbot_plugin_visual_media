@@ -1,15 +1,15 @@
 import sqlite3
-from unittest.mock import AsyncMock
 from types import SimpleNamespace as NS
+from unittest.mock import AsyncMock
 
 import pytest
 from astrbot_plugin_visual_media.media_runtime import MediaRuntime
-from test_media_behavior import event, candidate
 from astrbot_plugin_visual_media.tl.delivery_evidence import (
+    background_delivery_confirmed,
     expected_image_keys,
     note_confirmed_images,
-    background_delivery_confirmed,
 )
+from test_media_behavior import candidate, event
 
 
 @pytest.mark.asyncio
@@ -197,6 +197,7 @@ async def test_background_notifier_uses_image_receipt_not_just_text(
     owner, monkeypatch, image_sent
 ):
     from astrbot_plugin_visual_media.tl import background_notify as notify
+
     from astrbot.core.tools.message_tools import SendMessageToUserTool
 
     e = event()

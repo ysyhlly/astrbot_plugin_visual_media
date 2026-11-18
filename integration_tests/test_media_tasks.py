@@ -5,10 +5,9 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-
 from astrbot_plugin_visual_media.media_tasks import MediaTasks
-from test_media_library import generated
 from test_http_and_generation import app_for
+from test_media_library import generated
 
 
 async def failed(owner, umo=""):

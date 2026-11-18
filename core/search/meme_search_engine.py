@@ -11,10 +11,13 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
-from .search_features import (
-    collect_phrase_words, entry_category, parse_tags, prepare_entry_text_features,
-)
 from ..processing.semantic_schema import build_meme_search_text
+from .search_features import (
+    collect_phrase_words,
+    entry_category,
+    parse_tags,
+    prepare_entry_text_features,
+)
 from .text_similarity import (
     BM25,
     _extract_words,

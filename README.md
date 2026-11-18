@@ -1,10 +1,10 @@
 # 视觉工坊 · Visual Media
 
-> 发布候选：`0.5.0-rc.2`。升级说明与验证边界见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
+> 发布候选：`0.5.0-rc.3`。升级说明与验证边界见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
 
 将表情包收集、检索、发送、图片生成和角色参考管理整合为一个 AstrBot 插件。
 
-**发布候选：`0.5.0-rc.2`。** 不依赖旧表情包小偷或旧 Gemini 生图插件，也不要求安装 Chat Dynamics。安装 Chat Dynamics 后可在其允许回复的回合里统一选择文字、表情或生图。
+**发布候选：`0.5.0-rc.3`。** 不依赖旧表情包小偷或旧 Gemini 生图插件，也不要求安装 Chat Dynamics。安装 Chat Dynamics 后可在其允许回复的回合里统一选择文字、表情或生图。
 
 ## 参考图与任务体验
 

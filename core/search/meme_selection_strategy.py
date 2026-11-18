@@ -5,8 +5,8 @@ from typing import Any
 from astrbot.api import logger
 
 from ..util.normalization import canonicalize_path
-from .text_similarity import calculate_hybrid_similarity
 from .search_features import normalize_category
+from .text_similarity import calculate_hybrid_similarity
 
 
 class MemeSelectionStrategy:

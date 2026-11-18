@@ -3,9 +3,10 @@
 import json
 import sqlite3
 import tempfile
-from pathlib import Path
 from contextlib import closing
-from migrate_legacy import migrate, OLD_MEMES, OLD_GENERATION
+from pathlib import Path
+
+from migrate_legacy import OLD_GENERATION, OLD_MEMES, migrate
 
 with tempfile.TemporaryDirectory(prefix="visual-media-migration-smoke-") as tmp:
     root = Path(tmp)

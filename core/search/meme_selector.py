@@ -6,16 +6,15 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
+from ..events.event_context import unwrap_event
 from ..util.normalization import canonicalize_path
+from .jev_selector import JevSelector
+from .meme_scope_service import MemeScopeService
 from .meme_search_engine import MemeSearchEngine
 from .meme_selection_strategy import MemeSelectionStrategy
-
-from ..events.event_context import unwrap_event
-from .meme_scope_service import MemeScopeService
 from .meme_smart_select_service import MemeSmartSelectService
-from .jev_selector import JevSelector
-from .search_features import entry_category, normalize_category
 from .punctuation_emotion import punctuation_emotion_weights
+from .search_features import entry_category, normalize_category
 
 
 class MemeSelector:
@@ -317,8 +316,8 @@ class MemeSelector:
     async def send_emoji_message(self, event: AstrMessageEvent, path: str):
         """委托智能选择服务发送指定表情包。"""
         event = unwrap_event(event)
-        behavior = getattr(self.plugin, 'media_behavior', None)
-        candidate = {'path': path}
+        behavior = getattr(self.plugin, "media_behavior", None)
+        candidate = {"path": path}
         if behavior:
             behavior.bind(event)
             prepared = await behavior.prepare_candidates(event, [candidate])
@@ -326,14 +325,14 @@ class MemeSelector:
                 return None
             candidate = prepared[0]
             if not behavior.reserve_prepared(event, candidate):
-                await behavior.arecord(event, 'meme', 'blocked', behavior.reason_prepared(event, candidate) or 'concurrent_repeat')
+                await behavior.arecord(event, "meme", "blocked", behavior.reason_prepared(event, candidate) or "concurrent_repeat")
                 return None
         try:
             mode = await self._smart_select_service.send_emoji_message(event, path)
             if behavior and mode:
                 await behavior.adelivered(event, candidate)
             elif behavior:
-                await behavior.arecord(event, 'meme', 'failed', 'platform_send_failed')
+                await behavior.arecord(event, "meme", "failed", "platform_send_failed")
             return mode
         finally:
             if behavior:

@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-
 _EXTERNAL_CHANNELS = {
     "meme_pack": "资源包",
     "github": "GitHub 仓库",

@@ -9,6 +9,7 @@ from astrbot.api import logger
 
 from ..core.db.index_manager import delete_index_paths
 
+
 class MaintenanceRoutes:
     # ── Repair / Storage maintenance ─────────────────────────
 

@@ -3,7 +3,6 @@ from collections import Counter
 from typing import Any
 
 from astrbot.api import logger
-
 from astrbot.api.event import AstrMessageEvent
 
 from ..maintenance.retention import library_counts

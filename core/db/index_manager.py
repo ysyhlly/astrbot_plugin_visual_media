@@ -10,8 +10,6 @@ from typing import Any
 from astrbot.api import logger
 
 
-
-
 def invalidate_search(plugin) -> None:
     """统一失效所有检索缓存，避免各入口分别维护索引状态。"""
     try:
@@ -105,7 +103,7 @@ class IndexManager:
         available = getattr(embedding, "is_available", None)
         if callable(available) and not available():
             return 0
-        prepare = getattr(embedding, '_ensure_provider_ready', None)
+        prepare = getattr(embedding, "_ensure_provider_ready", None)
         if callable(prepare):
             # Model changes enqueue fresh generations before this batch takes
             # its snapshot, so a successful rebuild is acknowledged once.
@@ -113,7 +111,7 @@ class IndexManager:
                 await prepare()
             except Exception as exc:
                 limiter = getattr(embedding, "warning_rate_limited", None)
-                message = f'[Embedding] 模型检测等待后台重试: {exc}'
+                message = f"[Embedding] 模型检测等待后台重试: {exc}"
                 if callable(limiter):
                     limiter("probe", message)
                 else:

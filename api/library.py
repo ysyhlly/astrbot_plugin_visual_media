@@ -18,6 +18,7 @@ from astrbot.api import logger
 
 from ..core.maintenance.retention import library_counts, library_group
 
+
 class LibraryRoutes:
     # ── Image serving ─────────────────────────────────────────
 

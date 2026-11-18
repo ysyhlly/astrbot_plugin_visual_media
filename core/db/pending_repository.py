@@ -6,7 +6,6 @@ import sqlite3
 import time
 from typing import Any
 
-
 from ..util.normalization import normalize_scope_mode
 
 
@@ -45,10 +44,10 @@ class PendingRepository:
         with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                if meta.get('hash') and conn.execute('SELECT 1 FROM emoji_pending WHERE hash=?', (meta['hash'],)).fetchone():
+                if meta.get("hash") and conn.execute("SELECT 1 FROM emoji_pending WHERE hash=?", (meta["hash"],)).fetchone():
                     return None
-                capacity = meta.get('_pending_capacity')
-                if capacity and conn.execute('SELECT COUNT(*) FROM emoji_pending').fetchone()[0] >= capacity:
+                capacity = meta.get("_pending_capacity")
+                if capacity and conn.execute("SELECT COUNT(*) FROM emoji_pending").fetchone()[0] >= capacity:
                     return None
                 cur = conn.execute(
                     f"""
@@ -115,8 +114,8 @@ class PendingRepository:
                 return False
             if conn.execute("SELECT 1 FROM emoji WHERE path = ?", (path,)).fetchone():
                 raise sqlite3.IntegrityError("target metadata already exists")
-            if row['hash'] and conn.execute("SELECT 1 FROM emoji WHERE hash = ?", (row['hash'],)).fetchone():
-                raise sqlite3.IntegrityError('image already exists in library')
+            if row["hash"] and conn.execute("SELECT 1 FROM emoji WHERE hash = ?", (row["hash"],)).fetchone():
+                raise sqlite3.IntegrityError("image already exists in library")
             meta = dict(row)
             old_path = meta["path"]
             now = int(time.time())
@@ -295,7 +294,7 @@ class PendingRepository:
             except asyncio.CancelledError:
                 pending_id = await task
                 if pending_id is not None:
-                    await asyncio.to_thread(self._finish_pending_analysis_sync, pending_id, '')
+                    await asyncio.to_thread(self._finish_pending_analysis_sync, pending_id, "")
                 raise
         return self.get_pending(pending_id) if pending_id is not None else None
 
@@ -305,9 +304,9 @@ class PendingRepository:
             row = conn.execute("SELECT id FROM emoji_pending WHERE review_status='queued' ORDER BY id LIMIT 1").fetchone()
             if row is None:
                 return None
-            conn.execute("UPDATE emoji_pending SET review_status='processing' WHERE id=?", (row['id'],))
+            conn.execute("UPDATE emoji_pending SET review_status='processing' WHERE id=?", (row["id"],))
             conn.execute("COMMIT")
-            return row['id']
+            return row["id"]
 
     async def finish_pending_analysis(self, pending_id: int, error: str = "") -> None:
         async with self._write_lock:
@@ -317,11 +316,11 @@ class PendingRepository:
         with self._get_connection() as conn:
             conn.execute("UPDATE emoji_pending SET review_status=?, analysis_error=? "
                          "WHERE id=? AND review_status='processing'",
-                         ('failed' if error else 'queued', error[:500], pending_id))
+                         ("failed" if error else "queued", error[:500], pending_id))
 
     def pending_analysis_stats(self) -> dict[str, int]:
         with self._get_connection() as conn:
-            return {row['review_status']: row['count'] for row in conn.execute(
+            return {row["review_status"]: row["count"] for row in conn.execute(
                 "SELECT review_status, COUNT(*) AS count FROM emoji_pending GROUP BY review_status")}
 
     async def update_pending(
@@ -408,20 +407,20 @@ class PendingRepository:
         with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             previous = conn.execute("SELECT * FROM emoji_pending WHERE id=?", (pending_id,)).fetchone()
-            if previous is None or (not from_analysis and previous['review_status'] in ('queued', 'processing')):
+            if previous is None or (not from_analysis and previous["review_status"] in ("queued", "processing")):
                 return None
             if not from_analysis:
-                manual = set(json.loads(previous['manual_fields']))
+                manual = set(json.loads(previous["manual_fields"]))
                 manual.update(key for key, value in clean_fields.items()
-                              if (previous[key] or '') != (value or ''))
+                              if (previous[key] or "") != (value or ""))
                 if new_tags is not None:
-                    old_tags = [row['tag'] for row in conn.execute('SELECT tag FROM emoji_pending_tag WHERE path=?', (previous['path'],))]
+                    old_tags = [row["tag"] for row in conn.execute("SELECT tag FROM emoji_pending_tag WHERE path=?", (previous["path"],))]
                     if self._normalize_multi_value(new_tags) != old_tags:
-                        manual.add('tags')
+                        manual.add("tags")
                 if new_scenes is not None:
-                    old_scenes = [row['scene'] for row in conn.execute('SELECT scene FROM emoji_pending_scene WHERE path=?', (previous['path'],))]
+                    old_scenes = [row["scene"] for row in conn.execute("SELECT scene FROM emoji_pending_scene WHERE path=?", (previous["path"],))]
                     if self._normalize_multi_value(new_scenes) != old_scenes:
-                        manual.add('scenes')
+                        manual.add("scenes")
                 conn.execute("UPDATE emoji_pending SET manual_fields=? WHERE id=?", (json.dumps(sorted(manual)), pending_id))
             else:
                 conn.execute("UPDATE emoji_pending SET analysis_state='ready' WHERE id=?", (pending_id,))
@@ -457,7 +456,7 @@ class PendingRepository:
                         (path, scene),
                     )
 
-            conn.execute('COMMIT')
+            conn.execute("COMMIT")
 
             item = dict(row)
             tags = [
@@ -486,14 +485,14 @@ class PendingRepository:
     def delete_pending(self, pending_id: int) -> dict[str, Any] | None:
         """删除单条待审核记录，返回被删行的 path/hash（供删除磁盘文件用）；不存在返回 None。"""
         with self._get_connection() as conn:
-            conn.execute('BEGIN IMMEDIATE')
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT path, hash FROM emoji_pending WHERE id = ? AND review_status != 'processing'", (pending_id,)
             ).fetchone()
             if not row:
                 return None
             conn.execute("DELETE FROM emoji_pending WHERE id = ?", (pending_id,))
-            conn.execute('COMMIT')
+            conn.execute("COMMIT")
             return {"path": row["path"], "hash": row["hash"]}
 
     def delete_pending_batch(self, ids: list[int]) -> list[dict[str, Any]]:
@@ -502,7 +501,7 @@ class PendingRepository:
         if not clean_ids:
             return []
         with self._get_connection() as conn:
-            conn.execute('BEGIN IMMEDIATE')
+            conn.execute("BEGIN IMMEDIATE")
             placeholders = ",".join("?" * len(clean_ids))
             rows = conn.execute(
                 f"SELECT id, path, hash FROM emoji_pending WHERE id IN ({placeholders}) AND review_status != 'processing'",
@@ -511,5 +510,5 @@ class PendingRepository:
             conn.execute(
                 f"DELETE FROM emoji_pending WHERE id IN ({placeholders}) AND review_status != 'processing'", clean_ids
             )
-            conn.execute('COMMIT')
+            conn.execute("COMMIT")
             return [{"path": r["path"], "hash": r["hash"]} for r in rows]

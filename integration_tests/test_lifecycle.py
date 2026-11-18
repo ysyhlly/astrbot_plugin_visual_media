@@ -1,5 +1,5 @@
-import json
 import inspect
+import json
 import subprocess
 import sys
 import typing

@@ -9,8 +9,9 @@ from quart import jsonify, request
 
 from astrbot.api import logger
 
-from ..core.util.safe_io import safe_remove_file
 from ..core.sources.models import ExternalSourceError, ExternalSourceSecurityError
+from ..core.util.safe_io import safe_remove_file
+
 
 class ExternalSourceRoutes:
     # ── 外部表情包源 ────────────────────────────────────────

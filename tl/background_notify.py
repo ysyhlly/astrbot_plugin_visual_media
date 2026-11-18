@@ -123,7 +123,7 @@ async def notify_llm_background_result(
             message_type=session.message_type,
         )
         cron_event.role = getattr(event, "role", None)
-        behavior = getattr(plugin, 'media_behavior', None)
+        behavior = getattr(plugin, "media_behavior", None)
         if behavior:
             from .delivery_evidence import expected_image_keys
             behavior.bind(event)
@@ -131,7 +131,7 @@ async def notify_llm_background_result(
             behavior.bind(cron_event)
             cron_event._visual_generation_task = task_id
             cron_event._visual_expected_image_keys = expected_image_keys(task_result)
-            cron_event.set_extra('visual_media_confirmed_image_keys', [])
+            cron_event.set_extra("visual_media_confirmed_image_keys", [])
 
         cfg = context.get_config(umo=umo) or {}
         provider_settings = cfg.get("provider_settings") or {}
@@ -198,7 +198,7 @@ async def notify_llm_background_result(
         if behavior:
             from .delivery_evidence import background_delivery_confirmed
             if not background_delivery_confirmed(cron_event, task_result):
-                logger.warning('[VisualMedia] generated image delivery not fully confirmed: task_id=%s', task_id)
+                logger.warning("[VisualMedia] generated image delivery not fully confirmed: task_id=%s", task_id)
                 return False
         await _bump_delivery_count(plugin, task_result, scene=scene)
         logger.info(

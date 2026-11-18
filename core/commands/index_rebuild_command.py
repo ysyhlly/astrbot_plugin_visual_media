@@ -6,11 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
-
 from astrbot.api.event import AstrMessageEvent
 
-from ..db.index_metadata_merge import has_meaningful_metadata, restore_rebuilt_metadata
 from ..db.index_manager import delete_index_paths
+from ..db.index_metadata_merge import has_meaningful_metadata, restore_rebuilt_metadata
 from ..maintenance.retention import library_counts
 
 

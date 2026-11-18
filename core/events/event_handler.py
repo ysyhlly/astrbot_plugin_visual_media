@@ -7,16 +7,16 @@ from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
-from ..db.index_manager import delete_index_paths
 from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.message_components import Image, Plain
 
-from ..util.safe_io import safe_remove_file
+from ..db.index_manager import delete_index_paths
 from ..maintenance.retention import eviction_candidates
+from ..util.safe_io import safe_remove_file
 from .background_steal_queue import BackgroundStealQueue
 from .event_context import get_event_session_key
-from .platform_detector import PlatformDetector
 from .image_download_service import ImageDownloadService
+from .platform_detector import PlatformDetector
 
 
 class EventHandler:

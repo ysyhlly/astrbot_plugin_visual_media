@@ -2,7 +2,6 @@
 
 import re
 
-
 MAX_PUNCTUATION_BONUS = 0.06
 
 _NON_SPEECH = re.compile(

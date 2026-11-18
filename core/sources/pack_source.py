@@ -14,8 +14,12 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .models import ExternalSourceError, ExternalSourceSecurityError, PackInspection, SourceItem
-
+from .models import (
+    ExternalSourceError,
+    ExternalSourceSecurityError,
+    PackInspection,
+    SourceItem,
+)
 
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
 _MAX_MANIFEST_BYTES = 4 * 1024 * 1024

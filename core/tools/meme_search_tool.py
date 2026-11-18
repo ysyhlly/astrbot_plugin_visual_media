@@ -10,6 +10,7 @@ from ..events.event_context import unwrap_event
 from ..util.normalization import normalize_label_list
 from .joint_reply import sent_meme_receipt
 
+
 class MemeSearchToolWorkflow:
     async def _search_meme_candidates(
         self,
@@ -71,11 +72,11 @@ class MemeSearchToolWorkflow:
                 search_options["character"] = str(character).strip()
             results = await self._search_meme_candidates(event, query, **search_options)
 
-            behavior = getattr(self, 'media_behavior', None)
+            behavior = getattr(self, "media_behavior", None)
             if behavior:
                 behavior.bind(event)
-                ranked = await behavior.prepare_candidates(event, [{**idx.get(item[0], {}), 'path': item[0]} for item in results])
-                order = {item['path']: number for number, item in enumerate(ranked)}
+                ranked = await behavior.prepare_candidates(event, [{**idx.get(item[0], {}), "path": item[0]} for item in results])
+                order = {item["path"]: number for number, item in enumerate(ranked)}
                 results = sorted((item for item in results if item[0] in order), key=lambda item: order[item[0]])
 
             if not results:

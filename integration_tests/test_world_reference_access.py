@@ -1,5 +1,6 @@
 import threading
 from types import SimpleNamespace as NS
+
 import pytest
 from astrbot_plugin_visual_media import world_reference_access as access
 

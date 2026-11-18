@@ -10,10 +10,10 @@ from astrbot.api import logger
 
 from ..events.event_context import get_event_platform_name, get_event_session_key
 from ..search.meme_scope_service import MemeScopeService
-from .qq_menu import build_keyboard, panel_content, panel_rows, send_keyboard
 from .panel_actions import PANEL_ACTIONS
-from .qq_panel_interactions import QQPanelInteractions
 from .qq_callback_event import identity_tag, source_sender
+from .qq_menu import build_keyboard, panel_content, panel_rows, send_keyboard
+from .qq_panel_interactions import QQPanelInteractions
 
 
 @dataclass

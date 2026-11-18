@@ -3,11 +3,10 @@ from types import SimpleNamespace as NS
 
 import httpx
 import pytest
-from PIL import Image
-
-from astrbot_plugin_visual_media.media_behavior import MediaBehavior
 from astrbot_plugin_visual_media.character_check import check_character
 from astrbot_plugin_visual_media.core.tools.joint_reply import JointMemePlan
+from astrbot_plugin_visual_media.media_behavior import MediaBehavior
+from PIL import Image
 from test_http_and_generation import app_for
 from test_media_library import Event
 

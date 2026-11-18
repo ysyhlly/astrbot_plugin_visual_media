@@ -7,9 +7,10 @@ from quart import jsonify, request
 
 from astrbot.api import logger
 
-from ..core.util.blacklist import add_blacklist_hash
 from ..core.db.index_manager import refresh_search_entry
+from ..core.util.blacklist import add_blacklist_hash
 from ..core.util.safe_io import commit_image_file, safe_remove_file
+
 
 class PendingRoutes:
     # ── Pending (待审核池) ────────────────────────────────────
@@ -19,7 +20,7 @@ class PendingRoutes:
         item = self._build_image_item(str(row.get("path") or ""), row)
         if item is not None:
             item.update(id=row.get("id"), review_status=str(row.get("review_status") or "pending"),
-                        analysis_state=row.get('analysis_state', 'ready'), analysis_error=row.get('analysis_error', ''))
+                        analysis_state=row.get("analysis_state", "ready"), analysis_error=row.get("analysis_error", ""))
         return item
 
     async def handle_list_pending(self):
@@ -68,7 +69,7 @@ class PendingRoutes:
             db = self._db
             pending = db.count_pending() if db and hasattr(db, "count_pending") else 0
             capacity = int(getattr(self.plugin, "steal_pool_capacity", 200) or 200)
-            states = db.pending_analysis_stats() if db and hasattr(db, 'pending_analysis_stats') else {}
+            states = db.pending_analysis_stats() if db and hasattr(db, "pending_analysis_stats") else {}
             return jsonify(
                 {
                     "success": True,
@@ -76,9 +77,9 @@ class PendingRoutes:
                         "pending": pending,
                         "capacity": capacity,
                         "paused": pending >= capacity,
-                        "queued": states.get('queued', 0),
-                        "processing": states.get('processing', 0),
-                        "failed": states.get('failed', 0),
+                        "queued": states.get("queued", 0),
+                        "processing": states.get("processing", 0),
+                        "failed": states.get("failed", 0),
                     },
                 }
             )
@@ -99,16 +100,16 @@ class PendingRoutes:
     async def _approve_one(self, db, pending_id: int) -> tuple[bool, str]:
         row = db.get_pending(pending_id)
         if row is None:
-            return False, 'pending not found'
-        if row.get('review_status') in ('queued', 'processing'):
-            return False, 'already queued'
-        if row.get('analysis_state', 'ready') != 'ready' or row.get('review_status') == 'failed':
+            return False, "pending not found"
+        if row.get("review_status") in ("queued", "processing"):
+            return False, "already queued"
+        if row.get("analysis_state", "ready") != "ready" or row.get("review_status") == "failed":
             if not await db.queue_pending_analysis(pending_id):
-                return False, 'already queued'
-            worker = getattr(self.plugin, 'pending_analysis_worker', None)
+                return False, "already queued"
+            worker = getattr(self.plugin, "pending_analysis_worker", None)
             if worker is not None:
                 worker.wakeup.set()
-            return True, 'queued'
+            return True, "queued"
         return await self._promote_one(db, pending_id)
 
     async def _promote_one(self, db, pending_id: int) -> tuple[bool, str]:
@@ -165,8 +166,8 @@ class PendingRoutes:
                 ok, msg = await self._approve_one(db, pending_id)
                 if ok:
                     approved += 1
-                    queued += int(msg == 'queued')
-                elif msg and msg not in ("pending not found", 'already queued'):
+                    queued += int(msg == "queued")
+                elif msg and msg not in ("pending not found", "already queued"):
                     errors.append(f"id={pending_id}: {msg}")
 
             return jsonify(

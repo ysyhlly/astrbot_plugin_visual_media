@@ -151,7 +151,7 @@ class SdkDelivery:
         self._service._callback_tasks[task_id] = callback_task
         callback_status = "succeeded"
         try:
-            await asyncio.wait_for(callback_task, min(180, max(_CALLBACK_TIMEOUT_SECONDS, getattr(callback, '_visual_callback_timeout', _CALLBACK_TIMEOUT_SECONDS))))
+            await asyncio.wait_for(callback_task, min(180, max(_CALLBACK_TIMEOUT_SECONDS, getattr(callback, "_visual_callback_timeout", _CALLBACK_TIMEOUT_SECONDS))))
         except asyncio.CancelledError:
             callback_status = "interrupted"
         except Exception as exc:

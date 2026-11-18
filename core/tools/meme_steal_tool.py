@@ -13,6 +13,7 @@ from ..events.event_context import unwrap_event
 from ..util.normalization import canonicalize_path
 from ..util.safe_io import safe_remove_file
 
+
 class MemeStealToolWorkflow:
     async def _steal_sticker_impl(
         self,

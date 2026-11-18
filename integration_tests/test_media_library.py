@@ -3,10 +3,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PIL import Image
-
 from astrbot_plugin_visual_media.core.search.meme_scope_service import MemeScopeService
 from astrbot_plugin_visual_media.runtime import ConfigSection
+from PIL import Image
 
 
 class Event:

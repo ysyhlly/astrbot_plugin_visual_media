@@ -1010,11 +1010,11 @@ class JobScheduler:
             await self._complete_job(job_id, result, started_at=started_at)
         except asyncio.CancelledError as error:
             job = await self.store.get(job_id)
-            expired = bool(getattr(error, '_scheduler_deadline_expired', False))
+            expired = bool(getattr(error, "_scheduler_deadline_expired", False))
             if job is not None and job.state not in TERMINAL_STATES:
                 try:
                     if expired:
-                        job.set_error('deadline_exceeded', 'Database operation completed after the generation deadline')
+                        job.set_error("deadline_exceeded", "Database operation completed after the generation deadline")
                         job.transition(JobState.FAILED)
                     else:
                         job.request_cancel()

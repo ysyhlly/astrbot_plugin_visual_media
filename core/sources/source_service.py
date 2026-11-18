@@ -20,8 +20,8 @@ from PIL import Image, UnidentifiedImageError
 
 from astrbot.api import logger
 from astrbot.api.star import StarTools
-from ..db.index_manager import invalidate_search, refresh_search_entry
 
+from ..db.index_manager import invalidate_search, refresh_search_entry
 from ..util.normalization import (
     normalize_category_key,
     normalize_character_key,
@@ -37,7 +37,6 @@ from .models import (
     SourceItem,
 )
 from .pack_source import PackSource
-
 
 _FORMAT_SUFFIX = {
     "PNG": ".png",

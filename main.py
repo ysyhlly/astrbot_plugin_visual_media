@@ -13,11 +13,11 @@ ensure_current(
         ("media_library", "MediaLibrary", "_rebuild_public_ref_cache"),
         ("media_behavior", "MediaBehavior", "records"),
     ],
-    version="0.5.0-rc.2",
+    version="0.5.0-rc.3",
 )
 
-import threading
 import asyncio
+import threading
 from typing import Any
 
 from astrbot.api import logger
@@ -30,14 +30,14 @@ from astrbot.api.event.filter import (
 from astrbot.api.star import Context, Star
 from astrbot.core.star.star import star_registry
 
-from .runtime import ConfigSection, EngineContext
-from .memes_engine import Main as MemeEngine
 from .generation_engine import GeminiImageGenerationPlugin as GenerationEngine
-from .media_library import MediaLibrary
 from .media_api import MediaAPI
-from .media_tasks import MediaTasks
-from .media_runtime import MediaRuntime
+from .media_library import MediaLibrary
 from .media_receipts import image_receipt
+from .media_runtime import MediaRuntime
+from .media_tasks import MediaTasks
+from .memes_engine import Main as MemeEngine
+from .runtime import ConfigSection, EngineContext
 from .tl.delivery_evidence import note_confirmed_images
 
 # Decorators register tools at import time, before the host constructs the plugin.

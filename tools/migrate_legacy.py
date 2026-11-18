@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sqlite3
 import tempfile
-import os
 from contextlib import closing
 from pathlib import Path
 
@@ -147,7 +147,7 @@ def migrate(
         # Publish the config with an exclusive hard link on its own filesystem.
         # A failed write/link leaves neither a partial config nor active data.
         config_destination.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(dir=config_destination.parent, prefix='.visual-migrate-', delete=False) as stream:
+        with tempfile.NamedTemporaryFile(dir=config_destination.parent, prefix=".visual-migrate-", delete=False) as stream:
             staged_config = Path(stream.name)
             try:
                 stream.write(config_stage.read_bytes())

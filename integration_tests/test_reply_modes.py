@@ -3,7 +3,6 @@
 import json
 
 import pytest
-
 from astrbot_plugin_visual_media.core.tools.joint_reply import JointMemePlan
 from astrbot_plugin_visual_media.core.tools.media_policy import selection_prompt
 from test_media_library import Event

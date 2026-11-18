@@ -7,6 +7,7 @@ from threading import RLock
 from types import SimpleNamespace
 
 from astrbot.api import logger
+
 from .media_behavior import MediaBehavior
 
 

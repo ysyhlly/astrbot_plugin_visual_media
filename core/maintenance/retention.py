@@ -22,7 +22,7 @@ def is_auto_evictable(meta: object) -> bool:
 
 
 def library_counts(index: dict) -> dict[str, int]:
-    counts = dict(general=0, favorites=0, characters=0, automatic=0)
+    counts = {"general": 0, "favorites": 0, "characters": 0, "automatic": 0}
     for meta in index.values():
         if isinstance(meta, dict):
             counts[library_group(meta)] += 1

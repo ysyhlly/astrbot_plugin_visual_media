@@ -10,10 +10,10 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
-from ..util.safe_io import commit_image_file, safe_remove_file, unique_image_path
-from ..util.normalization import normalize_label_list
-from .semantic_schema import MAX_DESC_CHARS, clip_chars
 from ..db.index_manager import refresh_search_entry
+from ..util.normalization import normalize_label_list
+from ..util.safe_io import commit_image_file, safe_remove_file, unique_image_path
+from .semantic_schema import MAX_DESC_CHARS, clip_chars
 
 try:
     from PIL import Image as PILImage
@@ -81,9 +81,9 @@ class ImageProcessorService:
             else False
         )
         # 子服务（职责拆分）
-        from .prompt_manager import PromptManager
-        from .phash_dedup_service import PHashDedupService
         from .classification_parser import ClassificationParser
+        from .phash_dedup_service import PHashDedupService
+        from .prompt_manager import PromptManager
         from .vlm_call_service import VLMCallService
 
         self._prompt_manager = PromptManager(plugin_instance)
@@ -350,8 +350,8 @@ class ImageProcessorService:
                 )
                 meta["path"] = pending_path
                 meta["analysis_state"] = analysis_state
-                if analysis_state == 'unanalysed':
-                    meta['_pending_capacity'] = int(getattr(self.plugin_config, 'steal_pool_capacity', 200))
+                if analysis_state == "unanalysed":
+                    meta["_pending_capacity"] = int(getattr(self.plugin_config, "steal_pool_capacity", 200))
                 pending_id = await db.insert_pending(meta)
                 if pending_id is None:
                     raise RuntimeError("pending metadata insertion failed")
@@ -433,7 +433,7 @@ class ImageProcessorService:
             if to_pending:
                 # Manual review needs only the original image and local metadata.
                 metadata = await asyncio.to_thread(self._probe_image_metadata, file_path)
-                if not metadata.get('format'):
+                if not metadata.get("format"):
                     return False, None
                 async with self._process_lock:
                     return await self._store_to_pending(

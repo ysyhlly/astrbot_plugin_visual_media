@@ -8,8 +8,13 @@ from typing import Any
 from astrbot.api import logger
 
 from .panel_actions import PANEL_ACTIONS
-from .qq_callback_event import callback_event, context_mismatch, identity_tag, interaction_sender, source_sender
-
+from .qq_callback_event import (
+    callback_event,
+    context_mismatch,
+    identity_tag,
+    interaction_sender,
+    source_sender,
+)
 
 BUTTON_PREFIX = "stealer_panel:"
 

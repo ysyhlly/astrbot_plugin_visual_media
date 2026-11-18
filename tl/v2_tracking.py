@@ -108,7 +108,7 @@ class TrackerProjection:
             try:
                 await self._on_accepted(job)
             except Exception:
-                logger.warning('[VisualMedia] retry input metadata unavailable; generation continues')
+                logger.warning("[VisualMedia] retry input metadata unavailable; generation continues")
 
     def runtime_scope(self, job: Any):
         async def progress(status: str) -> None:

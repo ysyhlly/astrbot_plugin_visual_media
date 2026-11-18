@@ -1,4 +1,6 @@
-# astrbot_plugin_visual_media 0.5.0-rc.2
+# astrbot_plugin_visual_media 0.5.0-rc.3
+
+角色图交付的联动测试等待真实的队列释放事件，覆盖先交付图像、后完成后台检查的场景。
 
 系列面板显示安装版本及源码短提交号。
 

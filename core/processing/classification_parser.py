@@ -1,9 +1,8 @@
 """分类结果解析器：负责解析 VLM 的 JSON/文本响应。"""
 
-from typing import Any
-
 import json
 import re
+from typing import Any
 
 from astrbot.api import logger
 

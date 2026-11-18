@@ -1,16 +1,16 @@
-from pathlib import Path
 import asyncio
+from pathlib import Path
 
 import httpx
 import pytest
+from astrbot_plugin_visual_media.tl.generation_scheduler import scheduled_generation
+from astrbot_plugin_visual_media.tl.plugin_config import ProviderCandidate
 from fastapi import FastAPI, Request
 from PIL import Image
+from test_media_library import Event, generated
+
 from astrbot.api.web import PluginRequest, bind_request_context
 from astrbot.dashboard.asgi_runtime import FastAPIAppAdapter, call_request_view
-
-from astrbot_plugin_visual_media.tl.plugin_config import ProviderCandidate
-from astrbot_plugin_visual_media.tl.generation_scheduler import scheduled_generation
-from test_media_library import Event, generated
 
 
 def app_for(owner):
@@ -81,8 +81,19 @@ async def test_real_http_library_and_studio_contracts(owner):
 
 
 @pytest.mark.asyncio
-async def test_generation_queue_to_gallery_to_searchable_meme(owner):
+async def test_generation_queue_to_gallery_to_searchable_meme(owner, monkeypatch):
+    from astrbot_plugin_visual_media.tl.generation_scheduler import GenerationTicket
+
     generation = owner.generation
+    finalized = asyncio.Event()
+    release_ticket = GenerationTicket.release
+
+    def record_finalization(ticket):
+        release_ticket(ticket)
+        if ticket.scheduler is generation.generation_scheduler and ticket.scheduler.active == 0:
+            finalized.set()
+
+    monkeypatch.setattr(GenerationTicket, "release", record_finalization)
     source = Path(generation._plugin_data_dir) / "fixture.png"
     Image.new("RGB", (64, 64), "yellow").save(source)
 
@@ -127,9 +138,8 @@ async def test_generation_queue_to_gallery_to_searchable_meme(owner):
     assert Path(path).is_file()
     assert meta["desc"] == "开心笑脸"
     # A successful SDK delivery can wake wait_task before scheduler finalization.
-    async with asyncio.timeout(2):
-        while generation.generation_scheduler.active:
-            await asyncio.sleep(0.01)
+    await asyncio.wait_for(finalized.wait(), timeout=2)
+    assert generation.generation_scheduler.active == 0
     public = await owner.library.save_generation(completed["job_id"], public=True)
     await owner.library.save_profile(
         {
@@ -151,9 +161,9 @@ async def test_generation_queue_to_gallery_to_searchable_meme(owner):
 
 @pytest.mark.asyncio
 async def test_reload_closes_old_services_and_rebinds_routes(paths):
-    from test_lifecycle import Host
     from astrbot_plugin_visual_media.main import VisualMediaPlugin
     from astrbot_plugin_visual_media.tl.plugin_service import PluginServiceError
+    from test_lifecycle import Host
 
     host = Host()
     first = VisualMediaPlugin(host, {})

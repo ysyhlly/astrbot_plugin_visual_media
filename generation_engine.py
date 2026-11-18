@@ -16,14 +16,15 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Image as AstrImage
 from astrbot.api.message_components import Node, Plain
 from astrbot.api.star import Context
-from .runtime import Component
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
+from .runtime import Component
 from .tl import (
     AvatarHandler,
     ConfigLoader,
@@ -543,18 +544,18 @@ class GeminiImageGenerationPlugin(Component):
         return True
 
     async def _capture_task_inputs(self, job):
-        owner = getattr(self.context, 'owner', None)
-        tasks = getattr(owner, 'tasks', None)
+        owner = getattr(self.context, "owner", None)
+        tasks = getattr(owner, "tasks", None)
         if tasks is not None:
             req = job.request
             metadata = req.metadata or {}
             expected_refs = len(req.reference_images or ())
-            archived_refs = len(metadata.get('reference_names') or [])
+            archived_refs = len(metadata.get("reference_names") or [])
             complete = (expected_refs == archived_refs and len(req.prompt) < 2000
-                        and getattr(req, 'watermark', None) is None
-                        and not metadata.get('batch_parent'))
-            await tasks.observe('job:'+job.job_id, {'job_id':job.job_id,'input_complete':complete,
-                'input_reference_count':expected_refs}, defaults=True)
+                        and getattr(req, "watermark", None) is None
+                        and not metadata.get("batch_parent"))
+            await tasks.observe("job:"+job.job_id, {"job_id":job.job_id,"input_complete":complete,
+                "input_reference_count":expected_refs}, defaults=True)
 
     def _ensure_v2_service(self):
         """装配并返回常驻 v2 GenerationService 单例。"""

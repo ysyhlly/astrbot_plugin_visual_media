@@ -10,29 +10,29 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Image as MessageImage
 from astrbot.api.star import Context
-from .runtime import Component
 
 from .core.commands.command_handler import CommandHandler
 from .core.commands.image_mgmt_command import ImageManagementCommand
-from .core.commands.meme_menu_command import MemeMenuCommand
 from .core.commands.index_rebuild_command import IndexRebuildCommand
+from .core.commands.meme_menu_command import MemeMenuCommand
 from .core.commands.target_filter_command import TargetFilterCommand
 from .core.config.config import PluginConfig
 from .core.db.database_service import DatabaseService
-from .core.search.meme_selector import MemeSelector
+from .core.db.index_manager import IndexManager
 from .core.events.event_handler import EventHandler
 from .core.events.meme_sender_engine import MemeSenderEngine
-from .core.db.index_manager import IndexManager
-from .core.processing.natural_emotion_analyzer import NaturalEmotionAnalyzer
+from .core.maintenance.service import MaintenanceService
 from .core.processing.image_processor_service import ImageProcessorService
 from .core.processing.image_render_service import ImageRenderService
-from .core.maintenance.service import MaintenanceService
+from .core.processing.natural_emotion_analyzer import NaturalEmotionAnalyzer
+from .core.search.meme_selector import MemeSelector
 from .core.sources.source_service import SourceService
-from .task_scheduler import TaskScheduler
-from .plugin_api import PluginAPI
+from .core.tools.joint_reply import joint_reply_owned, prepare_joint_reply
 from .core.tools.meme_search_tool import MemeSearchToolWorkflow
 from .core.tools.meme_steal_tool import MemeStealToolWorkflow
-from .core.tools.joint_reply import prepare_joint_reply, joint_reply_owned
+from .plugin_api import PluginAPI
+from .runtime import Component
+from .task_scheduler import TaskScheduler
 
 try:
     import aiofiles  # type: ignore

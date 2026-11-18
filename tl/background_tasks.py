@@ -206,7 +206,7 @@ class BackgroundTaskManager:
     async def snapshot_records(self) -> list[dict[str, Any]]:
         """Internal admin projection; callers must enforce dashboard authorization."""
         async with self._lock:
-            fields=('task_id','job_id','status','callback_status','delivered_count')
+            fields=("task_id","job_id","status","callback_status","delivered_count")
             return [{key:record.get(key) for key in fields} for record in self._records.values()]
 
     async def get_for_plugin(

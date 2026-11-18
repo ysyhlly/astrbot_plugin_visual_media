@@ -2,7 +2,7 @@
 
 import asyncio
 
-from astrbot.api.web import request, json_response
+from astrbot.api.web import json_response, request
 
 from .tl.web_api import WebStudioAPI
 
@@ -112,6 +112,7 @@ class MediaAPI:
             return denied
         import base64
         import io
+
         from PIL import Image
 
         try:
@@ -167,6 +168,7 @@ class MediaAPI:
             return denied
         import base64
         import io
+
         from PIL import Image
 
         name = str(request.query.get("name", ""))

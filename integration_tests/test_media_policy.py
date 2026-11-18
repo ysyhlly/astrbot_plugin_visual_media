@@ -2,8 +2,7 @@ import json
 from types import SimpleNamespace as NS
 
 import pytest
-
-from astrbot_plugin_visual_media.core.tools import joint_reply, joint_prefetch
+from astrbot_plugin_visual_media.core.tools import joint_prefetch, joint_reply
 from astrbot_plugin_visual_media.core.tools.media_policy import selection_prompt
 from test_media_library import Event
 

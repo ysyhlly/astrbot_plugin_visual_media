@@ -10,14 +10,14 @@ import hashlib
 import json
 import re
 import time
-from dataclasses import dataclass, field
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
-from ..search.text_similarity import calculate_hybrid_similarity, _has_negation_prefix
+from ..search.text_similarity import _has_negation_prefix, calculate_hybrid_similarity
 
 
 def _inherit_series_provider(context: Any) -> str:
@@ -33,7 +33,7 @@ def _inherit_series_provider(context: Any) -> str:
 # 标记：模型明确选择不发送，用于区分"LLM 异常"和"模型说 none"
 _EMOTION_ABSTAIN = object()
 
-_LEGACY_EMOTION_TEMPLATE_HASH = '1914107e8c9b676649a0e92af223db633a7d56e0468dac44148df009e14d4201'
+_LEGACY_EMOTION_TEMPLATE_HASH = "1914107e8c9b676649a0e92af223db633a7d56e0468dac44148df009e14d4201"
 _EMOTION_ANALYSIS_DEFAULT_TEMPLATE = """根据本轮对话，提炼助手用于表达情绪、接梗或回应的表情包检索词。表情由助手发给当前用户。
 可选情绪分类：{emotion_list}
 

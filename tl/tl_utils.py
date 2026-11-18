@@ -16,6 +16,7 @@ from uuid import uuid4
 
 import aiohttp
 import cv2
+
 from astrbot.api import logger
 
 from .api_types import APIError
