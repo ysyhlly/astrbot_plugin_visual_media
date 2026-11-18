@@ -49,6 +49,7 @@ ROOT_FILES = {
     "runtime.py",
     "world_reference_access.py",
     "series_panels.py",
+    "series_workspace.py",
     "plugin_api.py",
     "task_scheduler.py",
     "prompts.json",

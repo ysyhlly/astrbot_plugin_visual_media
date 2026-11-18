@@ -328,66 +328,66 @@ const ImageLoader = {
 };
 
 // ==========================================================================
-// 3. BridgeClient (封装 window.AstrBotPluginView 通信 SDK)
+// 3. BridgeClient (封装 (window.DynamicsPanelBridge || window.AstrBotPluginView) 通信 SDK)
 // ==========================================================================
 class BridgeClient {
   static async init() {
-    if (!window.AstrBotPluginView) {
+    if (!(window.DynamicsPanelBridge || window.AstrBotPluginView)) {
       throw new Error(t("未检测到 AstrBotPluginView SDK，请在 AstrBot Dashboard 中运行"));
     }
-    return await window.AstrBotPluginView.ready();
+    return await (window.DynamicsPanelBridge || window.AstrBotPluginView).ready();
   }
 
   static isAvailable() {
-    return !!window.AstrBotPluginView;
+    return !!(window.DynamicsPanelBridge || window.AstrBotPluginView);
   }
 
   static getContext() {
-    return window.AstrBotPluginView?.getContext?.() ?? null;
+    return (window.DynamicsPanelBridge || window.AstrBotPluginView)?.getContext?.() ?? null;
   }
 
   static onContext(handler) {
-    return window.AstrBotPluginView?.onContext?.(handler);
+    return (window.DynamicsPanelBridge || window.AstrBotPluginView)?.onContext?.(handler);
   }
 
   static async get(endpoint, params = {}) {
-    if (!window.AstrBotPluginView) {
+    if (!(window.DynamicsPanelBridge || window.AstrBotPluginView)) {
       throw new Error(t("AstrBotPluginView SDK 未加载"));
     }
-    return await window.AstrBotPluginView.apiGet(endpoint, params);
+    return await (window.DynamicsPanelBridge || window.AstrBotPluginView).apiGet(endpoint, params);
   }
 
   static async post(endpoint, body = {}) {
-    if (!window.AstrBotPluginView) {
+    if (!(window.DynamicsPanelBridge || window.AstrBotPluginView)) {
       throw new Error(t("AstrBotPluginView SDK 未加载"));
     }
-    return await window.AstrBotPluginView.apiPost(endpoint, body);
+    return await (window.DynamicsPanelBridge || window.AstrBotPluginView).apiPost(endpoint, body);
   }
 
   static async upload(endpoint, file) {
-    if (!window.AstrBotPluginView) {
+    if (!(window.DynamicsPanelBridge || window.AstrBotPluginView)) {
       throw new Error(t("AstrBotPluginView SDK 未加载"));
     }
-    return await window.AstrBotPluginView.upload(endpoint, file);
+    return await (window.DynamicsPanelBridge || window.AstrBotPluginView).upload(endpoint, file);
   }
 
   static async download(endpoint, params = {}, filename = "") {
-    if (!window.AstrBotPluginView) {
+    if (!(window.DynamicsPanelBridge || window.AstrBotPluginView)) {
       throw new Error(t("AstrBotPluginView SDK 未加载"));
     }
-    return await window.AstrBotPluginView.download(endpoint, params, filename);
+    return await (window.DynamicsPanelBridge || window.AstrBotPluginView).download(endpoint, params, filename);
   }
 
   static async subscribeSSE(endpoint, handlers = {}, params = {}) {
-    if (!window.AstrBotPluginView) {
+    if (!(window.DynamicsPanelBridge || window.AstrBotPluginView)) {
       throw new Error(t("AstrBotPluginView SDK 未加载"));
     }
-    return await window.AstrBotPluginView.subscribeSSE(endpoint, handlers, params);
+    return await (window.DynamicsPanelBridge || window.AstrBotPluginView).subscribeSSE(endpoint, handlers, params);
   }
 
   static async unsubscribeSSE(subscriptionId) {
-    if (subscriptionId && window.AstrBotPluginView?.unsubscribeSSE) {
-      return await window.AstrBotPluginView.unsubscribeSSE(subscriptionId);
+    if (subscriptionId && (window.DynamicsPanelBridge || window.AstrBotPluginView)?.unsubscribeSSE) {
+      return await (window.DynamicsPanelBridge || window.AstrBotPluginView).unsubscribeSSE(subscriptionId);
     }
   }
 }

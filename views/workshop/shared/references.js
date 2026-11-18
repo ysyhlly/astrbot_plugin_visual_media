@@ -6,7 +6,7 @@
  function unwrap(r){if(r?.status==='error'||r?.success===false)throw new Error(r.message||r.error||UI.t("读取失败"));return r?.status==='ok'?r.data:r;}
  function drain(){while(running<4&&queue.length){const job=queue.shift();running++;job().finally(()=>{running--;drain();});}}
  function load(hash,size=240){const key=`${hash}:${size}`;if(cache.has(key))return cache.get(key);
-  const promise=new Promise((resolve,reject)=>queue.push(async()=>{try{const r=unwrap(await window.AstrBotPluginPage.apiGet('media/reference',{hash,size}));resolve(r.url);}catch(e){cache.delete(key);reject(e);}}));cache.set(key,promise);while(cache.size>128)cache.delete(cache.keys().next().value);drain();return promise;
+  const promise=new Promise((resolve,reject)=>queue.push(async()=>{try{const r=unwrap(await (window.DynamicsPanelBridge || window.AstrBotPluginPage).apiGet('media/reference',{hash,size}));resolve(r.url);}catch(e){cache.delete(key);reject(e);}}));cache.set(key,promise);while(cache.size>128)cache.delete(cache.keys().next().value);drain();return promise;
  }
  function preview(hash,label=UI.t("参考图")){
   const dialog=node('dialog','','vm-image-dialog'),header=node('div','','dialog-head'),close=node('button',UI.msg("关闭"));close.type='button';close.onclick=()=>dialog.close();header.append(node('h2',label),close);
@@ -37,7 +37,7 @@
    if(!items.length)grid.append(node('p',UI.msg("没有匹配的公开图片。"),'empty'));
    prev.disabled=page<=1;next.disabled=page*24>=total;pageText.textContent=UI.t("第 {0} 页 · {1} 张",{0:page,1:total});
   }
-  async function fetchPage(){const version=++epoch;status.textContent=UI.t("正在读取公开图库…");try{const data=unwrap(await window.AstrBotPluginPage.apiGet('media/references',{page,q:search.value}));if(version!==epoch)return;items=data.items;total=data.total;status.textContent=UI.t("只展示公开图片，当前选择会在翻页和搜索时保留。");render();}catch(e){if(version===epoch)status.textContent=e.message;}}
+  async function fetchPage(){const version=++epoch;status.textContent=UI.t("正在读取公开图库…");try{const data=unwrap(await (window.DynamicsPanelBridge || window.AstrBotPluginPage).apiGet('media/references',{page,q:search.value}));if(version!==epoch)return;items=data.items;total=data.total;status.textContent=UI.t("只展示公开图片，当前选择会在翻页和搜索时保留。");render();}catch(e){if(version===epoch)status.textContent=e.message;}}
   search.oninput=()=>{clearTimeout(timer);timer=setTimeout(()=>{page=1;fetchPage();},250);};prev.onclick=()=>{page--;fetchPage();};next.onclick=()=>{page++;fetchPage();};
   UI.onLocaleChange(render);return {open(refs=[]){clearTimeout(timer);epoch++;selected=[...refs];items=[];page=1;total=0;search.value='';changed();return fetchPage();},value:()=>[...selected]};
  }

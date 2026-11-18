@@ -1,6 +1,6 @@
 import {msg,tr,setText,getSharedScope,setSharedScope} from '../series-ui.js';
 const $=id=>document.getElementById(id);
-const api=window.AstrBotPluginPage;
+const api=(window.DynamicsPanelBridge || window.AstrBotPluginPage);
 let data={records:[],preferences:[]};
 let currentScope=getSharedScope();
 const names={image:'其他图片',text:'文字',meme:'表情',generate:'生图',preference:'偏好',character_check:'角色核对',selected:'已选择',filtered:'候选过滤',blocked:'已拦截',delivered:'已交付',submitted:'已提交',generated:'已生成',failed:'失败',saved:'已保存',pass:'核对通过',mismatch:'存在差异',unknown:'未能确认',skipped:'已关闭'};

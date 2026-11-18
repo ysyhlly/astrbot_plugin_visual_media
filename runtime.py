@@ -52,7 +52,9 @@ class EngineContext:
         return getattr(self.host, name)
 
     def register_web_api(self, route, handler, methods, description):
-        self.host.register_web_api(route, handler, methods, description)
+        from .series_workspace import register_panel_api
+
+        register_panel_api(self.owner, self.host.register_web_api, route, handler, methods, description)
         self.routes.append((route, handler, methods, description))
 
     def add_llm_tools(self, *tools):

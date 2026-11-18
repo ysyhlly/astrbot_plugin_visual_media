@@ -1,6 +1,6 @@
 const UI=window.SeriesUI||{t:(s,p={})=>String(s).replace(/\{(\w+)\}/g,(m,k)=>Object.hasOwn(p,k)?String(p[k]??''):m),msg(s,p={}){return this.t(s,p);},text(n,v){n.textContent=String(v??'');return n;},bind(n,s,p={},a=''){if(a)n.setAttribute(a,this.t(s,p));else n.textContent=this.t(s,p);return n;},onLocaleChange:()=>()=>{}};
 const $ = (id) => document.getElementById(id);
-const bridge = window.AstrBotPluginPage;
+const bridge = (window.DynamicsPanelBridge || window.AstrBotPluginPage);
 let profiles = [];
 const picker = window.VisualReferences.create($("reference-picker"), {onChange(refs) { const select=$("profile-form").elements.references; select.replaceChildren(...refs.map(hash=>new Option(hash,hash,true,true))); }});
 const notice = (text) => { $("notice").textContent = text; };

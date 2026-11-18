@@ -5,7 +5,7 @@
   const supported = {zh:'zh-CN',en:'en-US',ja:'ja-JP',ru:'ru-RU'};
   const bindings = new Map(), listeners = new Set();
   let context = {}, activeLocale = 'zh-CN', subscribed = false, lastLocale = '', lastCatalog = '';
-  const bridge = () => window.AstrBotPluginPage || window.AstrBotPluginView;
+  const bridge = () => (window.DynamicsPanelBridge || window.AstrBotPluginPage || window.AstrBotPluginView);
   const normalize = value => supported[String(value || '').toLowerCase().split('-')[0]] || 'zh-CN';
   function locale() { return typeof window.getLanguage === 'function' ? normalize(window.getLanguage()) : activeLocale; }
   function t(source, params = {}) {

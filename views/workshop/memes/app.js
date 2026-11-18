@@ -86,7 +86,7 @@ createApp({
         const pendingCurrentPage = ref(1);
         const pendingPageSize = ref(24);
         let pendingFetchLock = false;
-        const bridge = window.AstrBotPluginPage;
+        const bridge = (window.DynamicsPanelBridge || window.AstrBotPluginPage);
         const imagePreviewClient = new ImagePreviewClient(
             (path, params) => bridge.apiGet(path, params),
             { maxConcurrent: 4 },
