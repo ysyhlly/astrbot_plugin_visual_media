@@ -38,25 +38,34 @@ def generation_tools(tool_set) -> tuple[str, ...]:
     )
 
 
-def selection_prompt(candidate_count: int, tool_set, *, reply_modes=False, poke_supported=False) -> str:
-    tools = generation_tools(tool_set)
-    candidates = (
-        f"本轮有 {candidate_count} 张现成表情候选。只使用下方编号；动图预览仅为首帧。"
-        if candidate_count
-        else "本轮没有可用现成表情候选；仍可按语境选择文字或调用可用生图工具，不要伪造表情编号。"
-    )
-    available = (
-        "本轮可见的生图工具：" + "、".join(tools) + "。"
-        if tools
-        else "本轮未直接暴露生图工具。若宿主提供按需工具发现，须先由该入口取得允许的工具；否则不能生图。"
-    )
-    output = (
-        '最终回复使用 JSON 对象：{"media":"text|meme|generate","text":"要说的话","meme_id":null}。'
-        "选候选时 media=meme，meme_id 为候选整数编号；只发表情时 text 为空。其他模式 meme_id=null。"
-        "media=generate 只记录已实际调用生成工具的选择，本身不会触发生图。"
-        if candidate_count
-        else "本轮无现成候选，最终文字直接用普通文本，不包装发送计划 JSON。生图仍须先调用工具，不能只描述自己将调用。"
-    )
+_STATIC_TOOL_DISCOVERY_RULE = (
+    "若本轮未直接暴露生图工具且宿主提供按需工具发现，须先由该入口取得允许的工具；否则不能生图。"
+)
+
+_STATIC_LEGACY_OUTPUT_PROTOCOL = (
+    "动图预览仅为首帧；只使用本轮提供的候选编号，无可用候选时不要伪造表情编号。\n"
+    '当本轮有现成表情候选时，最终回复使用 JSON 对象：{"media":"text|meme|generate","text":"要说的话","meme_id":null}。'
+    "选候选时 media=meme，meme_id 为候选整数编号；只发表情时 text 为空。其他模式 meme_id=null。"
+    "media=generate 只记录已实际调用生成工具的选择，本身不会触发生图。\n"
+    "当本轮无可用现成表情候选时，仍可按语境选择文字或调用可用生图工具；"
+    "最终文字直接用普通文本，不包装发送计划 JSON。生图仍须先调用工具，不能只描述自己将调用。"
+)
+
+
+def selection_prompt(
+    candidate_count: int = 0,
+    tool_set=None,
+    *,
+    reply_modes=False,
+    poke_supported=False,
+) -> str:
+    """Return a session-static visual policy + output protocol for req.system_prompt.
+
+    Per-turn volatile details (candidate count, visible generation tools, preview
+    gating) must NOT appear here so provider prefix caches stay stable across turns.
+    Use ``turn_media_context(...)`` in temporary user content parts for those.
+    """
+    del candidate_count, tool_set
     if reply_modes:
         poke_supported = poke_supported is True
         modes = (
@@ -76,6 +85,7 @@ def selection_prompt(candidate_count: int, tool_set, *, reply_modes=False, poke_
         )
         no_meme_modes = "text、poke 或 silent" if poke_supported else "text 或 silent"
         output = (
+            "动图预览仅为首帧；只使用本轮提供的候选编号，无可用候选时不要伪造表情编号。\n"
             f"[本轮回应方式] 根据上下文、人设和关系自主选择 {modes}。"
             "群聊、被 @、被引用和私聊都允许主动不回，参与计划不强制发言。"
             f'输出 JSON：{{"reply_mode":"{schema_modes}","text":"要说的话","meme_id":null,"narration":""}}。'
@@ -88,7 +98,47 @@ def selection_prompt(candidate_count: int, tool_set, *, reply_modes=False, poke_
             "生图仍走已有工具，最终以 text 模式提供必要文字，不再附带候选表情。"
             "用户要求的代码、Markdown 或 JSON 放在 text 中，不把内部计划发给用户。"
         )
-    return MEDIA_POLICY + candidates + "\n" + available + "\n" + output
+    else:
+        output = _STATIC_LEGACY_OUTPUT_PROTOCOL
+    return MEDIA_POLICY + _STATIC_TOOL_DISCOVERY_RULE + "\n" + output
+
+
+def turn_media_context(
+    candidate_count: int,
+    tool_set,
+    *,
+    reply_modes: bool = False,
+    attached_previews: int | None = None,
+    preview_gated: bool = False,
+) -> str:
+    """Return per-turn volatile candidate & generation-tool summary for temp user parts."""
+    tools = generation_tools(tool_set)
+    count = max(0, int(candidate_count or 0))
+    if count:
+        if preview_gated:
+            candidates = (
+                f"本轮有 {count} 张现成表情候选（当前语境仅提供文字元数据，未附像素预览）。"
+                "只使用下方编号。"
+            )
+        elif attached_previews is not None and attached_previews < count:
+            candidates = (
+                f"本轮有 {count} 张现成表情候选（前 {attached_previews} 张附有预览图，动图预览仅为首帧；"
+                "其余仅提供文字元数据）。只使用下方编号。"
+            )
+        else:
+            candidates = f"本轮有 {count} 张现成表情候选。只使用下方编号；动图预览仅为首帧。"
+    else:
+        candidates = (
+            "本轮没有可用现成表情候选；仍可按语境选择文字或调用可用生图工具，不要伪造表情编号。"
+        )
+        if not reply_modes:
+            candidates += "本轮无现成候选，最终文字直接用普通文本，不包装发送计划 JSON。"
+    available = (
+        "本轮可见的生图工具：" + "、".join(tools) + "。"
+        if tools
+        else "本轮未直接暴露生图工具。若宿主提供按需工具发现，须先由该入口取得允许的工具；否则不能生图。"
+    )
+    return "[本轮视觉上下文]\n" + candidates + "\n" + available
 
 
 def record_selection(

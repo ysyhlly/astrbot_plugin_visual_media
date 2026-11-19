@@ -295,9 +295,11 @@ class MediaBehavior:
         already = getattr(event, "_visual_preferences_processed", False)
         if not scope or not member:
             event._visual_preferences_processed = True
+            default_prefs = self._default_preferences()
+            event._visual_media_member_prefs_v1 = dict(default_prefs)
             if not attach_prompt:
                 return ""
-            return self._format_prompt(event, self._default_preferences())
+            return self._format_prompt(event, default_prefs)
         value = None
         saved_payload = None
         with self.connect() as db:
@@ -320,9 +322,11 @@ class MediaBehavior:
                 event, "preference", "saved", "explicit_user_preference", saved_payload
             )
             event.set_extra("visual_media_preference_saved", True)
+        resolved = value or self._default_preferences()
+        event._visual_media_member_prefs_v1 = dict(resolved)
         if not attach_prompt:
             return ""
-        return self._format_prompt(event, value or self._default_preferences())
+        return self._format_prompt(event, resolved)
 
     def prompt(self, event):
         if not self.settings.preferences_enabled:

@@ -19,6 +19,13 @@ from astrbot.api.event import AstrMessageEvent
 
 from ..search.text_similarity import _has_negation_prefix, calculate_hybrid_similarity
 
+_JOINT_REPLY_KEY = "stealer_joint_reply_v1"
+
+
+def _joint_reply_owned(event: Any) -> bool:
+    getter = getattr(event, "get_extra", None)
+    return bool(callable(getter) and getter(_JOINT_REPLY_KEY, False) is True)
+
 
 def _inherit_series_provider(context: Any) -> str:
     try:
@@ -34,6 +41,22 @@ def _inherit_series_provider(context: Any) -> str:
 _EMOTION_ABSTAIN = object()
 
 _LEGACY_EMOTION_TEMPLATE_HASH = "1914107e8c9b676649a0e92af223db633a7d56e0468dac44148df009e14d4201"
+_EMOTION_ANALYSIS_DEFAULT_SYSTEM_TEMPLATE = """根据本轮对话，提炼助手用于表达情绪、接梗或回应的表情包检索词。表情由助手发给当前用户。
+可选情绪分类：{emotion_list}
+
+任务：
+1. 综合用户消息与助手回复理解这轮交流：共鸣、接梗、调侃、自嘲、安慰、感谢、关心、催促或抗议。
+2. 以助手回复的立场和语气为准，结合用户消息判断语境，区分安慰与嘲笑、关心式催促与敌意反击。
+3. query 用一条简短中文检索句表达助手想怎样回应，包含具体台词、语气或场景，并保留原句中的否定含义。画面和角色以对话中明确提到的内容为准。
+4. emotions 从给定分类中按相关度选 0~3 项，作为检索的辅助线索。
+
+只输出合法 JSON，例如：
+{"query":"安慰加班 辛苦了早点休息","emotions":["tired","sigh"]}
+"""
+
+_EMOTION_ANALYSIS_DEFAULT_USER_TEMPLATE = """用户消息：{user_message}
+助手回复：{llm_reply}"""
+
 _EMOTION_ANALYSIS_DEFAULT_TEMPLATE = """根据本轮对话，提炼助手用于表达情绪、接梗或回应的表情包检索词。表情由助手发给当前用户。
 可选情绪分类：{emotion_list}
 
@@ -367,22 +390,53 @@ class NaturalEmotionAnalyzer:
                 logger.warning("[情绪分析] 未找到可用的文本模型")
                 return None
 
-            # 构建提示词：用分类列表替换 {emotion_list}，再填入具体文本
+            # 构建提示词：默认模板将静态指令与分类列表拆分到 system_prompt 以提升前缀缓存命中率
             emotion_list = self._build_emotion_list_text()
-            prompt = self._render_emotion_analysis_template(
-                self._emotion_analysis_template,
-                emotion_list=emotion_list,
-                llm_reply=llm_reply,
-                user_message=user_message if user_message else "",
-            )
+            user_msg = user_message if user_message else ""
+            call_kwargs: dict[str, Any] = {
+                "chat_provider_id": provider_id,
+                "max_tokens": 120,
+            }
+            if self._emotion_analysis_template == _EMOTION_ANALYSIS_DEFAULT_TEMPLATE:
+                call_kwargs["system_prompt"] = self._render_emotion_analysis_template(
+                    _EMOTION_ANALYSIS_DEFAULT_SYSTEM_TEMPLATE,
+                    emotion_list=emotion_list,
+                    llm_reply="",
+                    user_message="",
+                )
+                call_kwargs["prompt"] = self._render_emotion_analysis_template(
+                    _EMOTION_ANALYSIS_DEFAULT_USER_TEMPLATE,
+                    emotion_list=emotion_list,
+                    llm_reply=llm_reply,
+                    user_message=user_msg,
+                )
+            elif (
+                "{llm_reply}" not in self._emotion_analysis_template
+                and "{user_message}" not in self._emotion_analysis_template
+            ):
+                call_kwargs["system_prompt"] = self._render_emotion_analysis_template(
+                    self._emotion_analysis_template,
+                    emotion_list=emotion_list,
+                    llm_reply="",
+                    user_message="",
+                )
+                call_kwargs["prompt"] = self._render_emotion_analysis_template(
+                    _EMOTION_ANALYSIS_DEFAULT_USER_TEMPLATE,
+                    emotion_list=emotion_list,
+                    llm_reply=llm_reply,
+                    user_message=user_msg,
+                )
+            else:
+                call_kwargs["prompt"] = self._render_emotion_analysis_template(
+                    self._emotion_analysis_template,
+                    emotion_list=emotion_list,
+                    llm_reply=llm_reply,
+                    user_message=user_msg,
+                )
 
             # 调用LLM（限制 max_tokens 提升速度）
             logger.debug(f"[情绪分析] 调用LLM，provider_id={provider_id}")
-            response = await self.plugin.context.llm_generate(
-                chat_provider_id=provider_id,
-                prompt=prompt,
-                max_tokens=120,
-            )
+            response = await self.plugin.context.llm_generate(**call_kwargs)
 
             # 安全获取响应文本
             if not response:
@@ -619,7 +673,9 @@ class NaturalEmotionAnalyzer:
     async def analyze_for_reply(
         self, event: AstrMessageEvent, llm_reply: str, *, user_message: str = ""
     ) -> EmotionQuery | None:
-        """自动发送入口：关闭分析时直接跳过，其余逻辑由分析器统一处理。"""
+        """自动发送入口：关闭分析或已由联合回复接管时直接跳过，其余逻辑由分析器统一处理。"""
         if not self.plugin_config.enable_natural_emotion_analysis:
+            return None
+        if _joint_reply_owned(event):
             return None
         return await self.analyze_emotion(event, llm_reply, user_message=user_message)

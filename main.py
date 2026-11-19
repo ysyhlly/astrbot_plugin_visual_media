@@ -30,6 +30,7 @@ from astrbot.api.event.filter import (
 from astrbot.api.star import Context, Star
 from astrbot.core.star.star import star_registry
 
+from .core.tools.joint_reply import joint_reply_owned
 from .generation_engine import GeminiImageGenerationPlugin as GenerationEngine
 from .media_api import MediaAPI
 from .media_library import MediaLibrary
@@ -610,6 +611,25 @@ class VisualMediaPlugin(Star):
             return
         return await self.memes._start_joint_meme_prefetch(event, req)
 
+    @staticmethod
+    def _attach_temp_user_prompt(req: Any, extra_prompt: str) -> None:
+        """Append per-speaker/per-turn visual preferences to temp user parts to keep system_prompt static."""
+        extra_parts = getattr(req, "extra_user_content_parts", None)
+        if isinstance(extra_parts, list):
+            try:
+                from astrbot.core.agent.message import TextPart
+            except ImportError:
+                TextPart = None
+            if TextPart is not None:
+                part = TextPart(text=extra_prompt.strip())
+                if hasattr(part, "mark_as_temp"):
+                    part = part.mark_as_temp()
+                extra_parts.append(part)
+                return
+        req.system_prompt = (
+            str(getattr(req, "system_prompt", "") or "") + extra_prompt
+        )
+
     @filter.on_llm_request(priority=1)
     async def _prepare_joint_meme_reply(self, event: AstrMessageEvent, req):
         if event.get_extra("_narrative_internal_v1", False):
@@ -620,9 +640,7 @@ class VisualMediaPlugin(Star):
         )
         if attach_prompt:
             if extra_prompt:
-                req.system_prompt = (
-                    str(getattr(req, "system_prompt", "") or "") + extra_prompt
-                )
+                self._attach_temp_user_prompt(req, extra_prompt)
             req._visual_preferences_attached = True
         if event.get_extra("visual_media_generation_requested", False):
             return
@@ -635,14 +653,20 @@ class VisualMediaPlugin(Star):
         AstrBot skips ``on_decorating_result`` while a result is still a
         streaming result.  The LLM response hook runs after the agent has its
         final response and gives passive emoji scheduling a stable entry point."""
-        if event.get_extra("visual_media_generation_requested", False):
+        if (
+            event.get_extra("visual_media_generation_requested", False)
+            or joint_reply_owned(event)
+        ):
             return
         return await self.memes._prepare_emoji_after_llm(event, response)
 
     @filter.on_decorating_result(priority=100)
     async def _prepare_emoji_response(self, event: AstrMessageEvent):
         """LLM 回复完成后异步发送表情包（不阻塞回复）。"""
-        if event.get_extra("visual_media_generation_requested", False):
+        if (
+            event.get_extra("visual_media_generation_requested", False)
+            or joint_reply_owned(event)
+        ):
             return
         return await self.memes._prepare_emoji_response(event)
 

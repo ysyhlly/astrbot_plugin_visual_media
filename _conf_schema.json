@@ -9,6 +9,81 @@
         "default": true,
         "hint": "Chat Dynamics 通过参与判断后，先检索表情候选供回复模型选择仅文字、仅表情或文字加表情；本轮不再后台补图。需要支持联合回复的 Chat Dynamics，关闭可恢复原流程。"
       },
+      "joint_reply_max_preview_images": {
+        "description": "联合回复最多附带像素预览张数",
+        "type": "int",
+        "default": 3,
+        "slider": {
+          "min": 2,
+          "max": 5,
+          "step": 1
+        },
+        "hint": "每轮最多向主回复模型附带的表情像素预览张数（默认 3，可调 2~5）；其余候选仍附带精简文字元数据以节省视觉 Token。",
+        "condition": {
+          "show_advanced_settings": true,
+          "llm_joint_reply": true
+        }
+      },
+      "joint_reply_preview_max_size": {
+        "description": "联合回复预览图最大边长（像素）",
+        "type": "int",
+        "default": 320,
+        "slider": {
+          "min": 128,
+          "max": 768,
+          "step": 32
+        },
+        "hint": "缩小附给回复模型的表情缩略图尺寸（默认 320×320），显著降低视觉输入体积并启用内存编码缓存。",
+        "condition": {
+          "show_advanced_settings": true,
+          "llm_joint_reply": true
+        }
+      },
+      "joint_reply_preview_format": {
+        "description": "联合回复预览图编码格式",
+        "type": "string",
+        "default": "webp",
+        "options": [
+          "webp",
+          "jpeg",
+          "png"
+        ],
+        "labels": [
+          "WebP（体积最小，不可用时自动降级 JPEG）",
+          "JPEG（兼容性好）",
+          "PNG（无损较大）"
+        ],
+        "hint": "默认使用 WebP 压缩预览；当运行环境 Pillow 未编译 WebP 时自动回退 JPEG。",
+        "condition": {
+          "show_advanced_settings": true,
+          "llm_joint_reply": true
+        }
+      },
+      "joint_reply_preview_quality": {
+        "description": "联合回复预览图压缩质量",
+        "type": "int",
+        "default": 75,
+        "slider": {
+          "min": 40,
+          "max": 95,
+          "step": 5
+        },
+        "hint": "WebP/JPEG 预览压缩质量（默认 75）。",
+        "condition": {
+          "show_advanced_settings": true,
+          "llm_joint_reply": true
+        }
+      },
+      "joint_reply_preview_context_gate": {
+        "description": "按语境门控像素预览上传",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后仅在轻松、玩梗、情绪互动或明确提到表情的回合附带像素预览；事实问答、技术/代码讨论或严肃长回合仅附文字元数据，大幅节省视觉 Token。",
+        "condition": {
+          "show_advanced_settings": true,
+          "llm_joint_reply": true
+        }
+      },
       "_steal_section": {
         "description": "=== 偷图设置 ===",
         "type": "text",

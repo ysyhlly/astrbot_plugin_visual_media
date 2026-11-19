@@ -24,6 +24,11 @@ class PluginConfig(BaseModel):
     steal_chance: float = 0.3  # 概率模式下的偷图概率
     auto_send_meme: bool = True
     llm_joint_reply: bool = True
+    joint_reply_preview_max_size: int = 320  # 联合回复候选像素预览最大边长 (128..768)
+    joint_reply_preview_format: str = "webp"  # webp / jpeg / png（webp 不可用时自动降级 jpeg）
+    joint_reply_preview_quality: int = 75  # 联合回复候选预览压缩质量 (40..95)
+    joint_reply_max_preview_images: int = 3  # 每轮最多附带的像素预览张数 (2..5)
+    joint_reply_preview_context_gate: bool = True  # 按语境门控像素预览（技术/严肃/长问答仅传文字元数据）
     meme_chance: float = 0.2
     send_meme_as_qq_sticker: bool = True
     send_meme_as_gif: bool = False

@@ -13,6 +13,7 @@ from astrbot.api.message_components import Image as MessageImage
 from ..processing.natural_emotion_analyzer import EmotionQuery
 from ..search.jev_selector import JevSelectionError, JevSelector
 from ..search.punctuation_emotion import punctuation_emotion_weights
+from ..tools.joint_reply import joint_reply_owned
 from .event_context import get_event_session_key
 
 
@@ -410,7 +411,7 @@ class MemeSenderEngine:
         """
         try:
             channel = getattr(event, "_cd_deferred_reply_media_v1", None)
-            if event.get_extra("visual_media_generation_requested", False):
+            if event.get_extra("visual_media_generation_requested", False) or joint_reply_owned(event):
                 return
             if getattr(event, "_chat_dynamics_owned_request", False):
                 if channel is None or not await channel.wait_ready():

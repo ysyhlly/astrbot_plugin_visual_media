@@ -40,6 +40,15 @@ except ImportError as e:  # pragma: no cover - 仅低版本框架触发
     MessageSession = ProviderRequest = SendMessageToUserTool = None
     persist_agent_history = None
 
+try:
+    from astrbot.core.agent.message import TextPart
+except ImportError:  # pragma: no cover - 兼容旧版框架
+    TextPart = None
+
+_STATIC_BACKGROUND_TASK_REF = (
+    "(Provided in the current turn temporary [Background task result] user context.)"
+)
+
 
 def _build_notice_prompt(task_id: str | None, failure_summary: str) -> str:
     tid = f"（任务号 {task_id}）" if task_id else ""
@@ -145,11 +154,20 @@ async def notify_llm_background_result(
         conv = await _get_session_conv(event=cron_event, plugin_context=context)
         req.conversation = conv
         req.contexts = json.loads(conv.history)
-        req.system_prompt += BACKGROUND_TASK_RESULT_WOKE_SYSTEM_PROMPT.format(
-            background_task_result=json.dumps(
-                extras["background_task_result"], ensure_ascii=False
+        wake_template = str(BACKGROUND_TASK_RESULT_WOKE_SYSTEM_PROMPT or "")
+        if "{background_task_result}" in wake_template:
+            static_wake = wake_template.format(
+                background_task_result=_STATIC_BACKGROUND_TASK_REF
             )
+        else:
+            static_wake = wake_template
+        req.system_prompt += static_wake
+        payload_json = json.dumps(
+            extras["background_task_result"],
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
+        payload_text = f"[Background task result]\n{payload_json}"
         req.prompt = (
             "Proceed according to your system instructions. "
             "Output using same language as previous conversation. "
@@ -164,6 +182,14 @@ async def notify_llm_background_result(
             "Use the supplied locations exactly; do not regenerate completed images. "
             "After completing your task, summarize and output your actions and results. "
         )
+        extra_parts = getattr(req, "extra_user_content_parts", None)
+        if isinstance(extra_parts, list) and TextPart is not None:
+            part = TextPart(text=payload_text)
+            if hasattr(part, "mark_as_temp"):
+                part = part.mark_as_temp()
+            extra_parts.append(part)
+        else:
+            req.prompt = req.prompt + "\n\n" + payload_text
         if not req.func_tool:
             req.func_tool = ToolSet()
         req.func_tool.add_tool(
