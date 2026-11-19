@@ -61,7 +61,7 @@ def test_selection_prompt_static_and_turn_context_dynamic(reply_modes, poke_supp
     assert "本轮没有可用现成表情候选" in ctx0
     assert "本轮未直接暴露生图工具" in ctx0
     assert "本轮有 3 张现成表情候选" in ctx3 and "前 2 张附有预览图" in ctx3
-    assert "本轮可见的生图工具：gemini_image_generation" in ctx3
+    assert "本轮通过会话筛选的生图工具：gemini_image_generation" in ctx3
     assert "仅提供文字元数据" in ctx_gated
 
 

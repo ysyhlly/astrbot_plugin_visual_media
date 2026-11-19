@@ -149,10 +149,10 @@ async def test_vm1_prepare_joint_reply_keeps_system_prompt_static_and_tools_cons
     assert "本轮没有可用现成表情候选" in contexts[0][0].text
     assert "本轮未直接暴露生图工具" in contexts[0][0].text
     assert "本轮有 3 张现成表情候选" in contexts[1][0].text
-    assert "本轮可见的生图工具：gemini_image_generation" in contexts[1][0].text
+    assert "本轮通过会话筛选的生图工具：gemini_image_generation" in contexts[1][0].text
     assert "本轮有 5 张现成表情候选" in contexts[2][0].text
     assert (
-        "本轮可见的生图工具：gemini_image_generation、generate_character_image"
+        "本轮通过会话筛选的生图工具：gemini_image_generation、generate_character_image"
         in contexts[2][0].text
     )
 
@@ -160,7 +160,104 @@ async def test_vm1_prepare_joint_reply_keeps_system_prompt_static_and_tools_cons
 def test_vm1_turn_media_context_covers_legacy_plain_text_reminder():
     text = turn_media_context(0, make_tools("gemini_image_generation"), reply_modes=False)
     assert "直接用普通文本" in text
-    assert "本轮可见的生图工具：gemini_image_generation" in text
+    assert "本轮通过会话筛选的生图工具：gemini_image_generation" in text
+
+
+@pytest.mark.asyncio
+async def test_gpt_cost1_preserved_visual_reply_policy_handoff_and_toctou_validation(
+    tmp_path, monkeypatch
+):
+    from astrbot_plugin_visual_media.core.tools.joint_preview import (
+        JointPreviewCache,
+        is_preview_source_current,
+    )
+    from astrbot_plugin_visual_media.core.tools.media_policy import MEDIA_POLICY
+
+    img1 = Path(_save_test_image(tmp_path / "c1.png", size=(400, 400)))
+    img2 = Path(_save_test_image(tmp_path / "c2.png", size=(400, 400)))
+    fake = make_plugin()
+    monkeypatch.setattr(joint_prefetch, "start_joint_prefetch", lambda p, e: None)
+
+    ev = make_event("哈哈哈哈笑死我了")
+    ev._cd_joint_meme_supported_v1 = True
+    ev._cd_reply_modes_v1 = True
+    ev._cd_visual_reply_policy_supported_v1 = True
+    ev._cd_original_user_text_v1 = "哈哈哈哈笑死我了"
+    ev._stealer_joint_meme_plan_v1 = JointMemePlan(
+        fake,
+        ev,
+        [
+            {"path": str(img1), "desc": "猫1"},
+            {"path": str(img2), "desc": "猫2"},
+        ],
+    )
+    req = NS(
+        system_prompt="host-system",
+        extra_user_content_parts=[],
+        func_tool=_removable_tools("search_meme", "send_meme", "gemini_image_generation"),
+    )
+    assert await prepare_joint_reply(fake, ev, req)
+
+    # Under _cd_visual_reply_policy_supported_v1, visual_media hands off static MEDIA_POLICY
+    # + render_state callback without mutating req.system_prompt or duplicating turn context
+    assert req.system_prompt == "host-system"
+    assert ev.get_extra("_visual_media_static_policy_v1") is True
+    policy_plan, media_policy, render_state = req._cd_visual_reply_policy_v1
+    assert policy_plan is ev._stealer_joint_meme_plan_v1
+    assert media_policy == MEDIA_POLICY
+    assert isinstance(fake._joint_meme_preview_cache, JointPreviewCache)
+    assert req._stealer_joint_meme_ids_v1 == (1, 2)
+    rendered = render_state(req._stealer_joint_meme_ids_v1, req.func_tool)
+    assert "编号为 1、2" in rendered
+    assert "gemini_image_generation" in rendered
+
+    # Previews rendered via JointPreviewCache are shrunk WebP/JPEG (<=320px)
+    img_parts = [p for p in req.extra_user_content_parts if isinstance(p, ImageURLPart)]
+    assert len(img_parts) == 2
+    assert img_parts[0].image_url.url.startswith(
+        ("data:image/webp;base64,", "data:image/jpeg;base64,")
+    )
+
+    # Replacing img2 invalidates its source_version; current_ids() strips candidate 2
+    # and JointMemePlan.resolve() rejects unoffered candidate 2.
+    ver2 = ev._stealer_joint_meme_plan_v1.candidates[1]["_joint_preview_source_version"]
+    assert is_preview_source_current(str(img2), ver2)
+    _save_test_image(img2, size=(120, 120), color=(255, 0, 0, 255))
+    assert not is_preview_source_current(str(img2), ver2)
+    remaining_ids = req._stealer_joint_meme_current_ids_v1()
+    assert remaining_ids == (1,)
+    with pytest.raises(ValueError, match="invalid_joint_meme_candidate"):
+        ev._stealer_joint_meme_plan_v1.resolve(
+            '{"reply_mode":"meme_only","text":"","meme_id":2}'
+        )
+
+
+def test_gpt_cost1_preserved_empty_catalogue_cache_and_library_version(tmp_path):
+    from astrbot_plugin_visual_media.core.db.database_service import DatabaseService
+    from astrbot_plugin_visual_media.core.tools.joint_prefetch import EmptyCatalogueCache
+
+    db = DatabaseService(tmp_path / "emoji.db")
+    snap, version = db.get_library_snapshot()
+    assert snap == {}
+    assert len(version) == 3
+    assert db.get_library_version() == version
+
+    cache = EmptyCatalogueCache(ttl_seconds=30, max_entries=4)
+    fake_plugin = NS(
+        plugin_config=NS(get_event_target=lambda e: ("group", "100")),
+    )
+    ev = NS(
+        get_platform_id=lambda: "aiocqhttp",
+        get_self_id=lambda: "999",
+        get_sender_id=lambda: "123",
+        unified_msg_origin="aiocqhttp:GroupMessage:100",
+    )
+    key = cache.key(fake_plugin, ev, "hello")
+    assert key is not None
+    assert cache.check(key, version) == "cold"
+    cache.remember(key, version)
+    assert cache.check(key, version) == "hit"
+    assert cache.check(key, ("other", version[1], version[2])) == "version_changed"
 
 
 # ---------------------------------------------------------------------------

@@ -56,7 +56,7 @@ class DatabaseService(
         # 异步锁，保护并发写入
         self._write_lock = asyncio.Lock()
         self._snapshot_lock = threading.RLock()
-        self._snapshot_revision: str | None = None
+        self._snapshot_revision: tuple[str, str] | None = None
         self._snapshot: dict[str, Any] = {}
 
     def _ensure_db_dir(self) -> None:
@@ -776,20 +776,44 @@ class DatabaseService(
 
     def get_search_snapshot(self) -> tuple[dict[str, Any], str]:
         """Metadata and corpus version from the same SQLite read transaction."""
+        snapshot, (corpus_id, _, corpus_revision) = self.get_library_snapshot()
+        return snapshot, f"{corpus_id}:{corpus_revision}"
+
+    @staticmethod
+    def _read_library_version(conn) -> tuple[str, str, str]:
+        versions = dict(
+            conn.execute(
+                "SELECT key, value FROM meta WHERE key IN ('library_revision', 'corpus_id', 'corpus_revision')"
+            )
+        )
+        return (
+            versions["corpus_id"],
+            versions["library_revision"],
+            versions["corpus_revision"],
+        )
+
+    def get_library_version(self) -> tuple[str, str, str]:
+        """Read the versions that govern search text and catalogue eligibility."""
+        with self._get_connection() as conn:
+            return self._read_library_version(conn)
+
+    def get_library_snapshot(self) -> tuple[dict[str, Any], tuple[str, str, str]]:
+        """Copy the indexed rows and their committed library version together."""
         with self._snapshot_lock, self._get_connection() as conn:
             conn.execute("BEGIN")
-            versions = {row["key"]: row["value"] for row in conn.execute(
-                "SELECT key, value FROM meta WHERE key IN ('library_revision', 'corpus_id', 'corpus_revision')"
-            )}
-            revision = versions["library_revision"]
+            version = self._read_library_version(conn)
+            revision = version[:2]
             if revision != self._snapshot_revision:
                 self._snapshot = self._read_index(conn)
                 self._snapshot_revision = revision
             snapshot = {
-                path: {key: value.copy() if isinstance(value, list) else value for key, value in entry.items()}
+                path: {
+                    key: value.copy() if isinstance(value, list) else value
+                    for key, value in entry.items()
+                }
                 for path, entry in self._snapshot.items()
             }
-            return snapshot, f"{versions['corpus_id']}:{versions['corpus_revision']}"
+            return snapshot, version
 
     def _read_index(self, conn: sqlite3.Connection, paths: list[str] | None = None) -> dict[str, Any]:
         """Hydrate a coherent snapshot or a bounded set of submitted paths."""

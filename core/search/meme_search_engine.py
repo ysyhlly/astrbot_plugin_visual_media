@@ -162,7 +162,7 @@ class MemeSearchEngine:
             self._bm25_doc_paths = doc_paths
             self._bm25_signature = signature
             self._bm25_dirty = epoch != self._bm25_epoch
-            logger.debug(f"[BM25] 索引构建完成: {len(documents)} 文档, 示例: {documents[:3]}")
+            logger.debug("[BM25] 索引构建完成 docs=%d", len(documents))
 
             if self._cache_path:
                 try:

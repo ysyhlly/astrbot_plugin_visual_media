@@ -37,30 +37,65 @@ class MemeSearchToolWorkflow:
         context = " ".join(part for part in (query, reply, character) if part).strip()
         return await self.meme_selector.smart_search(context, limit=limit, idx=idx, event=event)
 
-    async def _search_meme_impl(self, event: AstrMessageEvent, query: str, reply: str = "", character: str = ""):
+    async def _search_meme_impl(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        reply: str = "",
+        character: str = "",
+        *,
+        on_outcome=None,
+    ):
         """Build the current search's numbered, sendable candidates."""
         event = unwrap_event(event)
         query = str(query or "").strip()
-        logger.info(f"[Tool] LLM 搜索表情包: {query}")
+        logger.info("[Tool] LLM 搜索表情包")
 
         turn_state = self._emoji_sender_engine.emoji_turn_state(event)
         turn_state.set_candidates([])
 
+        def report(outcome, version=None):
+            if on_outcome is not None:
+                on_outcome(outcome, version)
+
+        no_match = (
+            f"未找到与“{query}”贴合的表情包。可补充图上原文或 reply；"
+            "指定 character 时请核对角色名。当前没有可发送候选，可直接用文字回复。"
+        )
         try:
             if not query:
+                report("empty_query")
                 yield "搜索失败：缺少 query。请描述要表达的台词、语气或场景，例如：安慰刚加班的朋友。"
                 return
 
             if not self.is_send_enabled_for_event(event):
+                report("disabled")
                 yield "搜索失败：当前会话已禁用表情包发送。"
                 return
 
-            if self.db_service.count_total() > 0:
-                idx = await asyncio.to_thread(self.db_service.get_index_cache_readonly)
+            db = self.db_service
+            if on_outcome is not None:
+                idx, version = await asyncio.to_thread(db.get_library_snapshot)
+                if not idx and not self.index_manager._migration_done:
+                    await self.index_manager.load_index()
+                    idx, version = await asyncio.to_thread(db.get_library_snapshot)
+                if not any(
+                    self.meme_selector._is_entry_allowed_for_event(row, event)
+                    for row in idx.values()
+                ):
+                    # Prove absence from the catalogue before file, ranking, and
+                    # preference checks, which can all produce temporary misses.
+                    if idx or self.index_manager._migration_done:
+                        report("empty_catalogue", version)
+                    else:
+                        report("catalogue_unverified")
+                    yield no_match
+                    return
             else:
-                logger.debug("索引未加载，正在加载...")
-                await self.index_manager.load_index()
-                idx = await asyncio.to_thread(self.db_service.get_index_cache_readonly)
+                if db.count_total() == 0:
+                    logger.debug("索引未加载，正在加载...")
+                    await self.index_manager.load_index()
+                idx = await asyncio.to_thread(db.get_index_cache_readonly)
 
             idx = await asyncio.to_thread(lambda: {
                 path: data for path, data in idx.items() if os.path.isfile(path)
@@ -71,6 +106,7 @@ class MemeSearchToolWorkflow:
             if character:
                 search_options["character"] = str(character).strip()
             results = await self._search_meme_candidates(event, query, **search_options)
+            had_ranked_candidates = bool(results)
 
             behavior = getattr(self, "media_behavior", None)
             if behavior:
@@ -80,8 +116,9 @@ class MemeSearchToolWorkflow:
                 results = sorted((item for item in results if item[0] in order), key=lambda item: order[item[0]])
 
             if not results:
-                yield (f"未找到与“{query}”贴合的表情包。可补充图上原文或 reply；"
-                       "指定 character 时请核对角色名。当前没有可发送候选，可直接用文字回复。")
+                outcome = "no_ranked_candidate" if idx else "files_missing"
+                report("filtered" if had_ranked_candidates else outcome)
+                yield no_match
                 return
 
             candidates = []
@@ -138,6 +175,7 @@ class MemeSearchToolWorkflow:
                     result_lines.append(f"    描述：{desc}")
 
             if not candidates:
+                report("files_missing")
                 yield "搜索失败：找到的表情包文件均已丢失"
                 return
 
@@ -149,11 +187,16 @@ class MemeSearchToolWorkflow:
 
             result_text = "\n".join(result_lines)
             logger.info(f"[Tool] 搜索完成，返回 {len(candidates)} 个候选")
+            report("candidates")
             yield result_text
 
         except Exception as e:
-            logger.error(f"[Tool] 搜索表情包失败: {e}", exc_info=True)
-            yield f"搜索出错：{e}"
+            if on_outcome is None:
+                logger.error(f"[Tool] 搜索表情包失败: {e}", exc_info=True)
+                yield f"搜索出错：{e}"
+            else:
+                report("timeout" if isinstance(e, TimeoutError) else "error")
+                yield "搜索出错"
 
     async def _send_meme_impl(self, event: AstrMessageEvent, emoji_id: int):
         """按本次 search_meme 返回的候选编号发送表情包。

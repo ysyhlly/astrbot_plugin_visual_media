@@ -987,6 +987,8 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
         self._terminated = True
         for prefetch in tuple(getattr(self, "_joint_reply_prefetches", ())):
             await prefetch.close()
+        self._joint_empty_catalogue_cache = None
+        self._joint_meme_preview_cache = None
         await self.menu_commands.aclose()
         await self.index_manager.stop_search_worker()
         try:

@@ -2,14 +2,80 @@
 
 import asyncio
 import copy
+import hmac
+import json
+import secrets
 import time
+from collections import OrderedDict
+
+
+class EmptyCatalogueCache:
+    def __init__(self, *, ttl_seconds=30, max_entries=256):
+        self._ttl_seconds = ttl_seconds
+        self._max_entries = max_entries
+        self._secret = secrets.token_bytes(32)
+        self._entries = OrderedDict()
+
+    def key(self, plugin, event, query):
+        try:
+            scope, target = plugin.plugin_config.get_event_target(event)
+            identity = (
+                event.get_platform_id(),
+                event.get_self_id(),
+                event.get_sender_id(),
+                event.unified_msg_origin,
+                scope,
+                target,
+            )
+        except Exception:
+            return None
+        if not all(identity):
+            return None
+        payload = json.dumps((*map(str, identity), query)).encode("utf-8")
+        return hmac.digest(self._secret, payload, "sha256")
+
+    def check(self, key, version):
+        entry = self._entries.get(key)
+        if entry is None:
+            return "cold"
+        stored_version, expires = entry
+        if stored_version != version:
+            self._entries.pop(key)
+            return "version_changed"
+        if time.monotonic() >= expires:
+            self._entries.pop(key)
+            return "expired"
+        self._entries.move_to_end(key)
+        return "hit"
+
+    def remember(self, key, version):
+        self._entries[key] = (version, time.monotonic() + self._ttl_seconds)
+        self._entries.move_to_end(key)
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+
+def joint_search_enabled(plugin, event):
+    config = plugin.plugin_config
+    return (
+        getattr(plugin, "_terminated", False) is not True
+        and getattr(config, "llm_joint_reply", True)
+        and getattr(config, "auto_send_meme", True)
+        and plugin.is_send_enabled_for_event(event)
+    )
 
 
 class JointReplyPrefetch:
+    timeout_seconds = 6
+
     def __init__(self, plugin, event, query):
         self.plugin, self.event, self.query = plugin, event, query
         self.started = time.monotonic()
-        self.task = asyncio.create_task(self._search())
+        self.outcome = "pending"
+        self.cache_reason = "bypass"
+        self.task = asyncio.create_task(
+            asyncio.wait_for(self._search(), timeout=self.timeout_seconds)
+        )
         jobs = getattr(plugin, "_joint_reply_prefetches", None)
         if jobs is None:
             jobs = set()
@@ -23,7 +89,32 @@ class JointReplyPrefetch:
 
         self.task.add_done_callback(done)
 
+    async def _library_version(self):
+        try:
+            return await asyncio.to_thread(self.plugin.db_service.get_library_version)
+        except Exception:
+            return None
+
     async def _search(self):
+        if not self.query:
+            return "empty_query", [], None
+        if not joint_search_enabled(self.plugin, self.event):
+            return "disabled", [], None
+
+        cache = getattr(self.plugin, "_joint_empty_catalogue_cache", None)
+        if cache is None:
+            cache = self.plugin._joint_empty_catalogue_cache = EmptyCatalogueCache()
+        key = cache.key(self.plugin, self.event, self.query)
+        version = await self._library_version() if key is not None else None
+        if key is None:
+            self.cache_reason = "identity_unavailable"
+        elif version is None:
+            self.cache_reason = "version_unavailable"
+        else:
+            self.cache_reason = cache.check(key, version)
+            if self.cache_reason == "hit":
+                return "empty_catalogue", [], version
+
         clone = copy.copy(self.event)
         clone._extras = dict(getattr(self.event, "_extras", {}) or {})
         clone._extras.pop("provider_request", None)
@@ -43,19 +134,27 @@ class JointReplyPrefetch:
 
         clone.send = no_send
 
-        async def run():
-            async for _ in self.plugin._search_meme_impl(clone, self.query):
-                pass
-            return [
-                dict(row)
-                for row in self.plugin._emoji_sender_engine.emoji_turn_state(
-                    clone
-                ).get_candidates()[:5]
-            ]
+        outcome, observed_version = "unconfirmed_empty", None
 
-        if not self.query or not self.plugin.is_send_enabled_for_event(self.event):
-            return []
-        return await asyncio.wait_for(run(), timeout=6)
+        def report(search_outcome, library_version):
+            nonlocal outcome, observed_version
+            outcome, observed_version = search_outcome, library_version
+
+        async for _ in self.plugin._search_meme_impl(
+            clone, self.query, on_outcome=report
+        ):
+            pass
+        candidates = self.plugin._emoji_sender_engine.emoji_turn_state(
+            clone
+        ).get_candidates()
+        return outcome, candidates[:5], observed_version
+
+    async def _join(self):
+        outcome, candidates, version = await asyncio.shield(self.task)
+        # The early hook can finish before later hooks or a library import commits.
+        if version is not None and await self._library_version() != version:
+            return await asyncio.wait_for(self._search(), timeout=self.timeout_seconds)
+        return outcome, candidates, version
 
     async def result(self, plugin, event, query, *, wait_seconds=None):
         if (
@@ -66,26 +165,38 @@ class JointReplyPrefetch:
         ):
             return None
         try:
-            result = (
-                await self.task
+            outcome, result, version = (
+                await self._join()
                 if wait_seconds is None
-                else await asyncio.wait_for(
-                    asyncio.shield(self.task), timeout=wait_seconds
-                )
+                else await asyncio.wait_for(self._join(), timeout=wait_seconds)
             )
+            if not joint_search_enabled(plugin, event):
+                self.outcome = "disabled"
+                return []
+            allowed = [
+                dict(row)
+                for row in result
+                if plugin.meme_selector.is_path_allowed_for_event(row["path"], event)
+            ]
         except asyncio.CancelledError:
             raise
-        except asyncio.TimeoutError:
+        except TimeoutError:
+            self.outcome = "timeout"
             return []
         except Exception:
+            self.outcome = "error"
             return []
-        if not plugin.is_send_enabled_for_event(event):
-            return []
-        return [
-            dict(row)
-            for row in result
-            if plugin.meme_selector.is_path_allowed_for_event(row["path"], event)
-        ]
+        self.outcome = "filtered" if result and not allowed else outcome
+        if (
+            self.outcome == "empty_catalogue"
+            and version is not None
+            and self.cache_reason != "hit"
+        ):
+            cache = plugin._joint_empty_catalogue_cache
+            key = cache.key(plugin, event, query)
+            if key is not None:
+                cache.remember(key, version)
+        return allowed
 
     async def close(self):
         if not self.task.done():
@@ -94,14 +205,10 @@ class JointReplyPrefetch:
 
 
 def start_joint_prefetch(plugin, event):
-    config = plugin.plugin_config
     if (
-        not getattr(config, "llm_joint_reply", True)
-        or not getattr(config, "auto_send_meme", True)
-        or getattr(event, "_cd_joint_meme_supported_v1", False) is not True
+        getattr(event, "_cd_joint_meme_supported_v1", False) is not True
         or plugin._emoji_sender_engine.is_command_event(event)
-        or not plugin.is_send_enabled_for_event(event)
-        or getattr(plugin, "_terminated", False) is True
+        or not joint_search_enabled(plugin, event)
     ):
         return None
     existing = getattr(event, "_stealer_joint_prefetch_v1", None)

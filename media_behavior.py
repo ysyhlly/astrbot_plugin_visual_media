@@ -341,7 +341,14 @@ class MediaBehavior:
     def _fingerprint(self, candidate):
         path = Path(candidate["path"])
         stat = path.stat()
-        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        key = (
+            str(path),
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+        )
         if key in self.cache:
             self.cache.move_to_end(key)
             digest, phash = self.cache[key]

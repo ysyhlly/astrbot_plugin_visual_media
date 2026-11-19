@@ -7,26 +7,40 @@ import os
 import re
 import threading
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
+from copy import copy
 from io import BytesIO
 
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Image, Plain
 
+from . import joint_prefetch
+from .joint_prefetch import joint_search_enabled
+from .joint_preview import (
+    DEFAULT_PREVIEW_FORMAT,
+    DEFAULT_PREVIEW_MAX_SIZE,
+    DEFAULT_PREVIEW_QUALITY,
+    JointPreviewCache,
+    PreviewSourceChanged,
+    is_preview_source_current,
+)
 from .media_policy import (
+    MEDIA_POLICY,
     generation_tools,
     record_selection,
     selection_prompt,
+    selection_state_prompt,
     turn_media_context,
 )
 
 JOINT_REPLY_KEY = "stealer_joint_reply_v1"
 MEME_HISTORY_LABEL = "已发送表情包的历史资料（非正文）"
+NO_CANDIDATE_MATERIAL = "[本轮表情候选资料] 无可用现成表情；按统一视觉表达规则选择文字或可用生图工具。"
 
-_DEFAULT_PREVIEW_MAX_SIZE = 320
-_DEFAULT_PREVIEW_FORMAT = "webp"
-_DEFAULT_PREVIEW_QUALITY = 75
+_DEFAULT_PREVIEW_MAX_SIZE = DEFAULT_PREVIEW_MAX_SIZE
+_DEFAULT_PREVIEW_FORMAT = DEFAULT_PREVIEW_FORMAT
+_DEFAULT_PREVIEW_QUALITY = DEFAULT_PREVIEW_QUALITY
 _DEFAULT_MAX_PREVIEW_IMAGES = 3
 _PREVIEW_CACHE_MAX_ITEMS = 256
 _PREVIEW_CACHE: OrderedDict[tuple, str] = OrderedDict()
@@ -319,11 +333,22 @@ def should_attach_pixel_previews(plan, event=None) -> tuple[bool, str]:
     return False, "neutral_turn_metadata_only"
 
 
+def _candidate_available(plugin, event, path):
+    return (
+        os.path.isfile(path)
+        and not event.get_extra("visual_media_generation_requested", False)
+        and joint_search_enabled(plugin, event)
+        and plugin.meme_selector.is_path_allowed_for_event(path, event)
+    )
+
+
 async def attach_temporary_candidates(plan, request):
     from astrbot.core.agent.message import ImageURLPart, TextPart
 
     if getattr(request, "_stealer_joint_meme_parts_v1", False):
         return
+    started = time.monotonic()
+    counts = Counter()
     cfg = getattr(getattr(plan, "plugin", None), "plugin_config", None)
     max_size = _bounded_int(
         getattr(cfg, "joint_reply_preview_max_size", _DEFAULT_PREVIEW_MAX_SIZE),
@@ -348,75 +373,183 @@ async def attach_temporary_candidates(plan, request):
         _DEFAULT_MAX_PREVIEW_IMAGES,
     )
 
-    allowed_candidates = []
-    for number, candidate in enumerate(plan.candidates, 1):
-        # Recheck the same scope that applies to delivery before uploading pixels.
-        if not plan.plugin.is_send_enabled_for_event(
-            plan.event
-        ) or not plan.plugin.meme_selector.is_path_allowed_for_event(
-            candidate["path"], plan.event
-        ):
-            continue
-        allowed_candidates.append((number, candidate))
+    cache = getattr(plan.plugin, "_joint_meme_preview_cache", None)
+    if cache is None and plan.candidates:
+        cache = plan.plugin._joint_meme_preview_cache = JointPreviewCache()
+
+    def can_upload(candidate):
+        behavior = getattr(plan, "behavior", None)
+        reason = getattr(behavior, "reason_prepared", None)
+        return (
+            not getattr(behavior, "stop_sends", False)
+            and _candidate_available(plan.plugin, plan.event, candidate["path"])
+            and (reason is None or not reason(plan.event, candidate))
+        )
 
     attach_pixels, gate_reason = (
         should_attach_pixel_previews(plan, plan.event)
-        if allowed_candidates
+        if plan.candidates
         else (False, "no_candidates")
     )
 
-    candidate_parts = []
-    previews_attached = 0
-    for number, candidate in allowed_candidates:
-        data = _public_candidate(candidate, number)
-        candidate_parts.append(
-            TextPart(
-                text="[本轮表情候选资料] "
-                + json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-            ).mark_as_temp()
-        )
-        if not attach_pixels or previews_attached >= max_previews:
+    prepared = []
+    previews_planned = 0
+    for number, candidate in enumerate(plan.candidates, 1):
+        if not can_upload(candidate):
+            counts["denied"] += 1
+            continue
+        if not attach_pixels or previews_planned >= max_previews:
+            prepared.append((number, candidate, None, True))
             continue
         try:
-            url = await asyncio.to_thread(
-                _preview_data_url,
+            preview = await asyncio.to_thread(
+                cache.get,
                 candidate["path"],
                 max_size=max_size,
                 fmt=preview_fmt,
                 quality=quality,
             )
+        except PreviewSourceChanged:
+            counts["source_changed"] += 1
+            continue
         except Exception:
+            preview = None
+            counts["error"] += 1
+            prepared.append((number, candidate, None, False))
+            continue
+        else:
+            counts[preview.cache_reason] += 1
+            previews_planned += 1
+        prepared.append((number, candidate, preview, False))
+
+    candidate_parts_all = []
+    projected = {}
+    previews_attached = 0
+    # Revalidate after all awaits, even for a cache hit or description-only fallback.
+    for number, candidate, preview, metadata_only in prepared:
+        if not can_upload(candidate):
+            counts["denied"] += 1
+            continue
+        if preview is not None:
+            fingerprint = candidate.get("_vm_fingerprint")
+            if (
+                (fingerprint and fingerprint[0] != preview.digest)
+                or not is_preview_source_current(candidate["path"], preview.source_version)
+            ):
+                counts["source_changed"] += 1
+                continue
+            candidate["_joint_preview_source_version"] = preview.source_version
+        candidate_parts = [
+            TextPart(
+                text="[本轮表情候选资料] "
+                + json.dumps(
+                    _public_candidate(candidate, number),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            ).mark_as_temp()
+        ]
+        if preview is not None:
+            candidate_parts.append(
+                ImageURLPart(image_url=ImageURLPart.ImageURL(url=preview.url)).mark_as_temp()
+            )
+            previews_attached += 1
+        elif not metadata_only:
             candidate_parts.append(
                 TextPart(
                     text=f"候选 {number} 图片预览不可用，请只依据描述判断。"
                 ).mark_as_temp()
             )
-            continue
-        candidate_parts.append(
-            ImageURLPart(image_url=ImageURLPart.ImageURL(url=url)).mark_as_temp()
-        )
-        previews_attached += 1
+        projected[number] = (candidate, candidate_parts)
+        candidate_parts_all.extend(candidate_parts)
 
-    reply_modes = bool(getattr(plan.event, "_cd_reply_modes_v1", False))
-    context_text = turn_media_context(
-        len(allowed_candidates),
-        getattr(request, "func_tool", None),
-        reply_modes=reply_modes,
-        attached_previews=previews_attached if attach_pixels else 0,
-        preview_gated=bool(allowed_candidates) and not attach_pixels,
+    cd_renders_state = (
+        getattr(plan.event, "_cd_visual_reply_policy_supported_v1", False) is True
     )
-    parts = [TextPart(text=context_text).mark_as_temp(), *candidate_parts]
+    reply_modes = bool(getattr(plan.event, "_cd_reply_modes_v1", False))
+    preview_gated = bool(projected) and not attach_pixels
+    plan._preview_meta_v1 = (
+        previews_attached if attach_pixels else 0,
+        preview_gated,
+    )
+    if cd_renders_state:
+        parts = candidate_parts_all or [
+            TextPart(text=NO_CANDIDATE_MATERIAL).mark_as_temp()
+        ]
+    else:
+        context_text = turn_media_context(
+            len(projected),
+            getattr(request, "func_tool", None),
+            reply_modes=reply_modes,
+            attached_previews=previews_attached if attach_pixels else 0,
+            preview_gated=preview_gated,
+            candidate_ids=tuple(projected),
+        )
+        parts = [TextPart(text=context_text).mark_as_temp(), *candidate_parts_all]
+
     extra_parts = getattr(request, "extra_user_content_parts", None)
     if isinstance(extra_parts, list):
         extra_parts.extend(parts)
+
+    def current_ids():
+        current_parts = getattr(request, "extra_user_content_parts", None)
+        if not isinstance(current_parts, list):
+            request._stealer_joint_meme_ids_v1 = tuple(projected)
+            plan._offered_ids = request._stealer_joint_meme_ids_v1
+            return request._stealer_joint_meme_ids_v1
+        present = {id(part) for part in current_parts}
+        removed_parts = set()
+        removed_candidates = 0
+        for number, (candidate, candidate_parts) in tuple(projected.items()):
+            version = candidate.get("_joint_preview_source_version")
+            if (
+                id(candidate_parts[0]) in present
+                and can_upload(candidate)
+                and (
+                    version is None
+                    or is_preview_source_current(candidate["path"], version)
+                )
+            ):
+                continue
+            removed_parts.update(map(id, candidate_parts))
+            del projected[number]
+            removed_candidates += 1
+        if removed_parts:
+            current_parts[:] = [
+                part for part in current_parts if id(part) not in removed_parts
+            ]
+            if not projected:
+                current_parts.append(
+                    TextPart(text=NO_CANDIDATE_MATERIAL).mark_as_temp()
+                )
+            logger.info(
+                "[VisualMedia] joint_preview final_validation_removed=%d",
+                removed_candidates,
+            )
+        request._stealer_joint_meme_ids_v1 = tuple(projected)
+        plan._offered_ids = request._stealer_joint_meme_ids_v1
+        return request._stealer_joint_meme_ids_v1
+
+    request._stealer_joint_meme_current_ids_v1 = current_ids
+    request._stealer_joint_meme_ids_v1 = tuple(projected)
+    plan._offered_ids = request._stealer_joint_meme_ids_v1
     request._stealer_joint_meme_parts_v1 = True
-    logger.debug(
-        "[VisualMedia] candidate_parts candidates=%d previews=%d max_previews=%d gate=%s",
-        len(allowed_candidates),
-        previews_attached,
-        max_previews,
-        gate_reason,
-    )
+    if plan.candidates:
+        logger.info(
+            "[VisualMedia] joint_preview elapsed_ms=%.1f attached=%d previews=%d "
+            "hit=%d miss=%d coalesced=%d oversize=%d error=%d denied=%d source_changed=%d gate=%s",
+            (time.monotonic() - started) * 1000,
+            len(projected),
+            previews_attached,
+            counts["hit"],
+            counts["miss"],
+            counts["coalesced"],
+            counts["oversize"],
+            counts["error"],
+            counts["denied"],
+            counts["source_changed"],
+            gate_reason,
+        )
 
 
 def joint_reply_owned(event):
@@ -457,6 +590,8 @@ class JointMemePlan:
     def resolve(self, completion):
         if not isinstance(completion, str) or not completion.strip():
             raise ValueError("invalid_joint_meme_plan")
+        offered = getattr(self, "_offered_ids", None)
+        has_candidates = bool(self.candidates if offered is None else offered)
         raw = completion.strip().lstrip("\ufeff")
         if raw.startswith("```") and raw.endswith("```"):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
@@ -467,7 +602,7 @@ class JointMemePlan:
                 completion.strip()
             )
             if (
-                not self.candidates
+                not has_candidates
                 and re.search(r"""["'](?:text|meme_id|reply_mode)["']\s*:""", raw)
                 is None
             ):
@@ -494,7 +629,7 @@ class JointMemePlan:
                 len(self.candidates),
             )
             raise ValueError("invalid_joint_meme_plan") from exc
-        if not self.candidates and (
+        if not has_candidates and (
             not isinstance(plan, dict)
             or (
                 "meme_id" not in plan
@@ -620,18 +755,18 @@ class JointMemePlan:
             return text, []
         if type(number) is not int or not 1 <= number <= len(self.candidates):
             raise ValueError("invalid_joint_meme_candidate")
+        if offered is not None and number not in offered:
+            raise ValueError("invalid_joint_meme_candidate")
         selected = self.candidates[number - 1]
         path = selected["path"]
 
         def current():
+            source_version = selected.get("_joint_preview_source_version")
             return (
-                os.path.isfile(path)
-                and not self.event.get_extra("visual_media_generation_requested", False)
-                and getattr(self.plugin.plugin_config, "llm_joint_reply", True)
-                and getattr(self.plugin.plugin_config, "auto_send_meme", True)
-                and self.plugin.is_send_enabled_for_event(self.event)
-                and self.plugin.meme_selector.is_path_allowed_for_event(
-                    path, self.event
+                _candidate_available(self.plugin, self.event, path)
+                and (
+                    source_version is None
+                    or is_preview_source_current(path, source_version)
                 )
                 and (
                     not self.behavior
@@ -728,16 +863,16 @@ async def prepare_joint_reply(plugin, event, request):
         query = str(getattr(event, "_cd_original_user_text_v1", "") or "").strip()[
             :1000
         ]
-        from .joint_prefetch import start_joint_prefetch
-
-        prefetch = start_joint_prefetch(plugin, event)
+        prefetch = joint_prefetch.start_joint_prefetch(plugin, event)
         candidates = []
+        outcome, cache_reason = "disabled", "bypass"
+        elapsed_ms = join_wait_ms = 0.0
+        explicit_media = (
+            re.search(r"表情|贴纸|动图|\bmeme\b|\bsticker\b", query, re.I)
+            is not None
+        )
         if prefetch is not None:
             joined = time.monotonic()
-            explicit_media = (
-                re.search(r"表情|贴纸|动图|\bmeme\b|\bsticker\b", query, re.I)
-                is not None
-            )
             try:
                 candidates = (
                     await prefetch.result(
@@ -750,43 +885,81 @@ async def prepare_joint_reply(plugin, event, request):
                 )
             finally:
                 await prefetch.close()
-            logger.info(
-                "[Stealer] joint_prefetch elapsed_ms=%.1f join_wait_ms=%.1f candidates=%d explicit=%s",
-                (time.monotonic() - prefetch.started) * 1000,
-                (time.monotonic() - joined) * 1000,
-                len(candidates),
-                explicit_media,
+            outcome = getattr(
+                prefetch, "outcome", "candidates" if candidates else "empty"
             )
+            cache_reason = getattr(prefetch, "cache_reason", "bypass")
+            elapsed_ms = (time.monotonic() - prefetch.started) * 1000
+            join_wait_ms = (time.monotonic() - joined) * 1000
         behavior = getattr(plugin, "media_behavior", None)
-        if behavior and hasattr(behavior, "prepare_candidates"):
+        prepares_candidates = behavior and hasattr(behavior, "prepare_candidates")
+        if prepares_candidates and candidates:
             candidates = await behavior.prepare_candidates(event, candidates)
+            if not candidates:
+                outcome = "filtered"
+        logger.info(
+            "[Stealer] joint_prefetch elapsed_ms=%.1f join_wait_ms=%.1f "
+            "candidates=%d explicit=%s outcome=%s cache=%s",
+            elapsed_ms,
+            join_wait_ms,
+            len(candidates),
+            explicit_media,
+            outcome,
+            cache_reason,
+        )
         plan = JointMemePlan(
             plugin,
             event,
             candidates,
-            prepared=bool(behavior and hasattr(behavior, "prepare_candidates")),
+            prepared=bool(prepares_candidates),
         )
         event._stealer_joint_meme_plan_v1 = plan
-    prompt = str(getattr(request, "system_prompt", "") or "")
-    instruction = selection_prompt(
-        len(plan.candidates),
-        getattr(request, "func_tool", None),
-        reply_modes=getattr(event, "_cd_reply_modes_v1", False),
-        poke_supported=getattr(event, "_cd_reply_poke_supported_v1", False) is True,
-    )
-    if instruction not in prompt:
-        request.system_prompt = prompt + "\n" + instruction
     await attach_temporary_candidates(plan, request)
     tools = getattr(request, "func_tool", None)
     if tools is not None:
+        remove_fn = getattr(tools, "remove_tool", None)
+        if getattr(remove_fn, "__self__", None) is tools:
+            tools = copy(tools)
+            tools.tools = list(getattr(tools, "tools", ()) or ())
+            request.func_tool = tools
         for name in ("search_meme", "send_meme"):
             tools.remove_tool(name)
+    candidate_ids = getattr(request, "_stealer_joint_meme_ids_v1", ())
+    if getattr(event, "_cd_visual_reply_policy_supported_v1", False) is True:
+        # Later request hooks may still restrict tools. The owned bridge renders
+        # this state into temp user content from the final request while keeping
+        # MEDIA_POLICY in the static system prompt.
+        def _render_state(ids, tool_set):
+            attached_count, gated = getattr(plan, "_preview_meta_v1", (None, False))
+            return selection_state_prompt(
+                ids,
+                tool_set,
+                attached_previews=attached_count,
+                preview_gated=gated,
+            )
+
+        request._cd_visual_reply_policy_v1 = (
+            plan,
+            MEDIA_POLICY,
+            _render_state,
+        )
+    else:
+        prompt = str(getattr(request, "system_prompt", "") or "")
+        instruction = selection_prompt(
+            len(plan.candidates),
+            tools,
+            reply_modes=getattr(event, "_cd_reply_modes_v1", False),
+            poke_supported=getattr(event, "_cd_reply_poke_supported_v1", False) is True,
+            candidate_ids=candidate_ids,
+        )
+        if instruction not in prompt:
+            request.system_prompt = prompt + "\n" + instruction
     event.set_extra(JOINT_REPLY_KEY, True)
     event.set_extra("visual_media_policy_v1", True)
     event.set_extra("_visual_media_static_policy_v1", True)
     logger.info(
         "[VisualMedia] policy attached candidates=%d generation_tools=%s",
-        len(plan.candidates),
+        len(candidate_ids),
         ",".join(generation_tools(tools)) or "none",
     )
     return True

@@ -52,20 +52,60 @@ _STATIC_LEGACY_OUTPUT_PROTOCOL = (
 )
 
 
+def selection_state_prompt(
+    candidate_ids,
+    tool_set,
+    *,
+    attached_previews: int | None = None,
+    preview_gated: bool = False,
+) -> str:
+    """Describe the attached candidates and the request's filtered tools for temp user context."""
+    tools = generation_tools(tool_set)
+    ids = tuple(candidate_ids or ())
+    if ids:
+        id_list = "、".join(str(number) for number in ids)
+        if preview_gated:
+            candidates = (
+                f"本轮有 {len(ids)} 张现成表情候选，编号为 {id_list}"
+                "（当前语境仅提供文字元数据，未附像素预览）。只使用这些编号。"
+            )
+        elif attached_previews is not None and attached_previews < len(ids):
+            candidates = (
+                f"本轮有 {len(ids)} 张现成表情候选，编号为 {id_list}"
+                f"（前 {attached_previews} 张附有预览图，动图预览仅为首帧；其余仅提供文字元数据）。只使用这些编号。"
+            )
+        else:
+            candidates = (
+                f"本轮有 {len(ids)} 张现成表情候选，编号为 {id_list}。只使用这些编号；动图预览仅为首帧。"
+            )
+    else:
+        candidates = (
+            "本轮没有可用现成表情候选；仍可按语境选择文字或调用可用生图工具，不要伪造表情编号。"
+        )
+    available = (
+        "本轮通过会话筛选的生图工具：" + "、".join(tools) + "。仍以当前模型实际提供且获准的工具为准。"
+        if tools
+        else "本轮未直接暴露生图工具。若宿主提供按需工具发现，须先由该入口取得允许的工具；否则不能生图。"
+    )
+    return candidates + "\n" + available
+
+
 def selection_prompt(
     candidate_count: int = 0,
     tool_set=None,
     *,
     reply_modes=False,
     poke_supported=False,
+    candidate_ids=None,
 ) -> str:
     """Return a session-static visual policy + output protocol for req.system_prompt.
 
-    Per-turn volatile details (candidate count, visible generation tools, preview
+    Per-turn volatile details (candidate count/IDs, visible generation tools, preview
     gating) must NOT appear here so provider prefix caches stay stable across turns.
-    Use ``turn_media_context(...)`` in temporary user content parts for those.
+    Use ``selection_state_prompt(...)`` / ``turn_media_context(...)`` in temporary
+    user content parts for those.
     """
-    del candidate_count, tool_set
+    del candidate_count, tool_set, candidate_ids
     if reply_modes:
         poke_supported = poke_supported is True
         modes = (
@@ -91,7 +131,7 @@ def selection_prompt(
             f'输出 JSON：{{"reply_mode":"{schema_modes}","text":"要说的话","meme_id":null,"narration":""}}。'
             "text 为纯文字，text 非空，meme_id=null；meme_only 只发表情，text 为空，meme_id 为候选整数编号；"
             "text_meme 为文字加表情，text 非空且 meme_id 为候选整数编号；"
-            f"{poke_shape}silent 表示不回应原消息，但会发送一条状态旁白：text 为空、meme_id=null，narration 必须是非空单行文字，用全角括号包住且含括号不超过 120 字；其他模式 narration 为空或省略。"
+            f"{poke_shape}silent 表示不回应原消息，旁白按聊天宿主的展示范围决定是否发送：text 为空、meme_id=null，narration 必须是非空单行文字，用全角括号包住且含括号不超过 120 字；其他模式 narration 为空或省略。"
             "旁白用第三人称和当前角色名字，简短描述当前角色的状态，只根据本轮已有的人设、世界与活动信息，不得臆造睡眠、忙碌或正在做的事；状态不明确时写角色暂时没有回应，不臆测无视对方的动机。旁白不能包含角色说出口的台词。"
             f"没有合适候选时只选 {no_meme_modes}，不硬配图。只发表情不补客套话。"
             "先决定回应方式；poke 和 silent 都不调用任何发送或生图工具，已经发送或启动生图后不能选择这两种方式。"
@@ -110,35 +150,25 @@ def turn_media_context(
     reply_modes: bool = False,
     attached_previews: int | None = None,
     preview_gated: bool = False,
+    candidate_ids=None,
 ) -> str:
     """Return per-turn volatile candidate & generation-tool summary for temp user parts."""
-    tools = generation_tools(tool_set)
-    count = max(0, int(candidate_count or 0))
-    if count:
-        if preview_gated:
-            candidates = (
-                f"本轮有 {count} 张现成表情候选（当前语境仅提供文字元数据，未附像素预览）。"
-                "只使用下方编号。"
-            )
-        elif attached_previews is not None and attached_previews < count:
-            candidates = (
-                f"本轮有 {count} 张现成表情候选（前 {attached_previews} 张附有预览图，动图预览仅为首帧；"
-                "其余仅提供文字元数据）。只使用下方编号。"
-            )
-        else:
-            candidates = f"本轮有 {count} 张现成表情候选。只使用下方编号；动图预览仅为首帧。"
+    if candidate_ids is None:
+        count = max(0, int(candidate_count or 0))
+        ids = tuple(range(1, count + 1))
     else:
-        candidates = (
-            "本轮没有可用现成表情候选；仍可按语境选择文字或调用可用生图工具，不要伪造表情编号。"
-        )
-        if not reply_modes:
-            candidates += "本轮无现成候选，最终文字直接用普通文本，不包装发送计划 JSON。"
-    available = (
-        "本轮可见的生图工具：" + "、".join(tools) + "。"
-        if tools
-        else "本轮未直接暴露生图工具。若宿主提供按需工具发现，须先由该入口取得允许的工具；否则不能生图。"
+        ids = tuple(candidate_ids)
+    state = selection_state_prompt(
+        ids,
+        tool_set,
+        attached_previews=attached_previews,
+        preview_gated=preview_gated,
     )
-    return "[本轮视觉上下文]\n" + candidates + "\n" + available
+    if not ids and not reply_modes:
+        lines = state.split("\n", 1)
+        lines[0] += "本轮无现成候选，最终文字直接用普通文本，不包装发送计划 JSON。"
+        state = "\n".join(lines)
+    return "[本轮视觉上下文]\n" + state
 
 
 def record_selection(

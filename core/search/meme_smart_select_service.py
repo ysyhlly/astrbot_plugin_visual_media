@@ -157,9 +157,7 @@ class MemeSmartSelectService:
                     emb_paths.append(path)
                 _add(emb_paths)
                 if embedding_paths:
-                    logger.info(
-                        f"[Embedding] 语义召回: context='{context_text[:50]}', topk={len(embedding_paths)}"
-                    )
+                    logger.info("[Embedding] 语义召回 topk=%d", len(embedding_paths))
             except Exception as e:
                 logger.warning(f"[Embedding] auto-emoji 语义召回异常: {e}")
         elif not self._is_embedding_ready():
