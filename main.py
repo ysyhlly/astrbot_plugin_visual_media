@@ -13,7 +13,7 @@ ensure_current(
         ("media_library", "MediaLibrary", "_rebuild_public_ref_cache"),
         ("media_behavior", "MediaBehavior", "records"),
     ],
-    version="0.5.0-rc.4",
+    version="0.5.0-rc.5",
 )
 
 import asyncio
