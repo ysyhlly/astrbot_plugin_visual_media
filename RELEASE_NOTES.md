@@ -1,4 +1,8 @@
-# astrbot_plugin_visual_media 0.5.0-rc.5
+# astrbot_plugin_visual_media 0.5.0-rc.6
+
+## 0.5.0-rc.6 — 2026-11-20
+
+- 统一 `metadata.yaml` 与 `VisualMediaPlugin.author` 的作者归属为 `ysyhlly`（保留 `plugin_id` 确保现有 KV 存储向后兼容）。
 
 ## 0.5.0-rc.5 — 2026-11-20
 

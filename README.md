@@ -1,6 +1,6 @@
 # 视觉工坊 · Visual Media
 
-> 发布候选：`0.5.0-rc.5`。升级说明与验证边界见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
+> 发布候选：`0.5.0-rc.6`。升级说明与验证边界见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
 
 将表情包收集、检索、发送、图片生成和角色参考管理整合为一个 AstrBot 插件。
 
