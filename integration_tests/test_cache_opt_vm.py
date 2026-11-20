@@ -11,10 +11,6 @@ from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
 
 import pytest
-from PIL import Image
-
-from astrbot.core.agent.message import ImageURLPart, TextPart
-from astrbot.core.provider.entites import ProviderRequest
 from astrbot_plugin_visual_media import character_check
 from astrbot_plugin_visual_media.core.events.meme_sender_engine import MemeSenderEngine
 from astrbot_plugin_visual_media.core.processing.natural_emotion_analyzer import (
@@ -35,9 +31,13 @@ from astrbot_plugin_visual_media.core.tools.media_policy import (
     turn_media_context,
 )
 from astrbot_plugin_visual_media.tl import background_notify as notify
+from PIL import Image
 from test_media_behavior import event as make_event
 from test_media_policy import plugin as make_plugin
 from test_media_policy import tools as make_tools
+
+from astrbot.core.agent.message import ImageURLPart, TextPart
+from astrbot.core.provider.entites import ProviderRequest
 
 
 def _save_test_image(path: Path, size=(640, 640), color=(40, 120, 220, 200)) -> str:
@@ -234,7 +234,9 @@ async def test_gpt_cost1_preserved_visual_reply_policy_handoff_and_toctou_valida
 
 def test_gpt_cost1_preserved_empty_catalogue_cache_and_library_version(tmp_path):
     from astrbot_plugin_visual_media.core.db.database_service import DatabaseService
-    from astrbot_plugin_visual_media.core.tools.joint_prefetch import EmptyCatalogueCache
+    from astrbot_plugin_visual_media.core.tools.joint_prefetch import (
+        EmptyCatalogueCache,
+    )
 
     db = DatabaseService(tmp_path / "emoji.db")
     snap, version = db.get_library_snapshot()
