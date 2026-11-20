@@ -57,7 +57,7 @@ class VisualMediaPlugin(Star):
     """Own both engines, their tools, settings, data and lifecycle."""
 
     name = "astrbot_plugin_visual_media"
-    author = "visual_media"
+    author = "ysyhlly"
     plugin_id = "visual_media/astrbot_plugin_visual_media"
     SEARCH_MEME_TOOL_NAME = "search_meme"
     SEND_MEME_TOOL_NAME = "send_meme"
