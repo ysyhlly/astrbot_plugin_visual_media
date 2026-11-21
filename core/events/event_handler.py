@@ -712,9 +712,13 @@ class EventHandler:
         try:
             cfg = getattr(plugin_instance, "plugin_config", None)
             if cfg:
-                scope, target_id = cfg.get_event_target(event)
-                if scope and target_id:
-                    origin_target_str = f"{scope}:{target_id}"
+                origin_getter = getattr(cfg, "get_event_origin_target", None)
+                if callable(origin_getter):
+                    origin_target_str = str(origin_getter(event) or "").strip()
+                else:
+                    scope, target_id = cfg.get_event_target(event)
+                    if scope and target_id:
+                        origin_target_str = f"{scope}:{target_id}"
         except (AttributeError, KeyError) as e:
             logger.debug(f"提取来源群信息失败: {e}")
         image_candidates = self._collect_image_candidates(

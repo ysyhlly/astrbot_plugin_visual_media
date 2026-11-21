@@ -1,4 +1,10 @@
-# astrbot_plugin_visual_media 0.5.0-rc.6
+# astrbot_plugin_visual_media 0.5.0-rc.7
+
+## 0.5.0-rc.7 — 2026-11-21
+
+- 群间系列面板 v2：统一「群间视觉 · Visual Media」图标与导航，接入系列摘要、群控矩阵、联邦搜索与今日生活手账钩子。
+- 修复视觉表情来源写入与面板匹配：自动收录/偷图优先保留完整 `umo:<UMO>` 隔离多适配器，面板搜索/计数/手账同时兼容历史 `group:`/`user:` 收录条目与完整 UMO。
+- 修复 `tools/build_release.py` 白名单补发根目录 `logo.png`。
 
 ## 0.5.0-rc.6 — 2026-11-20
 

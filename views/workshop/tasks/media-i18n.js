@@ -8,9 +8,17 @@
   const bridge = () => (window.DynamicsPanelBridge || window.AstrBotPluginPage || window.AstrBotPluginView);
   const normalize = value => supported[String(value || '').toLowerCase().split('-')[0]] || 'zh-CN';
   function locale() { return typeof window.getLanguage === 'function' ? normalize(window.getLanguage()) : activeLocale; }
+  function positionalArgs(params) {
+    if (!params || typeof params !== 'object') return [];
+    const keys = Object.keys(params);
+    if (keys.every(k => /^\d+$/.test(k))) {
+      return keys.sort((a, b) => Number(a) - Number(b)).map(k => params[k]);
+    }
+    return Object.values(params);
+  }
   function t(source, params = {}) {
     const catalog = context.i18n?.[locale()]?.series_ui || {};
-    const fallback = window.DynamicsUI?.tr?.(source, ...Object.values(params));
+    const fallback = window.DynamicsUI?.tr?.(source, ...positionalArgs(params));
     const value = typeof catalog[source] === 'string' ? catalog[source] : fallback ?? source;
     return String(value).replace(/\{(\w+)\}/g, (match, key) => Object.hasOwn(params,key) ? String(params[key] ?? '') : match);
   }
@@ -30,14 +38,22 @@
   }
   function applyStatic(scope=document) {
     scope.querySelectorAll('[data-series-i18n]').forEach(n=>bind(n,n.dataset.seriesI18n));
-    for (const [data,attr] of [['seriesPlaceholder','placeholder'],['seriesAria','aria-label'],['seriesTitle','title']]) {
-      scope.querySelectorAll(`[data-${data.replace(/[A-Z]/g,c=>'-'+c.toLowerCase())}]`).forEach(n=>bind(n,n.dataset[data],{},attr));
+    scope.querySelectorAll('[data-series-aria]').forEach(n=>{
+      if(!n.hasAttribute('data-series-aria-label')) bind(n,n.dataset.seriesAria,{},'aria-label');
+    });
+    if (typeof window.DynamicsUI?.apply === 'function') {
+      window.DynamicsUI.apply(scope);
+    } else {
+      for (const [data,attr] of [['seriesText',''],['seriesAriaLabel','aria-label'],['seriesPlaceholder','placeholder'],['seriesTitle','title']]) {
+        const sel = `[data-${data.replace(/[A-Z]/g,c=>'-'+c.toLowerCase())}]`;
+        scope.querySelectorAll(sel).forEach(n=>bind(n,n.dataset[data],{},attr));
+      }
     }
   }
   function refreshLanguage() {
     activeLocale=normalize(context.locale || root.lang || navigator.language);
     root.lang=locale();
-    const signature=JSON.stringify(context.i18n?.[locale()]?.series_ui||{});
+    const signature=JSON.stringify(context.i18n?.[locale()]?.series_ui||{})+'|'+String(typeof window.DynamicsUI?.tr==='function');
     if(lastLocale===locale()&&lastCatalog===signature){syncThemeLabels();return;}
     lastLocale=locale();lastCatalog=signature;
     for(const [node,entries] of bindings){

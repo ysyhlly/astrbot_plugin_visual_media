@@ -13,11 +13,14 @@ ensure_current(
         ("media_library", "MediaLibrary", "_rebuild_public_ref_cache"),
         ("media_behavior", "MediaBehavior", "records"),
     ],
-    version="0.5.0-rc.6",
+    version="0.5.0-rc.7",
 )
 
 import asyncio
 import threading
+from datetime import date as _date_cls
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from astrbot.api import logger
@@ -261,6 +264,549 @@ class VisualMediaPlugin(Star):
             "capabilities": {"media": 1},
             "media_policy_version": 1,
         }
+
+    @staticmethod
+    def _parse_series_ts(value: Any) -> datetime | None:
+        """Parse an ISO-8601 string or numeric unix timestamp into an aware UTC datetime."""
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            if value <= 0:
+                return None
+            try:
+                return datetime.fromtimestamp(float(value), tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _extract_group_id_from_umo(umo: str) -> str:
+        clean = str(umo or "").strip()
+        if not clean:
+            return ""
+        parts = clean.split(":", 2)
+        if len(parts) == 3 and "group" in parts[1].lower():
+            return parts[2].strip()
+        return ""
+
+    @staticmethod
+    def _origin_matches_scope(origin_target: Any, target_scope: str) -> bool:
+        """Match a meme's ``origin_target`` (``umo:...`` or legacy ``group:/user:``) against ``target_scope``."""
+        from .core.config.config import PluginConfig
+
+        return PluginConfig.origin_target_matches_scope(origin_target, target_scope)
+
+    def _safe_tracker_rows(self) -> list[dict[str, Any]]:
+        try:
+            tracker = getattr(
+                getattr(self, "generation", None), "generation_tracker", None
+            )
+            if tracker is None or not callable(
+                getattr(tracker, "records_snapshot", None)
+            ):
+                return []
+            rows = tracker.records_snapshot()
+            return [r for r in rows if isinstance(r, dict)] if rows else []
+        except Exception:
+            return []
+
+    def _safe_meme_index(self) -> dict[str, dict[str, Any]]:
+        try:
+            memes = getattr(self, "memes", None)
+            if memes is None:
+                return {}
+            api = getattr(memes, "plugin_api", None)
+            if api is not None and callable(getattr(api, "_get_index", None)):
+                idx = api._get_index()
+                if isinstance(idx, dict):
+                    return idx
+            db = getattr(memes, "db_service", None)
+            if db is not None and callable(
+                getattr(db, "get_index_cache_readonly", None)
+            ):
+                idx = db.get_index_cache_readonly()
+                if isinstance(idx, dict):
+                    return idx
+        except Exception:
+            pass
+        return {}
+
+    def _safe_character_profiles(self) -> list[dict[str, Any]]:
+        try:
+            lib = getattr(self, "library", None)
+            if lib is not None and callable(getattr(lib, "profiles", None)):
+                return [p for p in lib.profiles() if isinstance(p, dict)]
+        except Exception:
+            pass
+        try:
+            memes = getattr(self, "memes", None)
+            cfg = getattr(memes, "plugin_config", None)
+            if cfg is not None and callable(getattr(cfg, "get_characters", None)):
+                info = (
+                    cfg.get_character_info()
+                    if callable(getattr(cfg, "get_character_info", None))
+                    else {}
+                )
+                out = []
+                for key in cfg.get_characters():
+                    meta = info.get(key) if isinstance(info, dict) else {}
+                    out.append(
+                        {
+                            "key": str(key),
+                            "name": str((meta or {}).get("name") or key),
+                            "appearance": str((meta or {}).get("desc") or ""),
+                            "style": "",
+                            "references": [],
+                        }
+                    )
+                return out
+        except Exception:
+            pass
+        return []
+
+    def get_series_summary(self) -> dict[str, Any]:
+        """Return compact live badge and pulse summary for the v2 series matrix."""
+        now_utc = datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat()
+        try:
+            if getattr(self, "_closed", False):
+                return {
+                    "badge": {"count": 0, "tone": "muted", "label": "已停用"},
+                    "pulse": {"headline": "视觉工坊已关闭", "updated_at": now_iso},
+                }
+            if self.memes is None and self.generation is None:
+                return {
+                    "badge": {"count": 0, "tone": "muted", "label": "未就绪"},
+                    "pulse": {"headline": "等待引擎初始化", "updated_at": now_iso},
+                }
+
+            today_local = now_utc.astimezone().date()
+            running = 0
+            failed = 0
+            succeeded_today = 0
+            latest_dt: datetime | None = None
+            latest_iso = ""
+
+            for row in self._safe_tracker_rows():
+                status = str(row.get("status") or "").strip().lower()
+                raw_ts = row.get("finished_at") or row.get("created_at")
+                parsed_ts = self._parse_series_ts(raw_ts)
+                if parsed_ts is not None and (
+                    latest_dt is None or parsed_ts > latest_dt
+                ):
+                    latest_dt = parsed_ts
+                    latest_iso = parsed_ts.isoformat()
+
+                if status in {"queued", "running"}:
+                    running += 1
+                elif status in {"failed", "interrupted"}:
+                    if (
+                        parsed_ts is None
+                        or (now_utc - parsed_ts).total_seconds() <= 86400
+                    ):
+                        failed += 1
+                elif status in {"succeeded", "partial_success"}:
+                    if (
+                        parsed_ts is not None
+                        and parsed_ts.astimezone().date() == today_local
+                    ):
+                        succeeded_today += 1
+
+            updated_at = latest_iso or now_iso
+            if failed > 0:
+                count = failed + running
+                label = (
+                    f"{failed} 项失败 · {running} 生成中"
+                    if running > 0
+                    else f"{failed} 项失败"
+                )
+                headline = (
+                    f"{failed} 项近期任务异常 · {running} 项执行中"
+                    if running > 0
+                    else f"近期 {failed} 项任务失败 · 需排查"
+                )
+                badge = {"count": count, "tone": "danger", "label": label}
+            elif running > 0:
+                badge = {
+                    "count": running,
+                    "tone": "info",
+                    "label": f"{running} 项生成中",
+                }
+                headline = f"{running} 项图像任务执行中"
+            else:
+                meme_count = len(self._safe_meme_index())
+                char_count = len(self._safe_character_profiles())
+                badge = {"count": 0, "tone": "accent", "label": "已就绪"}
+                if succeeded_today > 0:
+                    headline = f"今日完成 {succeeded_today} 次创作 · 队列空闲"
+                else:
+                    headline = f"队列空闲 · 表情 {meme_count} 张 · 角色 {char_count} 个"
+
+            return {
+                "badge": badge,
+                "pulse": {"headline": headline, "updated_at": updated_at},
+            }
+        except Exception:
+            return {
+                "badge": {"count": 0, "tone": "muted", "label": "状态暂不可用"},
+                "pulse": {"headline": "视觉工坊状态暂不可用", "updated_at": now_iso},
+            }
+
+    def get_series_scope_status(self, umo: str) -> dict[str, Any]:
+        """Return read-only per-scope availability and today's activity for the matrix."""
+        try:
+            target_umo = str(umo or "").strip()
+            ready = (
+                not getattr(self, "_closed", False)
+                and (self.memes is not None or self.generation is not None)
+            )
+            if not ready:
+                return {
+                    "enabled": False,
+                    "supported": False,
+                    "persona_id": "",
+                    "activity_today": 0,
+                    "summary": "视觉工坊未就绪",
+                    "version": "0",
+                }
+
+            group_id = self._extract_group_id_from_umo(target_umo)
+            gen_allowed = self.generation is not None
+            if gen_allowed and target_umo:
+                limiter = getattr(self.generation, "rate_limiter", None)
+                if limiter is not None and callable(
+                    getattr(limiter, "allows_group", None)
+                ):
+                    gen_allowed = bool(
+                        limiter.allows_group(
+                            SimpleNamespace(
+                                group_id=group_id, unified_msg_origin=target_umo
+                            )
+                        )
+                    )
+
+            meme_allowed = self.memes is not None
+            if meme_allowed and target_umo:
+                cfg = getattr(self.memes, "plugin_config", None)
+                if cfg is not None and callable(
+                    getattr(cfg, "is_targets_allowed", None)
+                ):
+                    targets = [t for t in (target_umo, group_id) if t]
+                    if targets:
+                        meme_allowed = bool(cfg.is_targets_allowed("send", targets))
+
+            today_local = datetime.now(timezone.utc).astimezone().date()
+            activity_today = 0
+            for row in self._safe_tracker_rows():
+                req_umo = str((row.get("requester") or {}).get("umo") or "").strip()
+                if target_umo and req_umo != target_umo:
+                    continue
+                parsed_ts = self._parse_series_ts(
+                    row.get("finished_at") or row.get("created_at")
+                )
+                if (
+                    parsed_ts is not None
+                    and parsed_ts.astimezone().date() == today_local
+                ):
+                    activity_today += 1
+
+            for meta in self._safe_meme_index().values():
+                if not isinstance(meta, dict):
+                    continue
+                if target_umo and not self._origin_matches_scope(
+                    meta.get("origin_target"), target_umo
+                ):
+                    continue
+                parsed_ts = self._parse_series_ts(meta.get("created_at"))
+                if (
+                    parsed_ts is not None
+                    and parsed_ts.astimezone().date() == today_local
+                ):
+                    activity_today += 1
+
+            enabled = bool(gen_allowed or meme_allowed)
+            if gen_allowed and meme_allowed:
+                mode_summary = "生图与表情可用"
+            elif gen_allowed:
+                mode_summary = "仅生图可用 · 表情已禁用"
+            elif meme_allowed:
+                mode_summary = "仅表情可用 · 生图已禁用"
+            else:
+                mode_summary = "当前会话已禁用生图与表情"
+            summary = (
+                f"{mode_summary} · 今日 {activity_today} 次"
+                if activity_today > 0
+                else mode_summary
+            )
+            return {
+                "enabled": enabled,
+                "supported": True,
+                "persona_id": "",
+                "activity_today": activity_today,
+                "summary": summary,
+                "version": f"1:{int(gen_allowed)}:{int(meme_allowed)}",
+            }
+        except Exception:
+            return {
+                "enabled": None,
+                "supported": False,
+                "persona_id": "",
+                "activity_today": None,
+                "summary": "状态暂不可用",
+                "version": "0",
+            }
+
+    def series_search_items(
+        self, query: str, scope: str = "", limit: int = 8
+    ) -> list[dict[str, Any]]:
+        """Search character profiles, recent generation tasks, and visible memes."""
+        try:
+            q = str(query or "").strip().casefold()
+            if not q or getattr(self, "_closed", False):
+                return []
+            try:
+                max_items = max(1, min(50, int(limit)))
+            except (TypeError, ValueError):
+                max_items = 8
+            target_scope = str(scope or "").strip()
+            results: list[dict[str, Any]] = []
+
+            # 1. Character profiles
+            for profile in self._safe_character_profiles():
+                if len(results) >= max_items:
+                    return results
+                key = str(profile.get("key") or "").strip()
+                name = str(profile.get("name") or key).strip()
+                appearance = str(profile.get("appearance") or "").strip()
+                style = str(profile.get("style") or "").strip()
+                haystack = f"{key} {name} {appearance} {style}".casefold()
+                if q in haystack:
+                    subtitle = (appearance or style or f"角色标识：{key}")[:120]
+                    results.append(
+                        {
+                            "kind": "character",
+                            "title": name or key,
+                            "subtitle": subtitle,
+                            "plugin_id": "astrbot_plugin_visual_media",
+                            "page": "workshop",
+                            "deep_link": {"section": "characters", "character": key},
+                        }
+                    )
+
+            # 2. Recent generation tasks / prompts
+            status_labels = {
+                "queued": "排队中",
+                "running": "生成中",
+                "succeeded": "已完成",
+                "partial_success": "部分完成",
+                "failed": "失败",
+                "interrupted": "已中断",
+            }
+            rows = sorted(
+                self._safe_tracker_rows(),
+                key=lambda r: str(r.get("created_at") or ""),
+                reverse=True,
+            )
+            for row in rows:
+                if len(results) >= max_items:
+                    return results
+                req_umo = str((row.get("requester") or {}).get("umo") or "").strip()
+                if target_scope and req_umo and req_umo != target_scope:
+                    continue
+                job_id = str(row.get("job_id") or "").strip()
+                prompt = str(row.get("prompt") or "").strip()
+                status = str(row.get("status") or "").strip().lower()
+                source = str(row.get("source") or "").strip()
+                haystack = f"{prompt} {job_id} {status} {source}".casefold()
+                if q in haystack:
+                    results.append(
+                        {
+                            "kind": "task",
+                            "title": (prompt[:60] or f"任务 #{job_id[:8]}"),
+                            "subtitle": f"{status_labels.get(status, status or '任务')} · {source or '创作'}",
+                            "plugin_id": "astrbot_plugin_visual_media",
+                            "page": "workshop",
+                            "deep_link": {"subpage": "tasks", "job_id": job_id},
+                        }
+                    )
+
+            # 3. Meme descriptions (in-memory read-only index; respect scope privacy)
+            for meta in self._safe_meme_index().values():
+                if len(results) >= max_items:
+                    return results
+                if not isinstance(meta, dict):
+                    continue
+                scope_mode = str(meta.get("scope_mode") or "public")
+                origin_target = str(meta.get("origin_target") or "")
+                if scope_mode != "public" and (
+                    not target_scope
+                    or not self._origin_matches_scope(origin_target, target_scope)
+                ):
+                    continue
+                desc = str(meta.get("desc") or "").strip()
+                overlay = str(meta.get("overlay_text") or "").strip()
+                category = str(meta.get("category") or "").strip()
+                character = str(meta.get("character") or "").strip()
+                tags = meta.get("tags") or []
+                tag_text = (
+                    " ".join(str(t) for t in tags)
+                    if isinstance(tags, (list, tuple))
+                    else str(tags)
+                )
+                haystack = f"{desc} {overlay} {category} {character} {tag_text}".casefold()
+                if q in haystack:
+                    title = (desc or overlay or category or "表情")[:60]
+                    subtitle_parts = [p for p in ("表情", category, character) if p]
+                    results.append(
+                        {
+                            "kind": "meme",
+                            "title": title,
+                            "subtitle": " · ".join(subtitle_parts)[:120],
+                            "plugin_id": "astrbot_plugin_visual_media",
+                            "page": "workshop",
+                            "deep_link": {
+                                "subpage": "memes",
+                                "hash": str(meta.get("hash") or ""),
+                            },
+                        }
+                    )
+
+            return results
+        except Exception:
+            return []
+
+    def get_journal_events(
+        self,
+        persona: str = "",
+        scope: str = "",
+        date: str = "today",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Return today's completed creations and saved memes for Today's Living Journal."""
+        try:
+            if getattr(self, "_closed", False):
+                return []
+            try:
+                max_items = max(1, min(100, int(limit)))
+            except (TypeError, ValueError):
+                max_items = 20
+
+            date_key = str(date or "today").strip().lower()
+            if date_key in {"", "today"}:
+                target_date = datetime.now(timezone.utc).astimezone().date()
+            else:
+                try:
+                    target_date = _date_cls.fromisoformat(date_key)
+                except ValueError:
+                    return []
+
+            target_scope = str(scope or "").strip()
+            events: list[tuple[float, dict[str, Any]]] = []
+
+            # 1. Completed image creations
+            for row in self._safe_tracker_rows():
+                status = str(row.get("status") or "").strip().lower()
+                if status not in {"succeeded", "partial_success"}:
+                    continue
+                req_umo = str((row.get("requester") or {}).get("umo") or "").strip()
+                if target_scope and req_umo != target_scope:
+                    continue
+                parsed_ts = self._parse_series_ts(
+                    row.get("finished_at") or row.get("created_at")
+                )
+                if (
+                    parsed_ts is None
+                    or parsed_ts.astimezone().date() != target_date
+                ):
+                    continue
+                job_id = str(row.get("job_id") or "").strip()
+                prompt = str(row.get("prompt") or "").strip()
+                img_count = len(row.get("images") or []) or int(
+                    row.get("generated_images") or 0
+                )
+                title = (
+                    f"完成图像创作：{prompt[:48]}"
+                    if prompt
+                    else f"完成图像创作（{max(1, img_count)} 张）"
+                )
+                source = str(row.get("source") or "工坊").strip()
+                subtitle = f"生成 {max(1, img_count)} 张图片 · 来源：{source}"
+                events.append(
+                    (
+                        parsed_ts.timestamp(),
+                        {
+                            "id": f"gen:{job_id or int(parsed_ts.timestamp())}",
+                            "category": "visual_media",
+                            "source_label": "视觉工坊",
+                            "tone": "accent" if status == "succeeded" else "warm",
+                            "occurred_at": parsed_ts.isoformat(),
+                            "title": title,
+                            "subtitle": subtitle[:140],
+                            "target_plugin": "astrbot_plugin_visual_media",
+                            "target_route": "workshop",
+                            "target_id": job_id,
+                        },
+                    )
+                )
+
+            # 2. Saved memes
+            for path, meta in self._safe_meme_index().items():
+                if not isinstance(meta, dict):
+                    continue
+                origin_target = str(meta.get("origin_target") or "")
+                scope_mode = str(meta.get("scope_mode") or "public")
+                if target_scope:
+                    if not self._origin_matches_scope(origin_target, target_scope):
+                        continue
+                elif scope_mode != "public" and not meta.get("is_favorite"):
+                    continue
+                parsed_ts = self._parse_series_ts(meta.get("created_at"))
+                if (
+                    parsed_ts is None
+                    or parsed_ts.astimezone().date() != target_date
+                ):
+                    continue
+                img_hash = str(meta.get("hash") or "").strip()
+                desc = str(meta.get("desc") or meta.get("overlay_text") or "").strip()
+                category = str(meta.get("category") or "未分类").strip()
+                character = str(meta.get("character") or "").strip()
+                title = f"收藏新表情：{desc[:48]}" if desc else "收藏了新的表情图"
+                sub_parts = [f"分类：{category}"]
+                if character:
+                    sub_parts.append(f"角色：{character}")
+                events.append(
+                    (
+                        parsed_ts.timestamp(),
+                        {
+                            "id": f"meme:{img_hash or path}",
+                            "category": "visual_media",
+                            "source_label": "视觉工坊",
+                            "tone": "warm" if meta.get("is_favorite") else "info",
+                            "occurred_at": parsed_ts.isoformat(),
+                            "title": title,
+                            "subtitle": " · ".join(sub_parts)[:140],
+                            "target_plugin": "astrbot_plugin_visual_media",
+                            "target_route": "workshop",
+                            "target_id": img_hash,
+                        },
+                    )
+                )
+
+            events.sort(key=lambda item: item[0], reverse=True)
+            return [item[1] for item in events[:max_items]]
+        except Exception:
+            return []
 
     def start_joint_reply_prefetch(self, event):
         if event.get_extra("visual_media_generation_requested", False):

@@ -20,27 +20,109 @@ function formError(form, message = "") {
   if (!node) { node = el("p", "", "form-error"); node.setAttribute("role", "alert"); form.querySelector("footer").before(node); }
   node.textContent = message;
 }
+function createPolaroidPlaceholder(profile) {
+  const wrap = el("div", "", "vm-polaroid-placeholder");
+  const avatar = el("span", (profile.name || profile.key || "?").slice(0, 1), "profile-avatar");
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  icon.setAttribute("viewBox", "0 0 24 24");
+  icon.setAttribute("width", "24");
+  icon.setAttribute("height", "24");
+  icon.setAttribute("fill", "none");
+  icon.setAttribute("stroke", "currentColor");
+  icon.setAttribute("stroke-width", "1.6");
+  icon.setAttribute("aria-hidden", "true");
+  icon.innerHTML = '<rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="2"/><path d="m21 16-5-5-6 6"/><path d="m14 14-2-2-4 4"/>';
+  wrap.append(avatar, icon);
+  return wrap;
+}
 function renderProfiles() {
   const query = $("profile-search").value.trim().toLocaleLowerCase();
-  const matches = profiles.filter(profile => `${profile.name} ${profile.key} ${profile.appearance}`.toLocaleLowerCase().includes(query));
+  const matches = profiles.filter(profile => `${profile.name} ${profile.key} ${profile.appearance} ${profile.style || ""}`.toLocaleLowerCase().includes(query));
   const visible = charactersPage || query ? matches : matches.slice(0, 3);
   $("profile-result-count").textContent = query ? `${matches.length} / ${profiles.length}` : String(profiles.length);
   $("profiles").replaceChildren();
   if (!visible.length) $("profiles").append(el("p", query ? UI.t("没有匹配的角色，试试其他关键词。") : UI.t("还没有角色形象。添加外观与画风，让之后的创作保持一致。"), "empty"));
   for (const profile of visible) {
-    const card = el("article", "", "profile");
-    const heading = el("div", "", "profile-heading");
-    const identity = el("div");
+    const refs = Array.isArray(profile.references) ? profile.references : [];
+    const card = el("article", "", "profile vm-polaroid");
+    const frame = el("div", "", "vm-polaroid-frame");
+    const stage = el("div", "", "vm-polaroid-stage" + (refs.length ? " is-loading" : " is-empty"));
+    if (refs.length) {
+      const coverBtn = el("button", "", "vm-cover-button vm-polaroid-cover-btn");
+      coverBtn.type = "button";
+      coverBtn.setAttribute("aria-label", UI.t("预览 {0} 的标准参考图", { 0: profile.name || profile.key }));
+      const image = el("img", "", "vm-profile-cover vm-polaroid-photo");
+      image.alt = profile.name || profile.key;
+      image.loading = "lazy";
+      image.onload = () => stage.classList.remove("is-loading");
+      coverBtn.append(image);
+      coverBtn.onclick = () => window.VisualReferences.preview(refs[0], profile.name || profile.key);
+      stage.append(coverBtn);
+      window.VisualReferences.load(refs[0], 420).then(url => {
+        if (image.isConnected) image.src = url;
+      }).catch(() => {
+        if (!stage.isConnected) return;
+        stage.classList.remove("is-loading");
+        stage.classList.add("is-empty");
+        stage.replaceChildren(createPolaroidPlaceholder(profile));
+      });
+    } else {
+      stage.append(createPolaroidPlaceholder(profile));
+    }
+    const stamp = el("span", UI.msg("{0} 张参考图", { 0: refs.length }), "reference-badge vm-polaroid-stamp");
+    stage.append(stamp);
+    frame.append(stage);
+
+    if (refs.length > 1) {
+      const strip = el("div", "", "vm-polaroid-thumbs");
+      for (const [idx, hash] of refs.slice(1, 4).entries()) {
+        const thumbBtn = el("button", "", "vm-polaroid-thumb");
+        thumbBtn.type = "button";
+        thumbBtn.setAttribute("aria-label", UI.t("参考图 {0}", { 0: idx + 2 }));
+        const thumbImg = el("img");
+        thumbImg.alt = UI.t("参考图 {0}", { 0: idx + 2 });
+        thumbImg.loading = "lazy";
+        thumbBtn.append(thumbImg);
+        thumbBtn.onclick = () => window.VisualReferences.preview(hash, `${profile.name || profile.key} · ${UI.t("参考图 {0}", { 0: idx + 2 })}`);
+        window.VisualReferences.load(hash, 160).then(url => {
+          if (thumbImg.isConnected) thumbImg.src = url;
+        }).catch(() => { thumbBtn.classList.add("is-missing"); });
+        strip.append(thumbBtn);
+      }
+      if (refs.length > 4) {
+        strip.append(el("span", `+${refs.length - 4}`, "vm-polaroid-more tabular-nums"));
+      }
+      frame.append(strip);
+    }
+
+    const heading = el("div", "", "profile-heading vm-polaroid-caption");
+    const identity = el("div", "", "vm-polaroid-identity");
     identity.append(el("h3", profile.name || profile.key), el("span", profile.key, "profile-key"));
-    if(profile.references?.length) {
-      const cover=el("button","","vm-cover-button");cover.type="button";cover.setAttribute("aria-label",UI.t("预览 {0} 的标准参考图",{0:profile.name}));
-      const image=el("img","","vm-profile-cover");image.alt=profile.name;cover.append(image);cover.onclick=()=>window.VisualReferences.preview(profile.references[0],profile.name);
-      window.VisualReferences.load(profile.references[0]).then(url=>{if(image.isConnected)image.src=url;}).catch(()=>{image.alt=UI.t("参考图不可用");});heading.append(cover,identity);
-    } else heading.append(el("span", (profile.name || profile.key).slice(0, 1), "profile-avatar"), identity);
-    const edit = el("button", UI.msg("编辑形象")); edit.onclick = () => editProfile(profile);
-    const create = el("button", UI.msg("用角色创作")); create.onclick = () => { $("generate-form").reset(); formError($("generate-form")); $("generate-form").elements.character.value = profile.key; $("generate-dialog").showModal(); };
-    const actions = el("div", "", "profile-actions"); actions.append(edit, create);
-    card.append(heading, el("p", profile.appearance || UI.t("尚未填写外观")), el("span", UI.msg("{0} 张参考图",{0:profile.references.length}), "reference-badge"), actions);
+    heading.append(identity);
+
+    const body = el("div", "", "vm-polaroid-body");
+    body.append(el("p", profile.appearance || UI.t("尚未填写外观")));
+    if (profile.style) {
+      const styleChip = el("div", "", "vm-polaroid-style");
+      styleChip.append(el("span", UI.msg("画风"), "vm-polaroid-style-label"), el("span", profile.style, "vm-polaroid-style-text"));
+      body.append(styleChip);
+    }
+
+    const edit = el("button", UI.msg("编辑形象"));
+    edit.type = "button";
+    edit.onclick = () => editProfile(profile);
+    const create = el("button", UI.msg("用角色创作"));
+    create.type = "button";
+    create.onclick = () => {
+      $("generate-form").reset();
+      formError($("generate-form"));
+      $("generate-form").elements.character.value = profile.key;
+      $("generate-dialog").showModal();
+    };
+    const actions = el("div", "", "profile-actions");
+    actions.append(edit, create);
+
+    card.append(frame, heading, body, actions);
     $("profiles").append(card);
   }
 }

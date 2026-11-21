@@ -8,12 +8,38 @@
  function unwrap(r){if(r?.status==='error'||r?.success===false)throw new Error(r.message||r.error||UI.t("请求失败"));return r?.status==='ok'?r.data:r;}
  const get=async(path,params)=>unwrap(await (window.DynamicsPanelBridge || window.AstrBotPluginPage).apiGet(path,params));
  function studioLink(id,prompt='',character=''){const url=new URL('studio/index.html',base);url.searchParams.set('ui',document.documentElement.dataset.uiTheme||'day');if(id)url.searchParams.set('reuse',id);if(character)url.searchParams.set('character',character);if(prompt)url.searchParams.set('prompt',String(prompt).slice(0,500));url.searchParams.set('umo',window.DynamicsGetActiveScope?.()||'');const language=window.getLanguage?.();if(language)url.searchParams.set('lang',language);return url.href;}
+ function stagePercent(stage,stageIndex,isError){
+  if(isError)return 100;
+  return ({queued:22,generating:56,checking:80,delivering:90,ready:100,delivered:100,awaiting_delivery:94}[stage]??Math.min(100,Math.max(18,(stageIndex+1)*24)));
+ }
  function progressRing(stage,stageIndex,isError,isWarn){
-  const pct=isError?100:({queued:22,generating:56,checking:80,delivering:90,ready:100,delivered:100,awaiting_delivery:94}[stage]??Math.min(100,Math.max(18,(stageIndex+1)*24)));
+  const pct=stagePercent(stage,stageIndex,isError);
   const r=9,c=+(2*Math.PI*r).toFixed(2),offset=+(c*(1-pct/100)).toFixed(2);
   const wrap=node('span','','vm-progress-ring'+(busy.has(stage)?' is-busy':'')+(isError?' error':isWarn?' warn':''));
   wrap.setAttribute('aria-hidden','true');
   wrap.innerHTML=`<svg viewBox="0 0 24 24"><circle class="vm-ring-track" cx="12" cy="12" r="${r}"></circle><circle class="vm-ring-fill" cx="12" cy="12" r="${r}" stroke-dasharray="${c}" stroke-dashoffset="${offset}"></circle></svg>`;
+  return wrap;
+ }
+ function phaseProgressBar(row,stageIndex,isError,isWarn){
+  const isBusy=busy.has(row.stage);
+  const pct=stagePercent(row.stage,stageIndex,isError);
+  const stageLabel=labels[row.stage]||row.stage;
+  const toneClass=isError?' is-error':isWarn?' is-warn':isBusy?' is-busy':' is-done';
+  const wrap=node('div','','vm-phase-progress'+toneClass);
+  wrap.setAttribute('role','progressbar');
+  wrap.setAttribute('aria-valuemin','0');
+  wrap.setAttribute('aria-valuemax','100');
+  wrap.setAttribute('aria-valuenow',String(pct));
+  wrap.setAttribute('aria-label',`${stageLabel} ${pct}%`);
+  const head=node('div','','vm-phase-progress-head');
+  const labelNode=node('span',stageLabel,'vm-phase-progress-label');
+  const pctNode=node('span',`${pct}%`,'vm-phase-progress-pct tabular-nums');
+  head.append(labelNode,pctNode);
+  const track=node('div','','vm-phase-track');
+  const fill=node('div','','vm-phase-fill');
+  fill.style.width=`${pct}%`;
+  track.append(fill);
+  wrap.append(head,track);
   return wrap;
  }
  async function preview(name,options){
@@ -33,7 +59,7 @@
  function elapsed(row){const start=Date.parse(row.created_at);if(!Number.isFinite(start))return UI.t("耗时待确认");const end=busy.has(row.stage)?Date.now():Date.parse(row.finished_at);const seconds=Math.max(0,Math.floor((Number.isFinite(end)?end-start:(row.duration_ms||0))/1000));return UI.t("耗时 {0}",{0:seconds>=60?UI.t("{0} 分 {1} 秒",{0:Math.floor(seconds/60),1:seconds%60}):UI.t("{0} 秒",{0:seconds})});}
  function mount(container,options={}){
   if(container._vmTasks)return container._vmTasks;
-  let page=1,total=0,rows=[],loading=false,destroyed=false,highlight='',epoch=0,refreshAgain=false;
+  let page=1,total=0,rows=[],loading=false,destroyed=false,highlight=new URLSearchParams(location.search).get('job')||'',epoch=0,refreshAgain=false;
   const size=Number(options.size||container.dataset.taskSize||20),compact=options.compact||container.dataset.taskCompact==='true';
   const toolbar=node('div','','vm-task-toolbar'),heading=node('h2',UI.msg("生成任务")),filter=node('select'),search=node('input'),refreshButton=node('button',UI.msg("刷新"));filter.setAttribute('aria-label',UI.t("任务状态筛选"));search.type='search';search.placeholder=UI.t("搜索本页任务");search.setAttribute('aria-label',UI.t("搜索本页任务"));for(const [value,label] of [['all','全部状态'],['active','处理中'],['attention','需要处理']]){const option=new Option(UI.t(label),value);UI.bind(option,label);filter.add(option);}UI.bind(filter,'任务状态筛选',{},'aria-label');UI.bind(search,'搜索本页任务',{},'placeholder');UI.bind(search,'搜索本页任务',{},'aria-label');toolbar.append(heading,filter,refreshButton);if(!compact)toolbar.append(search);
   const status=node('p','','vm-task-status');status.setAttribute('role','status');status.setAttribute('aria-live','polite');const list=node('div','','vm-task-list'),footer=node('div','','vm-task-footer'),prev=node('button',UI.msg("上一页")),next=node('button',UI.msg("下一页")),pageLabel=node('span');footer.append(prev,pageLabel,next);container.replaceChildren(toolbar,status,list,footer);
@@ -45,11 +71,12 @@
   function render(){
    const oldFocus=document.activeElement?.dataset?.focusKey;const openDetails=new Set([...list.querySelectorAll('details[open]')].map(e=>e.dataset.job));
    list.replaceChildren();const filtered=rows.filter(r=>(filter.value==='all'||filter.value==='active'&&busy.has(r.stage)||filter.value==='attention'&&attention(r))&&(!search.value||`${r.prompt} ${r.character}`.toLowerCase().includes(search.value.toLowerCase())));
-   for(const row of filtered){const card=node('article','','vm-task-card');card.dataset.job=row.job_id;if(highlight===row.job_id||highlight===row.task_id)card.classList.add('vm-task-selected');
+   for(const row of filtered){const card=node('article','','vm-task-card'+(busy.has(row.stage)?' is-active':''));card.dataset.job=row.job_id;if(highlight===row.job_id||highlight===row.task_id)card.classList.add('vm-task-selected');
     const stageIndex={queued:0,generating:1,generation_failed:1,interrupted:1,no_image:1,checking:2,ready:3,delivering:3,delivered:4,delivery_failed:3,delivery_unknown:3,delivery_uncertain:3,awaiting_delivery:3,expired:4}[row.stage]??0;
     const isErr=/failed/.test(row.stage),isWarn=!isErr&&attention(row);
     const head=node('div','','vm-task-head');head.append(progressRing(row.stage,stageIndex,isErr,isWarn),node('strong',row.prompt||UI.t("图片任务")),node('span',labels[row.stage]||row.stage,'vm-task-state '+(isErr?'error':isWarn?'warn':'')));card.append(head);
     const meta=node('div','','vm-task-meta');meta.append(node('span',row.character?UI.t("角色：{0}",{0:row.character}):({webui:UI.t("创作台"),llm_tool:UI.t("聊天创作"),command:UI.t("指令创作"),plugin:UI.t("插件创作"),llm_batch:UI.t("批量创作")}[row.source]||UI.t("图片创作"))),node('span',row.target==='仅保存在工坊'?UI.msg("仅保存在工坊"):row.target),node('span',elapsed(row)));card.append(meta);
+    card.append(phaseProgressBar(row,stageIndex,isErr,isWarn));
     const steps=node('ol','','vm-task-steps');
     [UI.t("排队"),UI.t("生成"),row.character?({skipped:UI.t("核对已关闭"),mismatch:UI.t("核对有差异"),unknown:UI.t("核对未确认")}[row.check?.status]||UI.t("形象核对")):UI.t("结果保存"),row.target==='仅保存在工坊'?UI.t("工坊可查看"):UI.t("交付")].forEach((label,i)=>{const step=node('li',label,i<stageIndex?'done':i===stageIndex?'current':'');if(i===stageIndex)step.setAttribute('aria-current','step');steps.append(step);});card.append(steps);
     if(row.images?.length){const strip=node('div','','vm-task-images');for(const name of row.images.slice(0,4)){const b=node('button'),img=node('img');b.type='button';b.setAttribute('aria-label',UI.t("查看生成图片"));img.alt=UI.t("生成图片");img.loading='lazy';imageSource(name).then(url=>{if(img.isConnected)img.src=url;}).catch(()=>img.alt=UI.t("预览暂不可用"));b.append(img);b.onclick=()=>preview(name,{...options,images:row.images});strip.append(b);}card.append(strip);}

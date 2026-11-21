@@ -823,6 +823,76 @@ class PluginConfig(BaseModel):
 
         return "", ""
 
+    def get_event_origin_target(self, event: AstrMessageEvent) -> str:
+        """Build the canonical ``origin_target`` string for captured/stolen memes.
+
+        Preserves full platform/adapter + session identity as ``umo:<umo>`` when
+        ``event.unified_msg_origin`` is available so multi-adapter groups sharing
+        a numeric group ID stay isolated; falls back to legacy ``group:<id>`` /
+        ``user:<id>`` when UMO is absent.
+        """
+        try:
+            umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        except Exception:
+            umo = ""
+        if umo:
+            return f"umo:{umo}"
+        scope, target_id = self.get_event_target(event)
+        if scope and target_id:
+            return f"{scope}:{target_id}"
+        return ""
+
+    @classmethod
+    def parse_origin_scope(cls, value: object) -> tuple[str, str]:
+        """Parse an origin_target or scope string into ``(full_umo, legacy_target)``."""
+        raw = str(value or "").strip()
+        if not raw:
+            return "", ""
+        lowered = raw.lower()
+        is_umo_prefixed = lowered.startswith("umo:")
+        body = raw[4:].strip() if is_umo_prefixed else raw
+        if not body:
+            return "", ""
+
+        parts = body.split(":", 2)
+        if len(parts) == 3 and parts[0].strip() and parts[2].strip():
+            msg_type = parts[1].strip().lower()
+            session_id = parts[2].strip()
+            legacy = ""
+            if "group" in msg_type:
+                legacy = f"group:{session_id}"
+            elif any(k in msg_type for k in ("friend", "private", "user", "direct")):
+                legacy = f"user:{session_id}"
+            return body, legacy
+
+        if is_umo_prefixed:
+            return body, ""
+
+        if ":" in body:
+            normalized = cls.normalize_target_entry(body, default_scope="")
+            if normalized.startswith(("group:", "user:")):
+                return "", normalized
+
+        return "", ""
+
+    @classmethod
+    def origin_target_matches_scope(cls, origin_target: object, scope: object) -> bool:
+        """Match a meme's ``origin_target`` against a queried session ``scope``.
+
+        - When ``origin_target`` carries full UMO identity (``umo:<platform>:<type>:<id>``),
+          a full UMO ``scope`` requires exact UMO equality (strict multi-adapter isolation).
+        - When ``origin_target`` uses legacy ``group:<id>`` / ``user:<id>`` format
+          (existing auto-captured/imported memes), match against the scope's derived
+          ``group:<id>`` / ``user:<id>`` target.
+        """
+        origin_umo, origin_legacy = cls.parse_origin_scope(origin_target)
+        scope_umo, scope_legacy = cls.parse_origin_scope(scope)
+        if origin_umo:
+            if scope_umo:
+                return origin_umo == scope_umo
+            return bool(origin_legacy and scope_legacy and origin_legacy == scope_legacy)
+        return bool(origin_legacy and scope_legacy and origin_legacy == scope_legacy)
+
     def get_event_targets(self, event: AstrMessageEvent) -> list[str]:
         targets: list[str] = []
         seen: set[str] = set()

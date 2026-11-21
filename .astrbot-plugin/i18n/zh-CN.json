@@ -1,7 +1,7 @@
 {
   "metadata": {
-    "display_name": "视觉工坊",
-    "desc": "表情管理、图片创作与角色形象统一管理"
+    "display_name": "群间视觉 · Visual Media",
+    "desc": "群间系列视觉表达插件（原名「视觉工坊」）：一站式整合表情包收集检索、多模态生图改图、角色参考形象与媒体偏好策略。"
   },
   "config": {
     "memes": {

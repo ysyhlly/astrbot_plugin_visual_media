@@ -1,5 +1,11 @@
 # 更新日志
 
+## 0.5.0-rc.7 — 2026-11-21
+
+- 群间系列面板 v2：统一「群间视觉 · Visual Media」品牌图标与文案，新增系列摘要脉冲、群控矩阵状态、只读联邦搜索与今日生活手账钩子，同步共享 UI Kit。
+- 修复表情来源记录与面板匹配：自动收录与偷图工具优先写入带完整适配器身份的 `umo:<UMO>` 来源（无 UMO 时回退 `group:`/`user:`）；面板搜索、分群计数与手账统一经 `origin_target_matches_scope` 兼容历史 `group:`/`user:` 自动收录表情并对完整 UMO 保持严格多适配器隔离。
+- 修复 `tools/build_release.py` 根目录白名单遗漏 `logo.png`，确保生成的安装/源码 ZIP 根目录包含 `logo.png`。
+
 ## 0.5.0-rc.6 — 2026-11-20
 
 - 统一 `metadata.yaml` 与 `VisualMediaPlugin.author` 的作者归属为 `ysyhlly`（保留 `plugin_id` 确保现有 KV 存储向后兼容）。

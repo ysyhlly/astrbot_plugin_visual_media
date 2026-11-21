@@ -1,5 +1,11 @@
 (() => {
- const UI=window.SeriesUI||{t:(s,p={})=>String(s).replace(/\{(\w+)\}/g,(m,k)=>Object.hasOwn(p,k)?String(p[k]??''):m),msg(s,p={}){return this.t(s,p);},text(n,v){n.textContent=String(v??'');return n;},bind(n,s,p={},a=''){if(a)n.setAttribute(a,this.t(s,p));else n.textContent=this.t(s,p);return n;},onLocaleChange:()=>()=>{}};
+  const UI = window.SeriesUI || {
+    t: (s, p = {}) => String(s).replace(/\{(\w+)\}/g, (m, k) => (Object.hasOwn(p, k) ? String(p[k] ?? '') : m)),
+    msg(s, p = {}) { return this.t(s, p); },
+    text(n, v) { n.textContent = String(v ?? ''); return n; },
+    bind(n, s, p = {}, a = '') { if (a) n.setAttribute(a, this.t(s, p)); else n.textContent = this.t(s, p); return n; },
+    onLocaleChange: () => () => {},
+  };
 
   const root = document.documentElement;
   const script = document.currentScript;
@@ -13,6 +19,19 @@
   let theme = validTheme(queryTheme) ? queryTheme : validTheme(storedTheme) ? storedTheme : 'day';
   const page = document.body.dataset.workshopPage || 'home';
   const selected = page === 'home' && query.get('section') === 'characters' ? 'characters' : page;
+
+  const iconSvg = (paths) =>
+    `<span class="vm-nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">${paths}</svg></span>`;
+
+  const routeIcons = {
+    home: iconSvg('<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>'),
+    characters: iconSvg('<rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="12" cy="10" r="3"/><path d="M7 18.5c1.2-2.2 3-3.2 5-3.2s3.8 1 5 3.2"/>'),
+    memes: iconSvg('<circle cx="12" cy="12" r="9"/><path d="M8.5 14.5c1 1.4 2.2 2 3.5 2s2.5-.6 3.5-2"/><circle cx="9" cy="10" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="10" r="1" fill="currentColor" stroke="none"/>'),
+    studio: iconSvg('<path d="M12 3l1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6-4.6-1.9 4.6-1.9z"/><path d="M18.5 16l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z"/>'),
+    tasks: iconSvg('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.2 2"/>'),
+    behavior: iconSvg('<path d="M4 7h16M4 12h16M4 17h16"/><circle cx="9" cy="7" r="2" fill="var(--surface, #fcfdfb)"/><circle cx="15" cy="12" r="2" fill="var(--surface, #fcfdfb)"/><circle cx="11" cy="17" r="2" fill="var(--surface, #fcfdfb)"/>'),
+  };
+
   const links = [
     ['home', '总览', 'index.html'],
     ['characters', '角色形象', 'index.html?section=characters'],
@@ -21,24 +40,33 @@
     ['tasks', '生成任务', 'tasks/index.html'],
     ['behavior', '表达与记录', 'behavior/index.html'],
   ];
+
   const header = document.createElement('header');
   header.className = 'series-nav';
   header.innerHTML = `<a class="series-brand" href="${new URL('index.html', base)}"><span class="series-mark" aria-hidden="true">VM</span><span data-series-text="视觉工坊">视觉工坊</span></a>
     <nav class="series-tabs" aria-label="工坊导航" data-series-aria-label="工坊导航">${links.map(([key, label, href]) =>
-      `<a href="${new URL(href, base)}"${key === selected ? ' aria-current="page"' : ''} data-workshop-route data-series-text="${label}">${label}</a>`).join('')}</nav>
-    <div class="series-nav-tools"><button class="series-theme" id="vm-theme-toggle" type="button" aria-pressed="false"><span class="ui-theme-label">日间模式</span><span class="series-switch" aria-hidden="true"></span></button></div>`;
+      `<a href="${new URL(href, base)}"${key === selected ? ' aria-current="page"' : ''} data-workshop-route>${routeIcons[key] || ''}<span data-series-text="${label}">${label}</span></a>`).join('')}</nav>
+    <div class="series-nav-tools"><button class="series-theme" id="vm-theme-toggle" type="button" aria-pressed="false"><span class="ui-theme-label" data-series-text="日间模式">日间模式</span><span class="series-switch" aria-hidden="true"></span></button></div>`;
+
   document.body.classList.add('vm-layout');
-  document.body.prepend(header);
+  const seriesPanel = document.getElementById('dynamics-series-panel');
+  if (seriesPanel && seriesPanel.parentElement === document.body) {
+    seriesPanel.after(header);
+  } else {
+    document.body.prepend(header);
+  }
+
   const skip = document.createElement('a');
   skip.className = 'series-skip';
   skip.href = page === 'memes' ? '#app' : '#workspace';
   skip.textContent = '跳到工作区';
   skip.dataset.seriesText = '跳到工作区';
-  header.before(skip);
+  document.body.prepend(skip);
+
   const toggle = document.getElementById('vm-theme-toggle');
 
   const carryContext = () => {
-    document.querySelectorAll('a[href]').forEach(link => {
+    document.querySelectorAll('a[href]').forEach((link) => {
       try {
         const url = new URL(link.getAttribute('href'), location.href);
         if (url.origin !== base.origin || !url.pathname.startsWith(base.pathname) || !url.pathname.endsWith('.html') || link.getAttribute('href')?.startsWith('#')) return;
@@ -51,6 +79,14 @@
       } catch { /* Ignore non-workshop or malformed links. */ }
     });
   };
+
+  function syncThemeText() {
+    const night = theme === 'night';
+    const label = toggle.querySelector('.ui-theme-label');
+    if (label) label.textContent = window.DynamicsUI?.tr?.(night ? '夜间模式' : '日间模式') || UI.t(night ? '夜间模式' : '日间模式');
+    toggle.setAttribute('aria-label', window.DynamicsUI?.tr?.(night ? '切换到日间模式' : '切换到夜间模式') || UI.t(night ? '切换到日间模式' : '切换到夜间模式'));
+  }
+
   function apply(value, save = false) {
     if (!validTheme(value)) return;
     theme = value;
@@ -59,8 +95,7 @@
     root.dataset.theme = night ? 'dark' : 'light';
     root.style.colorScheme = night ? 'dark' : 'light';
     toggle.setAttribute('aria-pressed', String(night));
-    toggle.querySelector('.ui-theme-label').textContent = UI.t(night ? '夜间模式' : '日间模式');
-    toggle.setAttribute('aria-label', UI.t(night ? '切换到日间模式' : '切换到夜间模式'));
+    syncThemeText();
     if (save) {
       try { localStorage.setItem('chat_dynamics_ui', value); } catch { /* URL keeps the preference for this visit. */ }
       try {
@@ -71,18 +106,76 @@
     }
     carryContext();
   }
+
   toggle.addEventListener('click', () => apply(theme === 'night' ? 'day' : 'night', true));
-  window.addEventListener('storage', ({key, newValue}) => {
+  window.addEventListener('storage', ({ key, newValue }) => {
     if (key === 'chat_dynamics_ui' && validTheme(newValue)) apply(newValue);
   });
-  window.addEventListener('dynamics-scopechange', e => {
+  window.addEventListener('dynamics-scopechange', (e) => {
     activeUmo = String(e.detail?.umo ?? '').trim();
     carryContext();
   });
-  window.addEventListener('series-languagechange', carryContext);
+  window.addEventListener('series-languagechange', () => {
+    syncThemeText();
+    carryContext();
+  });
   window.DynamicsGetActiveScope = () => activeUmo;
-  window.VisualMediaUI = {current: () => theme, apply};
+  window.VisualMediaUI = { current: () => theme, apply };
   apply(theme);
+
+  function buildWorkshopUrl(relPath, extraParams = {}) {
+    const url = new URL(relPath, base);
+    url.searchParams.set('ui', theme);
+    if (activeUmo) url.searchParams.set('umo', activeUmo);
+    const language = window.getLanguage?.() || query.get('lang');
+    if (language) url.searchParams.set('lang', language);
+    for (const [k, v] of Object.entries(extraParams)) {
+      if (v !== undefined && v !== null && String(v) !== '') url.searchParams.set(k, String(v));
+    }
+    return url.href;
+  }
+
+  window.addEventListener('dynamics-cmdk-deeplink', (event) => {
+    const item = event?.detail;
+    if (!item || typeof item !== 'object') return;
+    const dl = item.deep_link && typeof item.deep_link === 'object' ? item.deep_link : {};
+    const subpage = String(dl.subpage || '').trim();
+    const section = String(dl.section || '').trim();
+    if (section === 'characters') {
+      const searchInput = document.getElementById('profile-search');
+      if (page === 'home' && searchInput) {
+        if (dl.character) {
+          searchInput.value = String(dl.character);
+          searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        document.getElementById('characters-section')?.scrollIntoView?.({ block: 'start', behavior: 'smooth' });
+        return;
+      }
+      location.href = buildWorkshopUrl('index.html', { section: 'characters' });
+      return;
+    }
+    if (subpage === 'tasks') {
+      const taskHost = document.querySelector('[data-task-cards]');
+      if (taskHost?._vmTasks && dl.job_id) {
+        taskHost._vmTasks.highlightJob(String(dl.job_id));
+        taskHost.scrollIntoView?.({ block: 'start', behavior: 'smooth' });
+        return;
+      }
+      location.href = buildWorkshopUrl('tasks/index.html', dl.job_id ? { job: dl.job_id } : {});
+      return;
+    }
+    if (subpage === 'memes') {
+      location.href = buildWorkshopUrl('memes/index.html');
+      return;
+    }
+    if (subpage === 'studio') {
+      location.href = buildWorkshopUrl('studio/index.html');
+      return;
+    }
+    if (subpage === 'behavior') {
+      location.href = buildWorkshopUrl('behavior/index.html');
+    }
+  });
 
   function setupStudioRemixPrefill() {
     if (page !== 'studio') return;
@@ -130,5 +223,5 @@
   document.addEventListener('DOMContentLoaded', () => {
     carryContext();
     setupStudioRemixPrefill();
-  }, {once:true});
+  }, { once: true });
 })();

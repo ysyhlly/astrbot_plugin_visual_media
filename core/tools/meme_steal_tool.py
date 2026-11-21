@@ -274,12 +274,24 @@ class MemeStealToolWorkflow:
         source: str = "llm_tool",
     ) -> dict[str, Any] | None:
         extra_meta: dict[str, Any] = {}
+        origin_target_str = ""
         try:
-            scope, target_id = self.get_event_target(event)
+            cfg = getattr(self, "plugin_config", None)
+            origin_getter = getattr(cfg, "get_event_origin_target", None) if cfg else None
+            if callable(origin_getter):
+                origin_target_str = str(origin_getter(event) or "").strip()
+            else:
+                umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+                if umo:
+                    origin_target_str = f"umo:{umo}"
+                else:
+                    scope, target_id = self.get_event_target(event)
+                    if scope and target_id:
+                        origin_target_str = f"{scope}:{target_id}"
         except Exception:
-            scope, target_id = "", ""
-        if scope and target_id:
-            extra_meta["origin_target"] = f"{scope}:{target_id}"
+            origin_target_str = ""
+        if origin_target_str:
+            extra_meta["origin_target"] = origin_target_str
 
         if image_ref.startswith("http://") or image_ref.startswith("https://"):
             extra_meta["origin_url"] = image_ref

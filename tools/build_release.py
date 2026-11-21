@@ -55,6 +55,7 @@ ROOT_FILES = {
     "prompts.json",
     "_conf_schema.json",
     "metadata.yaml",
+    "logo.png",
     "requirements.txt",
     "requirements-faiss.txt",
     "requirements-tested.txt",

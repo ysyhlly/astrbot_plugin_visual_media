@@ -1,7 +1,7 @@
 {
   "metadata": {
-    "display_name": "Visual Workshop",
-    "desc": "Integrated memes, image creation and character profiles"
+    "display_name": "Visual Media",
+    "desc": "Visual expression plugin for the Chat Dynamics series: meme collection and search, multimodal image generation/editing, character reference profiles, and media preference policies."
   },
   "config": {
     "memes": {
