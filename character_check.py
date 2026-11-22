@@ -7,6 +7,24 @@ from .core.processing.vlm_call_service import VLMCallService
 from .core.util.model_requests import model_request_gate
 from .media_settings import MediaSettings
 
+try:
+    from .series_panels import is_provider_budget_busy_error, series_llm_call
+except Exception:  # pragma: no cover - standalone fallback
+    def is_provider_budget_busy_error(_exc: BaseException | None) -> bool:
+        return False
+
+    async def series_llm_call(
+        _context,
+        _provider_id: str,
+        _plugin_id: str,
+        _purpose: str,
+        invoke,
+        *,
+        acquire_timeout: float | None = 15.0,
+    ):
+        _ = acquire_timeout
+        return await invoke()
+
 
 def parse_check_response(raw, checked, total, references):
     if not isinstance(raw, str) or len(raw) > 32768:
@@ -86,11 +104,18 @@ async def check_character(owner, profile, paths, refs, prompt, event=None):
         response = await asyncio.wait_for(
             model_request_gate(owner.memes).call(
                 provider,
-                lambda: owner.context.llm_generate(
-                    chat_provider_id=provider,
-                    system_prompt=CHARACTER_CHECK_SYSTEM_PROMPT,
-                    prompt=user_prompt,
-                    image_urls=refs + outputs,
+                lambda: series_llm_call(
+                    owner.context,
+                    provider,
+                    "astrbot_plugin_visual_media",
+                    "visual_character_check",
+                    lambda: owner.context.llm_generate(
+                        chat_provider_id=provider,
+                        system_prompt=CHARACTER_CHECK_SYSTEM_PROMPT,
+                        prompt=user_prompt,
+                        image_urls=refs + outputs,
+                    ),
+                    acquire_timeout=min(15.0, float(settings.character_check_timeout)),
                 ),
             ),
             timeout=settings.character_check_timeout,
@@ -100,5 +125,7 @@ async def check_character(owner, profile, paths, refs, prompt, event=None):
         return {**unknown, "reason":"vision_timeout"}
     except (ValueError, TypeError, AttributeError):
         return {**unknown, "reason":"invalid_vision_response"}
-    except Exception:
+    except Exception as exc:
+        if is_provider_budget_busy_error(exc):
+            return {**unknown, "reason":"provider_budget_busy"}
         return unknown

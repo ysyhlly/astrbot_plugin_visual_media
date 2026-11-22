@@ -142,10 +142,16 @@ def test_series_panels_presence_standalone_degradation(tmp_path):
 
 
 def test_workshop_html_standardized_i18n_and_v2_shell():
-    msg_src = (WORKSHOP_DIR / "series-messages.js").read_text(encoding="utf-8")
-    messages = json.loads(
-        msg_src[msg_src.index("{") : msg_src.rindex("}") + 1]
-    )
+    loader_src = (WORKSHOP_DIR / "series-messages.js").read_text(encoding="utf-8")
+    assert "loadLocaleMessages" in loader_src
+    locale_packs = {}
+    for lang in ("en", "ja", "ru"):
+        pack_src = (WORKSHOP_DIR / f"series-messages-{lang}.js").read_text(
+            encoding="utf-8"
+        )
+        locale_packs[lang] = json.loads(
+            pack_src[pack_src.index("{") : pack_src.rindex("}") + 1]
+        )
     html_files = [
         WORKSHOP_DIR / "index.html",
         WORKSHOP_DIR / "tasks" / "index.html",
@@ -162,7 +168,10 @@ def test_workshop_html_standardized_i18n_and_v2_shell():
             r'data-series-(?:text|aria-label|placeholder|title)="([^"]+)"', content
         ):
             key = match.group(1)
-            assert key in messages, f"missing translation key {key!r} in {path.name}"
+            for lang, pack in locale_packs.items():
+                assert key in pack, (
+                    f"missing {lang} translation key {key!r} in {path.name}"
+                )
 
     # Verify polaroid cards & phase progress bar hooks exist in workshop assets
     workshop_js = (WORKSHOP_DIR / "workshop.js").read_text(encoding="utf-8")

@@ -13,7 +13,7 @@ ensure_current(
         ("media_library", "MediaLibrary", "_rebuild_public_ref_cache"),
         ("media_behavior", "MediaBehavior", "records"),
     ],
-    version="0.5.0-rc.7",
+    version="0.5.0-rc.8",
 )
 
 import asyncio
@@ -375,6 +375,53 @@ class VisualMediaPlugin(Star):
             pass
         return []
 
+    def _series_panels_mod(self):
+        try:
+            if __package__:
+                from . import series_panels
+
+                return series_panels
+            import series_panels
+
+            return series_panels
+        except Exception:
+            return None
+
+    def _series_tz(self):
+        mod = self._series_panels_mod()
+        if mod is not None and callable(getattr(mod, "resolve_series_timezone", None)):
+            return mod.resolve_series_timezone(getattr(self, "context", None))
+        return datetime.now(timezone.utc).astimezone().tzinfo
+
+    def _is_excluded_by_core(self, umo: str = "", group_id: str = "") -> bool:
+        clean_umo = str(umo or "").strip()
+        clean_gid = str(group_id or "").strip()
+        if not clean_umo and not clean_gid:
+            return False
+        mod = self._series_panels_mod()
+        if mod is not None and callable(getattr(mod, "is_series_group_excluded", None)):
+            return bool(
+                mod.is_series_group_excluded(
+                    getattr(self, "context", None), umo=clean_umo, group_id=clean_gid
+                )
+            )
+        return False
+
+    def _is_event_excluded_by_core(self, event: AstrMessageEvent | None) -> bool:
+        if event is None:
+            return False
+        umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        gid = ""
+        get_gid = getattr(event, "get_group_id", None)
+        if callable(get_gid):
+            try:
+                gid = str(get_gid() or "").strip()
+            except Exception:
+                gid = ""
+        if not gid:
+            gid = str(getattr(event, "group_id", "") or "").strip()
+        return self._is_excluded_by_core(umo=umo, group_id=gid)
+
     def get_series_summary(self) -> dict[str, Any]:
         """Return compact live badge and pulse summary for the v2 series matrix."""
         now_utc = datetime.now(timezone.utc)
@@ -391,7 +438,8 @@ class VisualMediaPlugin(Star):
                     "pulse": {"headline": "等待引擎初始化", "updated_at": now_iso},
                 }
 
-            today_local = now_utc.astimezone().date()
+            tz = self._series_tz()
+            today_local = now_utc.astimezone(tz).date()
             running = 0
             failed = 0
             succeeded_today = 0
@@ -419,7 +467,7 @@ class VisualMediaPlugin(Star):
                 elif status in {"succeeded", "partial_success"}:
                     if (
                         parsed_ts is not None
-                        and parsed_ts.astimezone().date() == today_local
+                        and parsed_ts.astimezone(tz).date() == today_local
                     ):
                         succeeded_today += 1
 
@@ -506,7 +554,8 @@ class VisualMediaPlugin(Star):
                     if targets:
                         meme_allowed = bool(cfg.is_targets_allowed("send", targets))
 
-            today_local = datetime.now(timezone.utc).astimezone().date()
+            tz = self._series_tz()
+            today_local = datetime.now(timezone.utc).astimezone(tz).date()
             activity_today = 0
             for row in self._safe_tracker_rows():
                 req_umo = str((row.get("requester") or {}).get("umo") or "").strip()
@@ -517,7 +566,7 @@ class VisualMediaPlugin(Star):
                 )
                 if (
                     parsed_ts is not None
-                    and parsed_ts.astimezone().date() == today_local
+                    and parsed_ts.astimezone(tz).date() == today_local
                 ):
                     activity_today += 1
 
@@ -531,9 +580,24 @@ class VisualMediaPlugin(Star):
                 parsed_ts = self._parse_series_ts(meta.get("created_at"))
                 if (
                     parsed_ts is not None
-                    and parsed_ts.astimezone().date() == today_local
+                    and parsed_ts.astimezone(tz).date() == today_local
                 ):
                     activity_today += 1
+
+            excluded_by_core = bool(
+                target_umo
+                and self._is_excluded_by_core(umo=target_umo, group_id=group_id)
+            )
+            if excluded_by_core:
+                return {
+                    "enabled": False,
+                    "supported": False,
+                    "excluded_by_core": True,
+                    "persona_id": "",
+                    "activity_today": activity_today,
+                    "summary": "主控排除（表情采集与被动视觉已静默）",
+                    "version": "1:0:0",
+                }
 
             enabled = bool(gen_allowed or meme_allowed)
             if gen_allowed and meme_allowed:
@@ -552,6 +616,7 @@ class VisualMediaPlugin(Star):
             return {
                 "enabled": enabled,
                 "supported": True,
+                "excluded_by_core": False,
                 "persona_id": "",
                 "activity_today": activity_today,
                 "summary": summary,
@@ -702,9 +767,10 @@ class VisualMediaPlugin(Star):
             except (TypeError, ValueError):
                 max_items = 20
 
+            tz = self._series_tz()
             date_key = str(date or "today").strip().lower()
             if date_key in {"", "today"}:
-                target_date = datetime.now(timezone.utc).astimezone().date()
+                target_date = datetime.now(timezone.utc).astimezone(tz).date()
             else:
                 try:
                     target_date = _date_cls.fromisoformat(date_key)
@@ -727,7 +793,7 @@ class VisualMediaPlugin(Star):
                 )
                 if (
                     parsed_ts is None
-                    or parsed_ts.astimezone().date() != target_date
+                    or parsed_ts.astimezone(tz).date() != target_date
                 ):
                     continue
                 job_id = str(row.get("job_id") or "").strip()
@@ -774,7 +840,7 @@ class VisualMediaPlugin(Star):
                 parsed_ts = self._parse_series_ts(meta.get("created_at"))
                 if (
                     parsed_ts is None
-                    or parsed_ts.astimezone().date() != target_date
+                    or parsed_ts.astimezone(tz).date() != target_date
                 ):
                     continue
                 img_hash = str(meta.get("hash") or "").strip()
@@ -1087,6 +1153,8 @@ class VisualMediaPlugin(Star):
     @filter.platform_adapter_type(PlatformAdapterType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         """消息监听：偷取消息中的图片并分类存储。"""
+        if self._is_event_excluded_by_core(event):
+            return None
         return await self.memes.on_message(event)
 
     @filter.on_llm_tool_respond()
@@ -1151,8 +1219,10 @@ class VisualMediaPlugin(Star):
 
     @filter.on_llm_request(priority=5)
     async def _start_joint_meme_prefetch(self, event: AstrMessageEvent, req):
-        if event.get_extra("_narrative_internal_v1", False) or event.get_extra(
-            "visual_media_generation_requested", False
+        if (
+            self._is_event_excluded_by_core(event)
+            or event.get_extra("_narrative_internal_v1", False)
+            or event.get_extra("visual_media_generation_requested", False)
         ):
             return
         return await self.memes._start_joint_meme_prefetch(event, req)
@@ -1178,7 +1248,9 @@ class VisualMediaPlugin(Star):
 
     @filter.on_llm_request(priority=1)
     async def _prepare_joint_meme_reply(self, event: AstrMessageEvent, req):
-        if event.get_extra("_narrative_internal_v1", False):
+        if self._is_event_excluded_by_core(event) or event.get_extra(
+            "_narrative_internal_v1", False
+        ):
             return
         attach_prompt = not getattr(req, "_visual_preferences_attached", False)
         extra_prompt = await asyncio.to_thread(
@@ -1200,7 +1272,8 @@ class VisualMediaPlugin(Star):
         streaming result.  The LLM response hook runs after the agent has its
         final response and gives passive emoji scheduling a stable entry point."""
         if (
-            event.get_extra("visual_media_generation_requested", False)
+            self._is_event_excluded_by_core(event)
+            or event.get_extra("visual_media_generation_requested", False)
             or joint_reply_owned(event)
         ):
             return
@@ -1210,7 +1283,8 @@ class VisualMediaPlugin(Star):
     async def _prepare_emoji_response(self, event: AstrMessageEvent):
         """LLM 回复完成后异步发送表情包（不阻塞回复）。"""
         if (
-            event.get_extra("visual_media_generation_requested", False)
+            self._is_event_excluded_by_core(event)
+            or event.get_extra("visual_media_generation_requested", False)
             or joint_reply_owned(event)
         ):
             return

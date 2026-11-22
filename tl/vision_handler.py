@@ -21,6 +21,24 @@ from .enhanced_prompts import (
 )
 from .image_splitter import split_image
 
+try:
+    if __package__ and "." in __package__:
+        from ..series_panels import series_llm_call
+    else:
+        from series_panels import series_llm_call
+except Exception:  # pragma: no cover - standalone fallback
+    async def series_llm_call(
+        _context: Any,
+        _provider_id: str,
+        _plugin_id: str,
+        _purpose: str,
+        invoke: Any,
+        *,
+        acquire_timeout: float | None = 15.0,
+    ) -> Any:
+        _ = acquire_timeout
+        return await invoke()
+
 if TYPE_CHECKING:
     from astrbot.api.event import AstrMessageEvent
     from astrbot.api.star import Context
@@ -179,13 +197,19 @@ class VisionHandler:
             # 注意：这里直接设置 system_prompt 而非增强调用方可能已有的 prompt，
             # 因为这是独立的视觉识别请求，需要精确控制提示词以确保返回 JSON 格式的裁剪框数据。
             # 如需增强而非覆盖，可使用 inject_vision_system_prompt 方法。
-            resp = await self.context.llm_generate(
-                chat_provider_id=self.vision_provider_id,
-                prompt=prompt,
-                image_urls=image_urls,
-                max_output_tokens=600,
-                timeout=120,
-                system_prompt=get_vision_crop_system_prompt(),
+            resp = await series_llm_call(
+                self.context,
+                self.vision_provider_id,
+                "astrbot_plugin_visual_media",
+                "visual_sticker_crop",
+                lambda: self.context.llm_generate(
+                    chat_provider_id=self.vision_provider_id,
+                    prompt=prompt,
+                    image_urls=image_urls,
+                    max_output_tokens=600,
+                    timeout=120,
+                    system_prompt=get_vision_crop_system_prompt(),
+                ),
             )
             text = self.extract_llm_text(resp)
             if not text:
@@ -295,12 +319,18 @@ class VisionHandler:
         prompt = get_grid_detect_prompt()
 
         try:
-            resp = await self.context.llm_generate(
-                chat_provider_id=self.vision_provider_id,
-                prompt=prompt,
-                image_urls=[vision_input_path],
-                max_output_tokens=200,
-                timeout=60,
+            resp = await series_llm_call(
+                self.context,
+                self.vision_provider_id,
+                "astrbot_plugin_visual_media",
+                "visual_grid_detect",
+                lambda: self.context.llm_generate(
+                    chat_provider_id=self.vision_provider_id,
+                    prompt=prompt,
+                    image_urls=[vision_input_path],
+                    max_output_tokens=200,
+                    timeout=60,
+                ),
             )
             text = self.extract_llm_text(resp)
             if not text:

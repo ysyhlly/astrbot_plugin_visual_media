@@ -12,6 +12,27 @@ from astrbot.api.event import AstrMessageEvent
 from ..util.model_requests import model_request_gate
 
 try:
+    if __package__ and __package__.count(".") >= 2:
+        from ...series_panels import is_provider_budget_busy_error, series_llm_call
+    else:
+        from series_panels import is_provider_budget_busy_error, series_llm_call
+except Exception:  # pragma: no cover - standalone fallback
+    def is_provider_budget_busy_error(_exc: BaseException | None) -> bool:
+        return False
+
+    async def series_llm_call(
+        _context,
+        _provider_id: str,
+        _plugin_id: str,
+        _purpose: str,
+        invoke,
+        *,
+        acquire_timeout: float | None = 15.0,
+    ):
+        _ = acquire_timeout
+        return await invoke()
+
+try:
     from PIL import Image as PILImage
     from PIL import ImageDraw as PILImageDraw
 except Exception:
@@ -343,8 +364,16 @@ class VLMCallService:
                 )
                 result = await model_request_gate(self.plugin).call(
                     provider_id,
-                    lambda: self.plugin.context.llm_generate(
-                        chat_provider_id=provider_id, prompt=prompt, image_urls=[file_url],
+                    lambda: series_llm_call(
+                        getattr(self.plugin, "context", None),
+                        provider_id,
+                        "astrbot_plugin_visual_media",
+                        "visual_vlm_analysis",
+                        lambda: self.plugin.context.llm_generate(
+                            chat_provider_id=provider_id,
+                            prompt=prompt,
+                            image_urls=[file_url],
+                        ),
                     ),
                 )
 
@@ -360,6 +389,11 @@ class VLMCallService:
                 last_error = Exception("VLM返回空响应")
 
             except Exception as e:
+                if is_provider_budget_busy_error(e):
+                    logger.warning(
+                        f"VLM共享模型队列繁忙，放弃重试以便延后处理: provider={provider_id}"
+                    )
+                    raise
                 last_error = e
                 error_msg = str(e)
                 is_rate_limit = any(

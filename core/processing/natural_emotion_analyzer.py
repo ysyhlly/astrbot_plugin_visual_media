@@ -27,15 +27,48 @@ def _joint_reply_owned(event: Any) -> bool:
     return bool(callable(getter) and getter(_JOINT_REPLY_KEY, False) is True)
 
 
-def _inherit_series_provider(context: Any) -> str:
+def _series_panels_mod():
     try:
         if __package__ and __package__.count(".") >= 2:
-            from ...series_panels import inherit_provider
-        else:
-            from series_panels import inherit_provider
-    except ImportError:
+            from ... import series_panels
+
+            return series_panels
+        import series_panels
+
+        return series_panels
+    except Exception:
+        return None
+
+
+def _inherit_series_provider(context: Any) -> str:
+    mod = _series_panels_mod()
+    if mod is None:
         return ""
-    return inherit_provider("", context, role="reply")
+    resolver = getattr(mod, "resolve_series_provider", None)
+    if callable(resolver):
+        return resolver(context, "", role="reply")
+    inheritor = getattr(mod, "inherit_provider", None)
+    return inheritor("", context, role="reply") if callable(inheritor) else ""
+
+
+def _is_budget_busy(exc: BaseException | None) -> bool:
+    mod = _series_panels_mod()
+    checker = getattr(mod, "is_provider_budget_busy_error", None) if mod else None
+    return bool(callable(checker) and checker(exc))
+
+
+async def _call_via_series_budget(context: Any, provider_id: str, invoke):
+    mod = _series_panels_mod()
+    caller = getattr(mod, "series_llm_call", None) if mod else None
+    if callable(caller):
+        return await caller(
+            context,
+            provider_id,
+            "astrbot_plugin_visual_media",
+            "visual_emotion_analysis",
+            invoke,
+        )
+    return await invoke()
 
 # 标记：模型明确选择不发送，用于区分"LLM 异常"和"模型说 none"
 _EMOTION_ABSTAIN = object()
@@ -436,7 +469,11 @@ class NaturalEmotionAnalyzer:
 
             # 调用LLM（限制 max_tokens 提升速度）
             logger.debug(f"[情绪分析] 调用LLM，provider_id={provider_id}")
-            response = await self.plugin.context.llm_generate(**call_kwargs)
+            response = await _call_via_series_budget(
+                self.plugin.context,
+                provider_id,
+                lambda: self.plugin.context.llm_generate(**call_kwargs),
+            )
 
             # 安全获取响应文本
             if not response:
@@ -450,6 +487,9 @@ class NaturalEmotionAnalyzer:
             return self._parse_emotion_query(result_text, fallback_query=llm_reply)
 
         except Exception as e:
+            if _is_budget_busy(e):
+                logger.warning("[情绪分析] 共享模型队列繁忙，跳过本轮情绪表情分析")
+                return None
             error_msg = str(e)
             if "Provider" in error_msg or "提供商" in error_msg:
                 logger.error(
