@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-
 from astrbot_plugin_visual_media.character_check import check_character
 from astrbot_plugin_visual_media.main import VisualMediaPlugin
 from astrbot_plugin_visual_media.tl.vision_handler import VisionHandler
