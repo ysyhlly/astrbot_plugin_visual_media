@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,24 @@ from astrbot.api import logger
 from astrbot.api.star import StarTools
 
 from ..processing.semantic_schema import EMBEDDING_TEXT_VERSION, build_meme_search_text
-from .embedding_provider_adapter import EmbeddingProviderAdapter
+from .embedding_provider_adapter import EmbeddingProviderAdapter, interactive_embedding_lane
+
+
+def _load_series_panels():
+    """加载同插件根下的 series_panels，兼容包内相对导入与单测顶层导入。"""
+    try:
+        if __package__ and __package__.count(".") >= 2:
+            from ... import series_panels
+
+            return series_panels
+    except Exception:
+        pass
+    try:
+        import series_panels
+
+        return series_panels
+    except Exception:
+        return None
 
 
 class EmbeddingService:
@@ -31,6 +49,9 @@ class EmbeddingService:
     BACKFILL_BATCH_SIZE = 20
     # 供应商故障时同一类 WARN 的抑制窗口（秒），避免欠费/额度不足时刷屏
     DEGRADED_LOG_INTERVAL_SECONDS = 300.0
+    # 实时查询向量内存 LRU/TTL 缓存参数
+    QUERY_CACHE_MAX_ENTRIES = 512
+    QUERY_CACHE_TTL_SECONDS = 600.0
 
     def __init__(self, plugin: Any) -> None:
         self.plugin = plugin
@@ -60,6 +81,9 @@ class EmbeddingService:
         self._retired_faiss = []
         self._faiss_operation_lock = asyncio.Lock()
         self._warning_log_at: dict[str, float] = {}
+        self._initialized: bool = False
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
+        self._query_embedding_cache: OrderedDict[tuple[str, str], tuple[float, list[float]]] = OrderedDict()
 
     # ═══════════════════════════════════════════════════
     #  嵌入提供商查找
@@ -80,6 +104,7 @@ class EmbeddingService:
             self._provider = None
             self._provider_dim = 0
             self._provider_not_found = False
+            self._initialized = False
             self._retire_faiss()
             self.invalidate_cache()
             self._last_enable_embedding_search = current_enable
@@ -140,21 +165,25 @@ class EmbeddingService:
         return None
 
     def _find_provider_by_id(self, provider_id: str) -> Any | None:
-        """按 ID 查找提供商，查找失败时返回 None。"""
-        # 静默查找：直接读 provider_manager.inst_map，避免 AstrBot 的 warning 日志
+        """按 ID 静默查找提供商，查找失败时返回 None（避免冷启动刷 WARN）。"""
+        ctx = getattr(self.plugin, "context", None)
+        if ctx is None:
+            return None
+
+        # 优先使用 series_panels.find_provider_silently，避免冷启动抢跑调用 get_provider_by_id 刷 WARN
+        sp = _load_series_panels()
+        if sp is not None and callable(getattr(sp, "find_provider_silently", None)):
+            try:
+                return sp.find_provider_silently(ctx, provider_id)
+            except Exception:
+                pass
+
+        # 兜底静默读取 provider_manager.inst_map
         try:
-            pm = getattr(self.plugin.context, "provider_manager", None)
+            pm = getattr(ctx, "provider_manager", None)
             inst_map = getattr(pm, "inst_map", None)
             if isinstance(inst_map, dict):
-                p = inst_map.get(provider_id)
-                if p is not None:
-                    return p
-        except Exception:
-            pass
-
-        # 回退到公开 API
-        try:
-            return self.plugin.context.get_provider_by_id(provider_id)
+                return inst_map.get(provider_id)
         except Exception:
             pass
 
@@ -233,7 +262,9 @@ class EmbeddingService:
         except RuntimeError:
             _enqueue()
             return
-        loop.create_task(asyncio.to_thread(_enqueue))
+        task = loop.create_task(asyncio.to_thread(_enqueue))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     def warning_rate_limited(self, key: str, message: str, interval: float | None = None) -> None:
         """同一 key 的 WARN 在窗口期内只输出一次，避免供应商故障时刷屏。"""
@@ -465,15 +496,16 @@ class EmbeddingService:
             return
 
         await self._upgrade_corpus_if_needed()
-        await self._ensure_provider_ready()
 
-        # 1. Provider 就绪检查
+        # 1. Provider 就绪检查（先静默探测，避免冷启动反复探测与报错）
         provider = self._get_provider()
         if provider is None:
             logger.info(
                 "[Embedding] 未就绪 — 请在 AstrBot 后台配置 Embedding 模型"
             )
             return
+
+        await self._ensure_provider_ready()
 
         # 2. 尝试 FaissVecDB
         if self._init_faiss() and self._faiss_db is not None:
@@ -494,6 +526,8 @@ class EmbeddingService:
                     if count > 0 else
                     "[Embedding] numpy 降级方案就绪 ✅ — 向量库为空，新入库自动填充"
                 )
+
+        self._initialized = bool(self._faiss_available or self._fallback_loaded)
 
     # ═══════════════════════════════════════════════════
     #  插入 / 删除
@@ -635,8 +669,50 @@ class EmbeddingService:
             return False
 
     # ═══════════════════════════════════════════════════
-    #  检索
+    #  检索 & 查询向量缓存
     # ═══════════════════════════════════════════════════
+
+    @staticmethod
+    def normalize_query_text(query: str) -> str:
+        """规范化查询文本，折叠首尾与连续空白以提升查询向量缓存命中率。"""
+        return " ".join(str(query or "").strip().split())
+
+    def _query_cache_key(self, provider: Any, query: str) -> tuple[str, str] | None:
+        normalized = self.normalize_query_text(query)
+        if not normalized:
+            return None
+        return (self._fallback_signature(provider), normalized)
+
+    def get_cached_query_embedding(self, provider: Any, query: str) -> list[float] | None:
+        """读取未过期的查询向量缓存并刷新 LRU 顺序。"""
+        key = self._query_cache_key(provider, query)
+        if key is None:
+            return None
+        entry = self._query_embedding_cache.get(key)
+        if entry is None:
+            return None
+        expires_at, vector = entry
+        if time.monotonic() >= expires_at:
+            self._query_embedding_cache.pop(key, None)
+            return None
+        self._query_embedding_cache.move_to_end(key)
+        return list(vector)
+
+    def set_cached_query_embedding(
+        self, provider: Any, query: str, vector: list[float]
+    ) -> None:
+        """写入查询向量 LRU/TTL 缓存。"""
+        key = self._query_cache_key(provider, query)
+        if key is None or not vector:
+            return
+        max_entries = max(1, int(self.QUERY_CACHE_MAX_ENTRIES))
+        ttl = max(0.0, float(self.QUERY_CACHE_TTL_SECONDS))
+        if ttl <= 0:
+            return
+        self._query_embedding_cache[key] = (time.monotonic() + ttl, list(vector))
+        self._query_embedding_cache.move_to_end(key)
+        while len(self._query_embedding_cache) > max_entries:
+            self._query_embedding_cache.popitem(last=False)
 
     async def search(self, query: str, k: int = 80) -> list[tuple[str, float]]:
         """按向量相似度检索前 K 张表情包。
@@ -646,63 +722,64 @@ class EmbeddingService:
         """
         if not query or not query.strip():
             return []
-        try:
-            await self._ensure_provider_ready()
-        except Exception:
-            return []
-
-        # 将查询文本截断到 2000 字符。
-        processed = query[:2000] if len(query) > 2000 else query
-
-        # FaissVecDB 路径
-        if self._init_faiss() and self._faiss_db is not None:
+        with interactive_embedding_lane(True):
             try:
-                await self._ensure_faiss_initialized()
-                async with self._faiss_operation_lock:
-                    results = await self._faiss_db.retrieve(
-                        query=processed, k=k, fetch_k=k * 2, rerank=False
-                    )
-                out: list[tuple[str, float]] = []
-                for r in results:
-                    data = getattr(r, "data", None)
-                    if data is None:
-                        continue
-                    # FaissVecDB 返回的 data 是 {"id": int, "text": str, "metadata": dict}
-                    if isinstance(data, dict):
-                        meta = data.get("metadata", {})
-                        if isinstance(meta, dict):
-                            p = meta.get("path", "")
-                            if p:
-                                out.append((p, float(r.similarity)))
-                        elif isinstance(meta, str):
-                            # metadata 被序列化成了 JSON 字符串
+                await self._ensure_provider_ready()
+            except Exception:
+                return []
+
+            # 将查询文本截断到 2000 字符。
+            processed = query[:2000] if len(query) > 2000 else query
+
+            # FaissVecDB 路径
+            if self._init_faiss() and self._faiss_db is not None:
+                try:
+                    await self._ensure_faiss_initialized()
+                    async with self._faiss_operation_lock:
+                        results = await self._faiss_db.retrieve(
+                            query=processed, k=k, fetch_k=k * 2, rerank=False
+                        )
+                    out: list[tuple[str, float]] = []
+                    for r in results:
+                        data = getattr(r, "data", None)
+                        if data is None:
+                            continue
+                        # FaissVecDB 返回的 data 是 {"id": int, "text": str, "metadata": dict}
+                        if isinstance(data, dict):
+                            meta = data.get("metadata", {})
+                            if isinstance(meta, dict):
+                                p = meta.get("path", "")
+                                if p:
+                                    out.append((p, float(r.similarity)))
+                            elif isinstance(meta, str):
+                                # metadata 被序列化成了 JSON 字符串
+                                try:
+                                    meta_dict = json.loads(meta)
+                                    p = meta_dict.get("path", "")
+                                    if p:
+                                        out.append((p, float(r.similarity)))
+                                except (json.JSONDecodeError, TypeError):
+                                    pass
+                        elif isinstance(data, str):
+                            # data 本身是 JSON 字符串
                             try:
-                                meta_dict = json.loads(meta)
-                                p = meta_dict.get("path", "")
+                                data_dict = json.loads(data)
+                                meta = data_dict.get("metadata", {})
+                                if isinstance(meta, dict):
+                                    p = meta.get("path", "")
+                                elif isinstance(meta, str):
+                                    meta = json.loads(meta)
+                                    p = meta.get("path", "") if isinstance(meta, dict) else ""
                                 if p:
                                     out.append((p, float(r.similarity)))
                             except (json.JSONDecodeError, TypeError):
                                 pass
-                    elif isinstance(data, str):
-                        # data 本身是 JSON 字符串
-                        try:
-                            data_dict = json.loads(data)
-                            meta = data_dict.get("metadata", {})
-                            if isinstance(meta, dict):
-                                p = meta.get("path", "")
-                            elif isinstance(meta, str):
-                                meta = json.loads(meta)
-                                p = meta.get("path", "") if isinstance(meta, dict) else ""
-                            if p:
-                                out.append((p, float(r.similarity)))
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-                return out
-            except Exception as e:
-                self.warning_rate_limited("faiss_retrieve", f"[Embedding] FaissVecDB 检索失败: {e}")
+                    return out
+                except Exception as e:
+                    self.warning_rate_limited("faiss_retrieve", f"[Embedding] FaissVecDB 检索失败: {e}")
 
-        # numpy 降级
-        return await self._fallback_search(processed, k)
+            # numpy 降级
+            return await self._fallback_search(processed, k)
 
     async def _fallback_search(self, query: str, k: int) -> list[tuple[str, float]]:
         """降级：numpy 余弦相似度检索。"""
@@ -715,9 +792,11 @@ class EmbeddingService:
             if provider is None:
                 return []
 
-            # 嵌入查询
+            # 嵌入查询（走实时交互通道 + 查询向量缓存）
             try:
-                vec = await EmbeddingProviderAdapter(self, provider).get_embedding(query)
+                vec = await EmbeddingProviderAdapter(
+                    self, provider, interactive=True
+                ).get_embedding(query)
                 if not vec:
                     return []
                 if self._fallback_model_sig != self._fallback_signature(provider):
@@ -771,6 +850,7 @@ class EmbeddingService:
         self._fallback_loaded = False
         self._fallback_matrix = None
         self._fallback_paths = []
+        self._query_embedding_cache.clear()
 
     # ═══════════════════════════════════════════════════
     #  缺失向量批量回填
@@ -894,7 +974,15 @@ class EmbeddingService:
             logger.debug(f"[Embedding] 写入语料版本失败: {e}")
 
     async def close(self) -> None:
-        """关闭 FaissVecDB 并重置状态。"""
+        """关闭后台任务与 FaissVecDB 并重置状态。"""
+        bg_tasks = getattr(self, "_bg_tasks", None)
+        if bg_tasks:
+            pending = [task for task in list(bg_tasks) if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            bg_tasks.clear()
         for client in self._retired_faiss:
             try:
                 await client.close()
@@ -908,3 +996,4 @@ class EmbeddingService:
                 pass
             self._faiss_db = None
             self._faiss_available = False
+        self._initialized = False

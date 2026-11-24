@@ -451,12 +451,62 @@ class ImageHandler:
                     await handle_image_component(component, "当前消息")
                 elif isinstance(component, At):
                     await handle_at_component(component, "当前消息")
-                elif isinstance(component, Reply) and component.chain:
-                    for reply_comp in component.chain:
+                elif isinstance(component, Reply):
+                    before_reply_count = len(message_images)
+                    for reply_comp in component.chain or []:
                         if isinstance(reply_comp, Image):
                             await handle_image_component(reply_comp, "引用消息")
                         elif isinstance(reply_comp, At):
                             await handle_at_component(reply_comp, "引用消息")
+                        elif type(reply_comp).__name__.lower() == "forward":
+                            for node in getattr(reply_comp, "nodes", None) or ():
+                                for content_item in getattr(node, "content", None) or ():
+                                    if isinstance(content_item, Image):
+                                        await handle_image_component(
+                                            content_item, "引用合并转发"
+                                        )
+                        elif type(reply_comp).__name__.lower() == "node":
+                            for content_item in getattr(reply_comp, "content", None) or ():
+                                if isinstance(content_item, Image):
+                                    await handle_image_component(
+                                        content_item, "引用合并转发"
+                                    )
+                    if (
+                        len(message_images) == before_reply_count
+                        and len(message_images) < max_images
+                    ):
+                        try:
+                            from astrbot.core.utils.quoted_message_parser import (
+                                extract_quoted_message_images,
+                            )
+                        except Exception:
+                            extract_quoted_message_images = None
+                        if callable(extract_quoted_message_images):
+                            try:
+                                fallback_refs = (
+                                    await extract_quoted_message_images(
+                                        event, component
+                                    )
+                                    or []
+                                )
+                            except Exception as e:
+                                self._log_debug(f"回退提取引用消息图片失败: {e}")
+                                fallback_refs = []
+                            for ref in fallback_refs:
+                                if len(message_images) >= max_images:
+                                    break
+                                ref_str = str(ref or "").strip()
+                                if not ref_str or ref_str in seen_sources:
+                                    continue
+                                seen_sources.add(ref_str)
+                                ref_img = await convert_image_source(
+                                    ref_str, "引用消息回退"
+                                )
+                                if ref_img:
+                                    message_images.append(ref_img)
+                                    self._log_debug(
+                                        f"✓ 回退提取引用图片 (当前: {len(message_images)}/{max_images})"
+                                    )
             except Exception as e:
                 logger.warning(f"处理消息组件异常: {e}")
 

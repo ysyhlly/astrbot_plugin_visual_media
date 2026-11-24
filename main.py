@@ -13,7 +13,7 @@ ensure_current(
         ("media_library", "MediaLibrary", "_rebuild_public_ref_cache"),
         ("media_behavior", "MediaBehavior", "records"),
     ],
-    version="0.5.0-rc.8",
+    version="0.5.0-rc.9",
 )
 
 import asyncio
@@ -263,6 +263,171 @@ class VisualMediaPlugin(Star):
             and self.generation is not None,
             "capabilities": {"media": 1},
             "media_policy_version": 1,
+        }
+
+    def _resolve_embedding_service(self):
+        memes = getattr(self, "memes", None)
+        if memes is None:
+            return None
+        emb = getattr(memes, "embedding_service", None)
+        if emb is not None:
+            return emb
+        smart = getattr(
+            getattr(memes, "meme_selector", None), "_smart_select_service", None
+        )
+        return getattr(smart, "_embedding_service", None)
+
+    def get_series_health(self) -> dict[str, Any]:
+        """Return synchronous, read-only health diagnostics for series panel aggregation."""
+        closed = bool(getattr(self, "_closed", False))
+        memes = getattr(self, "memes", None)
+        generation = getattr(self, "generation", None)
+        ready = (not closed) and (memes is not None) and (generation is not None)
+        issues: list[str] = []
+        providers: list[dict[str, Any]] = []
+
+        if closed:
+            issues.append("plugin_closed")
+        if memes is None:
+            issues.append("memes_engine_uninitialized")
+        if generation is None:
+            issues.append("generation_engine_uninitialized")
+
+        # 1. Image generation provider status (read-only)
+        gen_cfg = getattr(generation, "cfg", None) if generation is not None else None
+        candidates = list(getattr(gen_cfg, "provider_candidates", None) or ())
+        api_client = getattr(generation, "api_client", None) if generation is not None else None
+        primary_gen_id = ""
+        if candidates:
+            primary_gen_id = str(
+                getattr(candidates[0], "id", "")
+                or getattr(candidates[0], "api_type", "")
+                or ""
+            ).strip()
+        if api_client is not None:
+            providers.append(
+                {
+                    "role": "image_generation",
+                    "provider_id": primary_gen_id or "configured",
+                    "status": "ok",
+                    "detail": f"candidates={len(candidates)}",
+                }
+            )
+        else:
+            providers.append(
+                {
+                    "role": "image_generation",
+                    "provider_id": primary_gen_id,
+                    "status": "missing",
+                    "detail": "api_client not initialized",
+                }
+            )
+            if not closed and generation is not None:
+                issues.append("image_generation_provider_unavailable")
+
+        # 2. Embedding provider status (strictly silent & read-only)
+        memes_cfg = getattr(memes, "plugin_config", None) if memes is not None else None
+        emb_enabled = bool(
+            getattr(memes_cfg, "enable_embedding_search", False)
+            if memes_cfg is not None
+            else getattr(memes, "enable_embedding_search", False)
+            if memes is not None
+            else False
+        )
+        configured_emb_id = (
+            str(getattr(memes_cfg, "embedding_provider_id", "") or "").strip()
+            if memes_cfg is not None
+            else ""
+        )
+        emb = self._resolve_embedding_service()
+        emb_initialized = bool(getattr(emb, "_initialized", False)) if emb is not None else False
+        faiss_ok = getattr(emb, "_faiss_available", None) is True if emb is not None else False
+        fallback_ok = bool(getattr(emb, "_fallback_loaded", False)) if emb is not None else False
+
+        if not emb_enabled:
+            providers.append(
+                {
+                    "role": "embedding",
+                    "provider_id": configured_emb_id,
+                    "status": "disabled",
+                    "detail": "embedding search disabled",
+                }
+            )
+        else:
+            provider_obj = getattr(emb, "_provider", None) if emb is not None else None
+            if provider_obj is None and configured_emb_id:
+                sp = self._series_panels_mod()
+                if sp is not None and callable(getattr(sp, "find_provider_silently", None)):
+                    try:
+                        provider_obj = sp.find_provider_silently(
+                            getattr(self, "context", None), configured_emb_id
+                        )
+                    except Exception:
+                        provider_obj = None
+            if provider_obj is None and not configured_emb_id:
+                ctx = getattr(self, "context", None)
+                getter = getattr(ctx, "get_all_embedding_providers", None)
+                if callable(getter):
+                    try:
+                        all_emb = getter() or ()
+                        if all_emb:
+                            provider_obj = all_emb[0]
+                    except Exception:
+                        provider_obj = None
+
+            if provider_obj is not None:
+                resolved_pid = configured_emb_id
+                extractor = getattr(emb, "_extract_provider_id", None) if emb is not None else None
+                if callable(extractor):
+                    try:
+                        extracted = str(extractor(provider_obj) or "").strip()
+                        if extracted and extracted != "unknown":
+                            resolved_pid = extracted
+                    except Exception:
+                        pass
+                backend = (
+                    "faiss"
+                    if faiss_ok
+                    else "numpy"
+                    if fallback_ok
+                    else "pending"
+                )
+                emb_ready = emb_initialized or faiss_ok or fallback_ok
+                providers.append(
+                    {
+                        "role": "embedding",
+                        "provider_id": resolved_pid,
+                        "status": "ok" if emb_ready else "initializing",
+                        "detail": f"backend={backend}",
+                    }
+                )
+                if not emb_ready:
+                    issues.append("embedding_service_initializing")
+            else:
+                providers.append(
+                    {
+                        "role": "embedding",
+                        "provider_id": configured_emb_id,
+                        "status": "missing",
+                        "detail": "embedding provider not found",
+                    }
+                )
+                issues.append("embedding_provider_unavailable")
+
+        meme_index = self._safe_meme_index()
+        metrics: dict[str, Any] = {
+            "meme_count": len(meme_index),
+            "generation_candidates": len(candidates),
+            "generation_client_ready": api_client is not None,
+            "embedding_enabled": emb_enabled,
+            "embedding_initialized": emb_initialized or faiss_ok or fallback_ok,
+        }
+        return {
+            "ready": ready,
+            "degraded": (not ready) or bool(issues),
+            "providers": providers,
+            "issues": issues,
+            "metrics": metrics,
         }
 
     @staticmethod
@@ -1292,8 +1457,30 @@ class VisualMediaPlugin(Star):
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self):
-        """AstrBot 完成初始化后加载插件 API 配置"""
-        return await self.generation.on_astrbot_loaded()
+        """AstrBot 完成初始化后加载插件 API 配置，并补齐嵌入向量服务初始化。"""
+        result = (
+            await self.generation.on_astrbot_loaded()
+            if self.generation is not None
+            else None
+        )
+        memes = getattr(self, "memes", None)
+        if memes is not None:
+            emb = self._resolve_embedding_service()
+            cfg = getattr(memes, "plugin_config", None)
+            emb_enabled = bool(
+                getattr(cfg, "enable_embedding_search", False)
+                if cfg is not None
+                else getattr(memes, "enable_embedding_search", True)
+            )
+            if emb is not None and emb_enabled and not getattr(emb, "_initialized", False):
+                scheduler = getattr(memes, "task_scheduler", None)
+                if scheduler is not None and callable(
+                    getattr(scheduler, "create_task", None)
+                ):
+                    scheduler.create_task("embedding_initialize", emb.initialize())
+                else:
+                    await emb.initialize()
+        return result
 
     @filter.command("生图")
     async def generate_image(self, event: AstrMessageEvent, prompt: str):

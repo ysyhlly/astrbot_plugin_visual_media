@@ -25,12 +25,45 @@ def retry_after(exc: Exception, default: float = 30) -> float:
 
 
 class ModelRequestGate:
+    DEFAULT_INTERACTIVE_CONCURRENCY = 4
+
     def __init__(self, plugin):
         self.plugin = plugin
         self._locks = {}
         self._next = {}
+        self._interactive_semaphores: dict[str, asyncio.Semaphore] = {}
 
-    async def call(self, provider_id: str, operation):
+    def _interactive_semaphore(self, provider_id: str, max_concurrency: int) -> asyncio.Semaphore:
+        sem = self._interactive_semaphores.get(provider_id)
+        if sem is None:
+            sem = asyncio.Semaphore(max(1, int(max_concurrency)))
+            self._interactive_semaphores[provider_id] = sem
+        return sem
+
+    async def call_interactive(
+        self,
+        provider_id: str,
+        operation,
+        *,
+        max_concurrency: int = DEFAULT_INTERACTIVE_CONCURRENCY,
+    ):
+        """Zero-interval concurrent lane for interactive queries (decoupled from 5s background gate)."""
+        sem = self._interactive_semaphore(provider_id, max_concurrency)
+        async with sem:
+            return await operation()
+
+    async def call(
+        self,
+        provider_id: str,
+        operation,
+        *,
+        interactive: bool = False,
+        max_concurrency: int = DEFAULT_INTERACTIVE_CONCURRENCY,
+    ):
+        if interactive:
+            return await self.call_interactive(
+                provider_id, operation, max_concurrency=max_concurrency
+            )
         lock = self._locks.setdefault(provider_id, asyncio.Lock())
         async with lock:
             delay = self._next.get(provider_id, 0) - time.monotonic()

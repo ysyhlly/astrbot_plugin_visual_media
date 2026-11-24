@@ -60,6 +60,8 @@ class PluginConfig(BaseModel):
 
     # === 内部常量/高级配置 ===
     max_reg_num: int = 100
+    max_disk_bytes: int = 256 * 1024 * 1024  # 256 MB 通用库自动收集表情包磁盘字节上限
+    max_pending_disk_bytes: int = 128 * 1024 * 1024  # 128 MB 待审核池磁盘字节上限
     eviction_usage_weight: float = 0.7
     content_filtration: bool = False  # 内容审核开关
     content_filtration_fail_open: bool = False

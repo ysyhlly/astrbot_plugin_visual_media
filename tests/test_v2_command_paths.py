@@ -247,15 +247,14 @@ async def test_image_generator_v2_success_returns_split_artifacts():
     assert submit_timeout == service.result_wait_timeout(generator.total_timeout)
 
 
-async def _save_inline_image(_data, image_format="png"):
-    path = Path(__file__).with_suffix(f".inline.{image_format}")
-    path.write_bytes(b"saved")
-    return str(path)
-
-
 @pytest.mark.asyncio
-async def test_image_generator_v2_saves_inline_base64_artifact(monkeypatch):
+async def test_image_generator_v2_saves_inline_base64_artifact(monkeypatch, tmp_path):
     import base64
+
+    async def _save_inline_image(_data, image_format="png"):
+        path = tmp_path / f"inline.{image_format}"
+        path.write_bytes(b"saved")
+        return str(path)
 
     png_b64 = base64.b64encode(b"\x89PNG\r\n\x1a\ninline").decode()
     monkeypatch.setattr("tl.image_outputs.save_base64_image", _save_inline_image)

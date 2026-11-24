@@ -11,7 +11,7 @@ from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.message_components import Image, Plain
 
 from ..db.index_manager import delete_index_paths
-from ..maintenance.retention import eviction_candidates
+from ..maintenance.retention import DEFAULT_MAX_DISK_BYTES, eviction_candidates
 from ..util.safe_io import safe_remove_file
 from .background_steal_queue import BackgroundStealQueue
 from .event_context import get_event_session_key
@@ -142,14 +142,26 @@ class EventHandler:
         return True
 
     def _select_items_for_removal(self, image_index: dict) -> list[tuple[str, int]]:
-        """仅对通用库普通表情按使用次数和入库时间加权淘汰。"""
+        """仅对通用库普通表情按使用次数、入库时间与磁盘总字节上限加权淘汰。"""
         cfg = self.plugin.plugin_config
         try:
             limit = int(cfg.max_reg_num)
         except (TypeError, ValueError):
+            limit = 0
+        raw_disk_bytes = getattr(cfg, "max_disk_bytes", DEFAULT_MAX_DISK_BYTES)
+        try:
+            max_disk_bytes = (
+                int(raw_disk_bytes) if raw_disk_bytes is not None else 0
+            )
+        except (TypeError, ValueError):
+            max_disk_bytes = DEFAULT_MAX_DISK_BYTES
+        if limit <= 0 and max_disk_bytes <= 0:
             return []
         return eviction_candidates(
-            image_index, limit, getattr(cfg, "eviction_usage_weight", 0.7)
+            image_index,
+            limit,
+            getattr(cfg, "eviction_usage_weight", 0.7),
+            max_disk_bytes=max_disk_bytes if max_disk_bytes > 0 else None,
         )
 
     def _resolve_index_file_path(self, path_str: str, image_info: dict | None) -> str | None:

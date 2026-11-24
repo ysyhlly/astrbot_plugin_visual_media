@@ -224,7 +224,7 @@ class PluginConfig:
     # WebUI 工作台
     webui_history_enabled: bool = True
     webui_history_max_records: int = 500
-    webui_gallery_max_size_mb: int = 512
+    webui_gallery_max_size_mb: int = 256
     webui_upload_max_mb: int = 20
     webui_max_concurrent_jobs: int = 2
     webui_batch_total_budget: int = 40
@@ -255,7 +255,7 @@ class PluginConfig:
     show_duration_stats: bool = True
     show_retry_stats: bool = True
     show_token_usage_stats: bool = True
-    image_cache_max_size_mb: float = 512.0
+    image_cache_max_size_mb: float = 256.0
 
     # 帮助页渲染
     help_render_mode: str = "html"
@@ -816,7 +816,7 @@ class ConfigLoader:
         )
         config.webui_gallery_max_size_mb = _clamp_int(
             webui_settings.get("gallery_max_size_mb"),
-            512,
+            256,
             64,
             10240,
             allow_zero=True,
@@ -893,10 +893,10 @@ class ConfigLoader:
         )
         try:
             config.image_cache_max_size_mb = max(
-                float(service_settings.get("image_cache_max_size_mb", 512.0)), 0.0
+                float(service_settings.get("image_cache_max_size_mb", 256.0)), 0.0
             )
         except (TypeError, ValueError):
-            config.image_cache_max_size_mb = 512.0
+            config.image_cache_max_size_mb = 256.0
 
         # 帮助页渲染
         config.help_render_mode = self.raw_config.get("help_render_mode") or "html"

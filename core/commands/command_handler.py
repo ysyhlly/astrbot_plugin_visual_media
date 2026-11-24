@@ -5,7 +5,7 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
-from ..maintenance.retention import library_counts
+from ..maintenance.retention import DEFAULT_MAX_DISK_BYTES, automatic_disk_bytes, library_counts
 
 
 class CommandHandler:
@@ -286,8 +286,21 @@ class CommandHandler:
 
             current_count = library_counts(image_index)["automatic"]
             max_count = self.plugin.plugin_config.max_reg_num
+            max_disk_bytes = int(
+                getattr(
+                    self.plugin.plugin_config,
+                    "max_disk_bytes",
+                    DEFAULT_MAX_DISK_BYTES,
+                )
+                or 0
+            )
+            current_bytes = (
+                automatic_disk_bytes(image_index) if max_disk_bytes > 0 else 0
+            )
 
-            if current_count <= max_count:
+            if current_count <= max_count and (
+                max_disk_bytes <= 0 or current_bytes <= max_disk_bytes
+            ):
                 yield event.plain_result(
                     f"当前通用库自动淘汰计数 {current_count} 未超过限制 {max_count}，无需清理"
                 )

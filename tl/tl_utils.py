@@ -104,7 +104,7 @@ def get_temp_dir() -> Path:
 
 
 # 生成图保留区容量上限（MB）：会话工作区按全部会话插件名子目录总量、其余按插件 images/ 目录计，超限按最旧清理；<=0 表示不清理
-_DEFAULT_IMAGE_CACHE_MAX_SIZE_MB = 512.0
+_DEFAULT_IMAGE_CACHE_MAX_SIZE_MB = 256.0
 _image_cache_max_size_mb = _DEFAULT_IMAGE_CACHE_MAX_SIZE_MB
 
 

@@ -61,7 +61,7 @@ from .v2_bridge import build_request as v2_build_request
 
 _SAFE_FILE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 _REMOTE_IMAGE_MAX_BYTES = 20 * 1024 * 1024
-_UPLOAD_QUOTA_BYTES = 200 * 1024 * 1024
+_UPLOAD_QUOTA_BYTES = 100 * 1024 * 1024
 _UPLOAD_EXPIRE_HOURS = 24
 _CHUNK_SIZE = 1024 * 1024
 _THUMBNAIL_MAX_EDGE = 512
@@ -1082,9 +1082,9 @@ class WebStudioService:
 
     async def _enforce_gallery_quota_locked(self, protected: set[str]) -> bool:
         try:
-            maximum_mb = float(getattr(self.config, "webui_gallery_max_size_mb", 512))
+            maximum_mb = float(getattr(self.config, "webui_gallery_max_size_mb", 256))
         except (TypeError, ValueError):
-            maximum_mb = 512
+            maximum_mb = 256
         if maximum_mb <= 0 or not self.gallery_dir.is_dir():
             return True
         maximum = int(maximum_mb * 1024 * 1024)

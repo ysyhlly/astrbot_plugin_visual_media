@@ -1,5 +1,11 @@
 # 更新日志
 
+## 0.5.0-rc.9 — 2026-11-24
+
+- 实时表情包检索独立零间隔并发通道（`call_interactive` + `interactive_embedding_lane`）与 512 条/10m 查询向量缓存，并行本地召回并在超时时回退，仅对 Top-K 在后台线程校验文件存在性。
+- 调整 `SMART_EMBEDDING_BONUS_WEIGHT=0.42` 与语义直通门槛（`>=0.35 -> floor 0.10`），修复纯语义高相关候选全被过滤的问题，日志区分 `raw`/`accepted`。
+- `openai_compat` 清理死代码、参考图 `asyncio.gather` 并行预处理、拒绝响应快速失败并将 `no_image_retry` 封顶为 1；`_cleanup_orphans` 移出主事件循环，新增 `pending/` 128 MB 上限并收紧磁盘总配额；同步最新 `series_panels.py`。
+
 ## 0.5.0-rc.8 — 2026-11-22
 
 - 接入全系列共享 `ProviderBudget` 并发池与 Token/缓存遥测上报（覆盖角色校验、视觉解析、自然情绪分析与 VLM 调用服务），在队列繁忙时优雅降级不阻塞主控群聊回复。

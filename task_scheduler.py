@@ -47,6 +47,12 @@ class TaskScheduler:
         try:
             task = self.create_detached_task(coro, name=name)
             self._tasks[name] = task
+
+            def _remove_if_current(done_task: asyncio.Task[Any]) -> None:
+                if self._tasks.get(name) is done_task:
+                    self._tasks.pop(name, None)
+
+            task.add_done_callback(_remove_if_current)
             logger.info(f"创建任务: {name}")
             return task
         except Exception as e:

@@ -97,16 +97,29 @@ class MemeSearchToolWorkflow:
                     await self.index_manager.load_index()
                 idx = await asyncio.to_thread(db.get_index_cache_readonly)
 
-            idx = await asyncio.to_thread(lambda: {
-                path: data for path, data in idx.items() if os.path.isfile(path)
-            })
-            search_options = {"limit": self.MAX_SEARCH_RESULTS, "idx": idx}
+            max_results = max(1, int(getattr(self, "MAX_SEARCH_RESULTS", 5) or 5))
+            fetch_limit = max(max_results * 2, max_results + 5) if len(idx) > max_results else max_results
+            search_options = {"limit": fetch_limit, "idx": idx}
             if reply:
                 search_options["reply"] = str(reply).strip()[:500]
             if character:
                 search_options["character"] = str(character).strip()
-            results = await self._search_meme_candidates(event, query, **search_options)
+            raw_results = await self._search_meme_candidates(event, query, **search_options)
+            had_raw_ranked = bool(raw_results)
+
+            # 仅对最终 Top-K 候选在工作线程校验文件存在，避免每次请求全库 os.path.isfile 扫描
+            if raw_results:
+                results = await asyncio.to_thread(
+                    lambda: [item for item in raw_results if os.path.isfile(item[0])][:max_results]
+                )
+            else:
+                results = []
             had_ranked_candidates = bool(results)
+
+            if had_raw_ranked and not results:
+                report("files_missing")
+                yield "搜索失败：找到的表情包文件均已丢失"
+                return
 
             behavior = getattr(self, "media_behavior", None)
             if behavior:
@@ -125,54 +138,53 @@ class MemeSearchToolWorkflow:
             result_lines = ["可发送候选；核对台词与语气，再选择编号："]
 
             for path, desc, emotion, tags in results:
-                if os.path.exists(path):
-                    meta = idx.get(path, {}) if isinstance(idx, dict) else {}
-                    raw_scenes = meta.get("scenes", None) if isinstance(meta, dict) else None
-                    if not raw_scenes:
-                        raw_scenes = meta.get("scene", None) if isinstance(meta, dict) else None
+                meta = idx.get(path, {}) if isinstance(idx, dict) else {}
+                raw_scenes = meta.get("scenes", None) if isinstance(meta, dict) else None
+                if not raw_scenes:
+                    raw_scenes = meta.get("scene", None) if isinstance(meta, dict) else None
 
-                    scenes_items = normalize_label_list(raw_scenes)
-                    scenes_str = ", ".join(scenes_items)
-                    overlay_text = str(meta.get("overlay_text", "") or "") if isinstance(meta, dict) else ""
-                    character_key = str(meta.get("character", "") or "") if isinstance(meta, dict) else ""
-                    character_name = character_key
-                    if character_key:
-                        info_map = getattr(self.plugin_config, "character_info", None) or {}
-                        info = info_map.get(character_key) if isinstance(info_map, dict) else None
-                        if isinstance(info, dict) and info.get("name"):
-                            character_name = str(info.get("name"))
-                    source = str(meta.get("source", "") or "") if isinstance(meta, dict) else ""
-                    scope_mode = str(meta.get("scope_mode", "public") or "public") if isinstance(meta, dict) else "public"
-                    origin_target = str(meta.get("origin_target", "") or "") if isinstance(meta, dict) else ""
-                    use_count = int(meta.get("use_count", 0) or 0) if isinstance(meta, dict) else 0
+                scenes_items = normalize_label_list(raw_scenes)
+                scenes_str = ", ".join(scenes_items)
+                overlay_text = str(meta.get("overlay_text", "") or "") if isinstance(meta, dict) else ""
+                character_key = str(meta.get("character", "") or "") if isinstance(meta, dict) else ""
+                character_name = character_key
+                if character_key:
+                    info_map = getattr(self.plugin_config, "character_info", None) or {}
+                    info = info_map.get(character_key) if isinstance(info_map, dict) else None
+                    if isinstance(info, dict) and info.get("name"):
+                        character_name = str(info.get("name"))
+                source = str(meta.get("source", "") or "") if isinstance(meta, dict) else ""
+                scope_mode = str(meta.get("scope_mode", "public") or "public") if isinstance(meta, dict) else "public"
+                origin_target = str(meta.get("origin_target", "") or "") if isinstance(meta, dict) else ""
+                use_count = int(meta.get("use_count", 0) or 0) if isinstance(meta, dict) else 0
 
-                    candidate_id = len(candidates) + 1
-                    candidates.append(
-                        {
-                            "id": candidate_id,
-                            "path": path,
-                            "desc": desc,
-                            "emotion": emotion,
-                            "tags": tags,
-                            "scenes": scenes_str,
-                            "overlay_text": overlay_text,
-                            "character": character_key,
-                            "source": source,
-                            "scope_mode": scope_mode,
-                            "origin_target": origin_target,
-                            "use_count": use_count,
-                        }
-                    )
-                    result_lines.append(f"\n[{candidate_id}] 分类：{emotion}")
-                    if character_name:
-                        result_lines.append(f"    角色：{character_name}")
-                    if overlay_text:
-                        result_lines.append(f"    图上文字：{overlay_text}")
-                    if tags:
-                        result_lines.append(f"    标签：{tags}")
-                    if scenes_str:
-                        result_lines.append(f"    适合回应：{scenes_str}")
-                    result_lines.append(f"    描述：{desc}")
+                candidate_id = len(candidates) + 1
+                candidates.append(
+                    {
+                        "id": candidate_id,
+                        "path": path,
+                        "desc": desc,
+                        "emotion": emotion,
+                        "tags": tags,
+                        "scenes": scenes_str,
+                        "overlay_text": overlay_text,
+                        "character": character_key,
+                        "source": source,
+                        "scope_mode": scope_mode,
+                        "origin_target": origin_target,
+                        "use_count": use_count,
+                    }
+                )
+                result_lines.append(f"\n[{candidate_id}] 分类：{emotion}")
+                if character_name:
+                    result_lines.append(f"    角色：{character_name}")
+                if overlay_text:
+                    result_lines.append(f"    图上文字：{overlay_text}")
+                if tags:
+                    result_lines.append(f"    标签：{tags}")
+                if scenes_str:
+                    result_lines.append(f"    适合回应：{scenes_str}")
+                result_lines.append(f"    描述：{desc}")
 
             if not candidates:
                 report("files_missing")

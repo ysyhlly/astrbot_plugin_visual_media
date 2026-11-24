@@ -12,6 +12,7 @@ import base64
 import json
 import os
 import re
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import replace
@@ -43,6 +44,23 @@ from .provider_runtime import provider_operation
 from .provider_settings import candidate_is_keyless, candidate_with_overrides
 
 _DOWNLOAD_PROXY_DEFAULT = object()
+
+
+def _load_series_panels():
+    """加载插件根下的 series_panels，兼容包内相对导入与单测顶层导入。"""
+    try:
+        if __package__ and "." in __package__:
+            from .. import series_panels
+
+            return series_panels
+    except Exception:
+        pass
+    try:
+        import series_panels
+
+        return series_panels
+    except Exception:
+        return None
 
 try:
     from .reference_image import (
@@ -155,6 +173,8 @@ class GeminiAPIClient:
 
         # KeyManager 实例（由主插件注入，用于多 Key 轮换和每日限额）
         self._key_manager = None
+        self.context: Any = None
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
         self.provider_candidates: list[Any] = []
         # 全部启用候选（含未入轮询表条目），仅供 route_all_candidates 的工作台请求路由
         self.provider_candidates_all: list[Any] = []
@@ -229,10 +249,24 @@ class GeminiAPIClient:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(self._close_sessions(sessions))
+        task = loop.create_task(self._close_sessions(sessions))
+        bg_tasks = getattr(self, "_bg_tasks", None)
+        if bg_tasks is None:
+            bg_tasks = set()
+            self._bg_tasks = bg_tasks
+        bg_tasks.add(task)
+        task.add_done_callback(bg_tasks.discard)
 
     async def close(self):
-        """关闭内部复用的 aiohttp 会话"""
+        """关闭内部复用的 aiohttp 会话并清理受管后台关闭任务"""
+        bg_tasks = getattr(self, "_bg_tasks", None)
+        if bg_tasks:
+            pending = [task for task in list(bg_tasks) if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            bg_tasks.clear()
         await self._close_sessions(self._detach_sessions())
 
     def set_key_manager(self, key_manager) -> None:
@@ -973,6 +1007,50 @@ class GeminiAPIClient:
                 max_total_time=max_total_time,
             )
 
+    def _record_series_image_telemetry(
+        self,
+        *,
+        config: ApiRequestConfig,
+        elapsed: float,
+        ok: bool,
+        error_type: str,
+        image_count: int,
+    ) -> None:
+        """向 series_telemetry 上报单次生图/改图供应商尝试的耗时、Token 与结果。"""
+        ctx = getattr(self, "context", None)
+        if ctx is None:
+            return
+        sp = _load_series_panels()
+        recorder = getattr(sp, "record_series_llm_usage", None) if sp is not None else None
+        if not callable(recorder):
+            return
+        candidate_id = (
+            str(config.candidate_id or config.api_type or "default").strip()
+            or "default"
+        )
+        purpose = "image_edit" if config.reference_images else "image_generate"
+        model_name = str(config.model or "").strip()
+        usage_payload = (
+            {"usage": dict(config.token_usage)}
+            if isinstance(config.token_usage, dict) and config.token_usage
+            else None
+        )
+        try:
+            recorder(
+                ctx,
+                plugin_id="astrbot_plugin_visual_media",
+                provider_id=candidate_id,
+                purpose=purpose,
+                response=usage_payload,
+                generation_seconds=max(0.0, float(elapsed)),
+                ok=ok,
+                error_type=error_type,
+                model=model_name,
+                image_count=max(0, int(image_count)),
+            )
+        except Exception:
+            pass
+
     async def _generate_image_single_inner(
         self,
         config: ApiRequestConfig,
@@ -981,66 +1059,98 @@ class GeminiAPIClient:
         per_retry_timeout: int = None,
         max_total_time: int = None,
     ) -> tuple[list[str], list[str], str | None, str | None]:
-        keyless_candidate = candidate_is_keyless(
-            config.api_type, config.provider_settings
-        )
-        if not self.api_keys and not keyless_candidate:
-            raise ValueError("未配置 API 密钥")
+        started = time.monotonic()
+        ok = False
+        err_type = ""
+        img_count = 0
+        try:
+            keyless_candidate = candidate_is_keyless(
+                config.api_type, config.provider_settings
+            )
+            if not self.api_keys and not keyless_candidate:
+                raise ValueError("未配置 API 密钥")
 
-        # 使用 KeyManager 获取 Key（支持多 Key 轮换和每日限额）
-        if not config.api_key and not keyless_candidate:
-            key_scope = config.candidate_id or config.api_type
-            key = await self.get_key_for_api_type(key_scope)
-            if key is None:
-                # 所有 Key 今日额度已用尽
-                raise APIError(
-                    f"{key_scope} 的所有 API Key 今日额度已用尽，请明天再试或添加更多 Key。",
-                    None,
-                    "quota_exhausted",
-                    retryable=False,
-                )
-            config.api_key = key
+            # 使用 KeyManager 获取 Key（支持多 Key 轮换和每日限额）
+            if not config.api_key and not keyless_candidate:
+                key_scope = config.candidate_id or config.api_type
+                key = await self.get_key_for_api_type(key_scope)
+                if key is None:
+                    # 所有 Key 今日额度已用尽
+                    raise APIError(
+                        f"{key_scope} 的所有 API Key 今日额度已用尽，请明天再试或添加更多 Key。",
+                        None,
+                        "quota_exhausted",
+                        retryable=False,
+                    )
+                config.api_key = key
 
-        enable_smart_retry = bool(getattr(config, "enable_smart_retry", True))
+            enable_smart_retry = bool(getattr(config, "enable_smart_retry", True))
 
-        # 获取请求信息
-        url, headers, payload = await self._get_api_url(config)
+            # 获取请求信息
+            url, headers, payload = await self._get_api_url(config)
 
-        logger.debug(f"使用 {config.model} (通过 {config.api_type}) 生成图像")
-        logger.debug(f"API 端点: {redact_url(url)}")
+            logger.debug(f"使用 {config.model} (通过 {config.api_type}) 生成图像")
+            logger.debug(f"API 端点: {redact_url(url)}")
 
-        # 从 payload 中获取实际使用的 size（provider_overrides 可能已覆盖）
-        actual_size = payload.get("size") or config.resolution or "默认"
-        logger.debug(
-            "请求参数概览: refs=%s prompt_len=%s aspect=%s res=%s",
-            len(config.reference_images or []),
-            len(config.prompt or ""),
-            config.aspect_ratio,
-            actual_size,
-        )
-
-        if actual_size != "默认" or config.aspect_ratio:
+            # 从 payload 中获取实际使用的 size（provider_overrides 可能已覆盖）
+            actual_size = payload.get("size") or config.resolution or "默认"
             logger.debug(
-                f"分辨率: {actual_size}, 长宽比: {config.aspect_ratio or '默认'}"
+                "请求参数概览: refs=%s prompt_len=%s aspect=%s res=%s",
+                len(config.reference_images or []),
+                len(config.prompt or ""),
+                config.aspect_ratio,
+                actual_size,
             )
 
-        if config.api_base:
-            logger.debug(f"使用自定义 API Base: {config.api_base}")
+            if actual_size != "默认" or config.aspect_ratio:
+                logger.debug(
+                    f"分辨率: {actual_size}, 长宽比: {config.aspect_ratio or '默认'}"
+                )
 
-        return await self._make_request(
-            url=url,
-            payload=payload,
-            headers=headers,
-            api_type=config.api_type,
-            model=config.model,
-            max_retries=max_retries,
-            total_timeout=total_timeout,
-            api_base=config.api_base,
-            enable_smart_retry=enable_smart_retry,
-            per_retry_timeout=per_retry_timeout,
-            max_total_time=max_total_time,
-            config=config,
-        )
+            if config.api_base:
+                logger.debug(f"使用自定义 API Base: {config.api_base}")
+
+            result = await self._make_request(
+                url=url,
+                payload=payload,
+                headers=headers,
+                api_type=config.api_type,
+                model=config.model,
+                max_retries=max_retries,
+                total_timeout=total_timeout,
+                api_base=config.api_base,
+                enable_smart_retry=enable_smart_retry,
+                per_retry_timeout=per_retry_timeout,
+                max_total_time=max_total_time,
+                config=config,
+            )
+            image_urls, image_paths, _text_content, _thought_signature = result
+            img_count = len(image_paths or ()) or len(image_urls or ())
+            ok = img_count > 0
+            if not ok:
+                err_type = "no_image"
+            return result
+        except APIError as exc:
+            err_type = (
+                str(
+                    exc.error_type
+                    or exc.error_code
+                    or (f"http_{exc.status_code}" if exc.status_code else "")
+                    or type(exc).__name__
+                ).strip()
+            )
+            raise
+        except BaseException as exc:
+            err_type = type(exc).__name__
+            raise
+        finally:
+            self._record_series_image_telemetry(
+                config=config,
+                elapsed=time.monotonic() - started,
+                ok=ok,
+                error_type=err_type,
+                image_count=img_count,
+            )
 
     async def _make_request(
         self,
@@ -1182,6 +1292,10 @@ class GeminiAPIClient:
                 return self._candidate_key_count(key_scope) > 1
             return False
 
+        max_no_image_retries = 1
+        no_image_retry_delay = 1.5
+        no_image_retry_count = 0
+
         for attempt in range(effective_max_retries):
             if max_total_time_int is not None:
                 elapsed = loop.time() - started_at
@@ -1300,6 +1414,15 @@ class GeminiAPIClient:
                     logger.error(f"不可重试错误: {err.message}")
                     raise err from None
 
+                # no_image_retry 最多重试 1 次，避免纯文本响应长尾拖慢生图
+                if err.error_type == "no_image_retry":
+                    if no_image_retry_count >= max_no_image_retries:
+                        logger.error(
+                            f"达到 no_image_retry 最大重试次数 ({max_no_image_retries})，生成失败: {err.message}"
+                        )
+                        raise err from None
+                    no_image_retry_count += 1
+
                 # 可重试错误，但已用尽重试次数
                 if attempt >= effective_max_retries - 1:
                     logger.error(
@@ -1317,7 +1440,10 @@ class GeminiAPIClient:
 
                 await rotate_key_if_possible(err)
 
-                delay = min(2 ** (attempt + 2), 10)
+                if err.error_type == "no_image_retry":
+                    delay = no_image_retry_delay
+                else:
+                    delay = min(2 ** (attempt + 2), 10)
                 logger.debug(f"等待 {delay} 秒后重试...")
                 await asyncio.sleep(delay)
 
@@ -1649,291 +1775,6 @@ class GeminiAPIClient:
 
         logger.debug("SSE 响应只包含通用事件，返回最后一个 data 包")
         return events[-1]
-
-    async def _parse_openai_response(
-        self,
-        response_data: dict,
-        session: aiohttp.ClientSession,
-        api_base: str = None,
-        *,
-        request_config: ApiRequestConfig | None = None,
-    ) -> tuple[list[str], list[str], str | None, str | None]:
-        """解析 OpenAI API 响应"""
-
-        image_urls: list[str] = []
-        image_paths: list[str] = []
-        text_content = None
-        thought_signature = None
-        fail_reasons: list[str] = []
-        fallback_texts = self._collect_fallback_texts(response_data)
-        download_proxy = self._request_http_proxy(request_config)
-        has_request_proxy = self._request_has_proxy(request_config)
-
-        message: dict[str, Any] | None = None
-        if "choices" in response_data and response_data["choices"]:
-            choice = response_data["choices"][0]
-            message = choice.get("message", {})
-        else:
-            message = self._coerce_basic_openai_message(response_data)
-
-        if message:
-            if "choices" not in response_data:
-                logger.debug(
-                    "[openai] 使用非标准字段构造 message，keys=%s",
-                    list(response_data.keys())[:5],
-                )
-            content = message.get("content", "")
-
-            text_chunks: list[str] = []
-            image_candidates: list[str] = []
-            extracted_urls: list[str] = []
-
-            logger.debug(
-                "[openai] 解析响应 choices，content_type=%s images_field=%s",
-                type(content),
-                bool(message.get("images")),
-            )
-
-            if isinstance(content, list):
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-
-                    part_type = part.get("type")
-                    if part_type == "text" and "text" in part:
-                        text_val = str(part.get("text", ""))
-                        text_chunks.append(text_val)
-                        extracted_urls.extend(self._find_image_urls_in_text(text_val))
-                    elif part_type == "image_url":
-                        image_obj = part.get("image_url") or {}
-                        if isinstance(image_obj, dict):
-                            url_val = image_obj.get("url")
-                            if url_val:
-                                image_candidates.append(url_val)
-            elif isinstance(content, str):
-                text_chunks.append(content)
-                extracted_urls.extend(self._find_image_urls_in_text(content))
-
-            # 标准 images 字段
-            if message.get("images"):
-                for image_item in message["images"]:
-                    if not isinstance(image_item, dict):
-                        continue
-
-                    # 典型格式：{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
-                    image_obj = image_item.get("image_url")
-                    if isinstance(image_obj, dict):
-                        url_val = image_obj.get("url")
-                        if isinstance(url_val, str) and url_val:
-                            image_candidates.append(url_val)
-                    elif isinstance(image_obj, str) and image_obj:
-                        image_candidates.append(image_obj)
-                    # 退化格式：{"url": "..."}
-                    elif isinstance(image_item.get("url"), str):
-                        image_candidates.append(image_item["url"])
-
-            # 合并在文本里解析到的图像 URL
-            if extracted_urls:
-                image_candidates.extend(extracted_urls)
-
-            # 组装文本内容
-            if text_chunks:
-                text_content = " ".join([t for t in text_chunks if t]).strip() or None
-
-            # 按顺序处理图像候选
-            for candidate_url in image_candidates:
-                logger.debug("[openai] 处理候选URL: %s", redact_url(str(candidate_url)))
-                if isinstance(candidate_url, str) and candidate_url.startswith(
-                    "data:image/"
-                ):
-                    image_url, image_path = await self._parse_data_uri(candidate_url)
-                elif isinstance(candidate_url, str):
-                    if candidate_url.startswith("/") and not candidate_url.startswith(
-                        "//"
-                    ):
-                        logger.warning(
-                            "发现相对路径 URL，已跳过: %s", redact_url(candidate_url)
-                        )
-                        continue
-                    # 对于可访问的 http(s) 链接，直接返回 URL，避免重复下载占用带宽
-                    if candidate_url.startswith("http://") or candidate_url.startswith(
-                        "https://"
-                    ):
-                        is_temp_cache = (
-                            "/images/users-" in candidate_url
-                            or "/temp/image/" in candidate_url
-                        )
-                        if is_temp_cache or has_request_proxy or self.proxy:
-                            logger.debug(
-                                "[openai] %s，强制下载: %s",
-                                "临时缓存" if is_temp_cache else "代理模式",
-                                redact_url(candidate_url),
-                            )
-                            image_url, image_path = await self._download_image(
-                                candidate_url,
-                                session,
-                                use_cache=False,
-                                proxy=download_proxy,
-                            )
-                            if image_path:
-                                image_paths.append(image_path)
-                            if image_url and not image_path:
-                                image_urls.append(image_url)
-                            continue
-                        # 其他永久 URL 直接使用
-                        image_urls.append(candidate_url)
-                        logger.debug(
-                            "OpenAI 返回可直接访问的图像链接: %s",
-                            redact_url(candidate_url),
-                        )
-                        continue
-                    image_url, image_path = await self._download_image(
-                        candidate_url,
-                        session,
-                        use_cache=False,
-                        proxy=download_proxy,
-                    )
-                else:
-                    logger.warning(f"跳过非字符串类型的图像URL: {type(candidate_url)}")
-                    continue
-
-                if image_url or image_path:
-                    if image_url:
-                        image_urls.append(image_url)
-                    if image_path:
-                        image_paths.append(image_path)
-
-            # content 中查找内联 data URI
-            if not (image_urls or image_paths):
-                extracted_urls2: list[str] = []
-                extracted_paths2: list[str] = []
-
-                if isinstance(content, str):
-                    (
-                        extracted_urls2,
-                        extracted_paths2,
-                    ) = await self._extract_from_content(content)
-                elif text_content:
-                    (
-                        extracted_urls2,
-                        extracted_paths2,
-                    ) = await self._extract_from_content(text_content)
-
-                if extracted_urls2 or extracted_paths2:
-                    image_urls.extend(extracted_urls2)
-                    image_paths.extend(extracted_paths2)
-
-            # 仅在前面没有提取到结构化图片时，才回退扫描文本中的 URL，
-            if text_content and not (image_urls or image_paths):
-                http_urls = self._find_image_urls_in_text(text_content)
-                for url in http_urls:
-                    is_temp_cache = "/images/users-" in url or "/temp/image/" in url
-                    if is_temp_cache:
-                        logger.debug(
-                            "跳过文本中的临时缓存 URL（已下载）: %s", redact_url(url)
-                        )
-                        continue
-                    if has_request_proxy:
-                        _, image_path = await self._download_image(
-                            url,
-                            session,
-                            use_cache=False,
-                            proxy=download_proxy,
-                        )
-                        if image_path and image_path not in image_paths:
-                            image_paths.append(image_path)
-                        continue
-                    if url not in image_urls:
-                        image_urls.append(url)
-
-                # 松散提取 data:image 片段 —— 仅在尚无图片时作为最终回退
-                if not (image_urls or image_paths):
-                    loose_matches = re.finditer(
-                        r"data:image/([a-zA-Z0-9.+-]+);base64,([-A-Za-z0-9+/=_\\s]+)",
-                        text_content,
-                        flags=re.IGNORECASE,
-                    )
-                    for m in loose_matches:
-                        fmt = m.group(1)
-                        b64_raw = m.group(2)
-                        b64_clean = re.sub(r"\\s+", "", b64_raw)
-                        image_path = await save_base64_image(b64_clean, fmt.lower())
-                        if image_path:
-                            image_urls.append(image_path)
-                            image_paths.append(image_path)
-                            logger.debug(
-                                "[openai] 松散提取 data URI 成功: fmt=%s len=%s",
-                                fmt,
-                                len(b64_clean),
-                            )
-
-        else:
-            logger.debug("[openai] 响应缺少可用的 message 字段，尝试 data/b64 解析")
-
-        if not (image_urls or image_paths) and fallback_texts:
-            fallback_added = await self._append_images_from_texts(
-                fallback_texts,
-                image_urls,
-                image_paths,
-                session=session,
-                request_config=request_config,
-            )
-            if fallback_added and not text_content:
-                text_content = (
-                    " ".join(t.strip() for t in fallback_texts if t and t.strip())
-                    or text_content
-                )
-
-        # OpenAI 格式
-        if not image_urls and not image_paths and response_data.get("data"):
-            for image_item in response_data["data"]:
-                if "url" in image_item:
-                    image_url, image_path = await self._download_image(
-                        image_item["url"],
-                        session,
-                        use_cache=False,
-                        proxy=download_proxy,
-                    )
-                    if image_url:
-                        image_urls.append(image_url)
-                    if image_path:
-                        image_paths.append(image_path)
-                elif "b64_json" in image_item:
-                    image_path = await save_base64_image(image_item["b64_json"], "png")
-                    if image_path:
-                        # 直接使用文件路径，不使用 file:// URI（根据 AstrBot 文档要求）
-                        image_urls.append(image_path)
-                        image_paths.append(image_path)
-
-        if image_urls or image_paths:
-            logger.debug(
-                f"🖼️ OpenAI 收集到 {len(image_paths) or len(image_urls)} 张图片"
-            )
-            return image_urls, image_paths, text_content, thought_signature
-
-        if text_content:
-            detail = (
-                f" | 参考图处理提示: {'; '.join(fail_reasons[:3])}"
-                if fail_reasons
-                else ""
-            )
-            logger.debug(
-                "[openai] 仅返回文本，长度=%s 预览=%s",
-                len(text_content),
-                text_content[:200],
-            )
-            logger.warning(f"OpenAI只返回了文本响应，未生成图像，将触发重试{detail}")
-            logger.debug(f"OpenAI响应内容: {str(response_data)[:1000]}")
-            raise APIError(
-                f"图像生成失败：API只返回了文本响应，正在重试... | 响应预览: {str(response_data)[:300]}",
-                500,
-                "no_image_retry",
-            )
-
-        logger.warning(
-            f"OpenAI 响应格式不支持或未找到图像数据，响应: {str(response_data)[:500]}"
-        )
-        return [], [], None, None
 
     def _normalize_message_value(self, raw_value: Any) -> dict[str, Any] | None:
         """归一化任意常见字段为标准 message 结构"""

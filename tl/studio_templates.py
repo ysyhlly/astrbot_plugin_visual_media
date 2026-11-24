@@ -64,6 +64,7 @@ class StudioTemplateService:
         self._config_lock = config_lock if config_lock is not None else asyncio.Lock()
         self._is_closed = is_closed or (lambda: False)
         self.hub_source: HubTemplateSource | None = None
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
         self.hub_cache = TemplateHubCache(self.data_dir, mode=hub_mode)
         self.reconfigure_hub(mode=hub_mode, url=hub_url, key=hub_key, sync=False)
 
@@ -95,7 +96,10 @@ class StudioTemplateService:
         if key is not None:
             self._hub_key = key
         if self._hub_mode == "off":
+            previous = self.hub_source
             self.hub_source = None
+            if previous is not None:
+                _schedule_close(previous, self._bg_tasks)
             self.hub_cache.reconfigure(source=None, mode="off")
             return
         if (
@@ -106,7 +110,7 @@ class StudioTemplateService:
             previous = self.hub_source
             self.hub_source = self._source_factory(self._hub_url, self._hub_key or None)
             if previous is not None:
-                _schedule_close(previous)
+                _schedule_close(previous, self._bg_tasks)
         self.hub_cache.reconfigure(source=self.hub_source, mode=self._hub_mode)
 
     def hub_state(self) -> dict[str, Any]:
@@ -459,6 +463,14 @@ class StudioTemplateService:
 
     async def close(self) -> None:
         source, self.hub_source = self.hub_source, None
+        bg_tasks = getattr(self, "_bg_tasks", None)
+        if bg_tasks:
+            pending = [task for task in list(bg_tasks) if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            bg_tasks.clear()
         await _drain(source)
 
     async def save(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -642,16 +654,22 @@ def _auth_error(exc: Exception) -> StudioServiceError:
     return StudioServiceError(_source_message(exc), status_code=403)
 
 
-def _schedule_close(source: Any) -> None:
+def _schedule_close(
+    source: Any, tasks: set[asyncio.Task[Any]] | None = None
+) -> asyncio.Task[Any] | None:
     """配置变更时关闭旧客户端；无事件循环时只能丢弃引用。"""
 
     if source is None:
-        return
+        return None
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        return
-    loop.create_task(_drain(source))
+        return None
+    task = loop.create_task(_drain(source))
+    if tasks is not None:
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+    return task
 
 
 async def _drain(source: Any) -> None:

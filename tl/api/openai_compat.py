@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 import urllib.parse
@@ -16,11 +17,29 @@ import aiohttp
 from astrbot.api import logger
 
 from ..api_types import APIError, ApiRequestConfig
+from ..core.errors import redact_text, redact_url
 from ..tl_utils import save_base64_image
 from .base import ProviderRequest
 from .provider_limits import MAX_REFERENCE_IMAGES_OPENAI_COMPAT
 from .reference_intake import announce_reference_intake
 from .reference_pipeline import reference_data_uri
+
+_REFUSAL_POLICY_RE = re.compile(
+    r"(?i)("
+    r"\b(?:i\s+cannot|i\s+can't|unable\s+to\s+generate|cannot\s+generate|can't\s+generate"
+    r"|cannot\s+create|can't\s+create|unable\s+to\s+create|cannot\s+fulfill|can't\s+fulfill"
+    r"|against\s+(?:our|my|the)\s+(?:content|safety|usage)?\s*polic"
+    r"|violates?\s+(?:our|my|the)?\s*(?:content|safety|usage)?\s*(?:polic|guidelines)"
+    r"|content\s+policy|safety\s+policy|safety\s+guidelines|policy\s+violation"
+    r"|inappropriate\s+content|sexually\s+explicit|harmful\s+content|nsfw)\b"
+    r"|无法生成|不能生成|拒绝生成|不支持生成|违反.{0,8}(?:政策|规定|准则|协议)|内容政策|安全策略|敏感内容|违规内容|不符合.{0,8}(?:政策|安全|规范)"
+    r")"
+)
+
+
+def _is_refusal_or_policy_text(text: str) -> bool:
+    """Detect model refusal or safety/policy rejection text so we fail fast without retrying."""
+    return bool(text and _REFUSAL_POLICY_RE.search(text))
 
 
 class OpenAICompatProvider:
@@ -121,17 +140,19 @@ class OpenAICompatProvider:
         }
 
         if config.reference_images:
-            processed_cache: dict[str, dict[str, Any]] = {}
             total_start = time.perf_counter()
             total_ref_count, processed_ref_count = announce_reference_intake(
                 config.reference_images,
                 MAX_REFERENCE_IMAGES_OPENAI_COMPAT,
             )
 
+            ordered_keys: list[str] = []
+            unique_tasks: list[tuple[int, Any, str]] = []
+            seen_keys: set[str] = set()
+
             for idx, image_input in enumerate(
                 config.reference_images[:MAX_REFERENCE_IMAGES_OPENAI_COMPAT]
             ):
-                per_start = time.perf_counter()
                 image_str = str(image_input).strip()
                 if not image_str:
                     logger.warning(f"跳过空白参考图像: idx={idx}")
@@ -140,11 +161,17 @@ class OpenAICompatProvider:
                 if "&amp;" in image_str:
                     image_str = image_str.replace("&amp;", "&")
 
-                if image_str in processed_cache:
+                ordered_keys.append(image_str)
+                if image_str in seen_keys:
                     logger.debug(f"参考图像命中缓存: idx={idx}")
-                    message_content.append(processed_cache[image_str])
                     continue
+                seen_keys.add(image_str)
+                unique_tasks.append((idx, image_input, image_str))
 
+            async def _prepare_single_reference(
+                idx: int, image_input: Any, image_str: str
+            ) -> tuple[str, dict[str, Any] | None]:
+                per_start = time.perf_counter()
                 parsed = urllib.parse.urlparse(image_str)
                 image_payload: dict[str, Any] | None = None
 
@@ -160,7 +187,7 @@ class OpenAICompatProvider:
                                 "参考图像URL扩展名不在常见列表: idx=%s ext=%s url=%s",
                                 idx,
                                 ext,
-                                image_str[:80],
+                                redact_url(image_str)[:80],
                             )
 
                         image_payload = {
@@ -174,7 +201,7 @@ class OpenAICompatProvider:
                             "OpenAI兼容API使用URL参考图: idx=%s ext=%s url=%s",
                             idx,
                             ext or "unknown",
-                            image_str[:120],
+                            redact_url(image_str)[:120],
                         )
 
                     elif (
@@ -222,12 +249,7 @@ class OpenAICompatProvider:
                                 idx,
                                 type(image_input),
                             )
-                            continue
-
-                        image_payload = {
-                            "type": "image_url",
-                            "image_url": {"url": payload_url},
-                        }
+                            return image_str, None
 
                         image_payload = {
                             "type": "image_url",
@@ -235,8 +257,6 @@ class OpenAICompatProvider:
                         }
 
                     if image_payload:
-                        message_content.append(image_payload)
-                        processed_cache[image_str] = image_payload
                         elapsed_ms = (time.perf_counter() - per_start) * 1000
                         logger.debug(
                             "参考图像处理完成: idx=%s 耗时=%.2fms 来源=%s",
@@ -244,13 +264,28 @@ class OpenAICompatProvider:
                             elapsed_ms,
                             parsed.scheme or "normalized",
                         )
+                    return image_str, image_payload
 
                 except Exception as e:
                     logger.warning(
                         f"📎 图片 {idx + 1}/{processed_ref_count} 未能加入发送请求 - {str(e)[:30]}"
                     )
                     logger.debug("处理参考图像时出现异常: idx=%s err=%s", idx, e)
-                    continue
+                    return image_str, None
+
+            prepared_results = await asyncio.gather(
+                *(
+                    _prepare_single_reference(idx, image_input, image_str)
+                    for idx, image_input, image_str in unique_tasks
+                )
+            )
+            processed_cache: dict[str, dict[str, Any]] = {
+                key: payload for key, payload in prepared_results if payload is not None
+            }
+            for key in ordered_keys:
+                cached_payload = processed_cache.get(key)
+                if cached_payload is not None:
+                    message_content.append(cached_payload)
 
             total_elapsed_ms = (time.perf_counter() - total_start) * 1000
             success_count = len(processed_cache)
@@ -322,7 +357,11 @@ class OpenAICompatProvider:
         fallback_texts = client._collect_fallback_texts(response_data)
         special_state: dict[str, Any] = {}
         download_proxy = client._request_http_proxy(request_config)
-        has_request_proxy = client._request_has_proxy(request_config)
+        has_request_proxy = bool(
+            client._request_has_proxy(request_config)
+            or getattr(client, "proxy", None)
+            or getattr(self, "proxy", None)
+        )
 
         message: dict[str, Any] | None = None
         if "choices" in response_data and response_data["choices"]:
@@ -391,7 +430,10 @@ class OpenAICompatProvider:
                 text_content = " ".join([t for t in text_chunks if t]).strip() or None
 
             for candidate_url in image_candidates:
-                logger.debug("[openai] 处理候选URL: %s", str(candidate_url)[:120])
+                logger.debug(
+                    "[openai] 处理候选URL: %s",
+                    redact_url(str(candidate_url))[:120],
+                )
                 if isinstance(candidate_url, str) and candidate_url.startswith(
                     "data:image/"
                 ):
@@ -433,7 +475,8 @@ class OpenAICompatProvider:
                             continue
                         image_urls.append(cleaned_candidate)
                         logger.debug(
-                            f"🖼️ OpenAI 返回可直接访问的图像链接: {cleaned_candidate}"
+                            "🖼️ OpenAI 返回可直接访问的图像链接: %s",
+                            redact_url(cleaned_candidate),
                         )
                         continue
                     image_url, image_path = await client._download_image(
@@ -452,57 +495,60 @@ class OpenAICompatProvider:
                     if image_path:
                         image_paths.append(image_path)
 
-            extracted_urls2: list[str] = []
-            extracted_paths2: list[str] = []
+            if not (image_urls or image_paths):
+                extracted_urls2: list[str] = []
+                extracted_paths2: list[str] = []
 
-            if isinstance(content, str):
-                extracted_urls2, extracted_paths2 = await client._extract_from_content(
-                    content
-                )
-            elif text_content:
-                extracted_urls2, extracted_paths2 = await client._extract_from_content(
-                    text_content
-                )
+                if isinstance(content, str):
+                    (
+                        extracted_urls2,
+                        extracted_paths2,
+                    ) = await client._extract_from_content(content)
+                elif text_content:
+                    (
+                        extracted_urls2,
+                        extracted_paths2,
+                    ) = await client._extract_from_content(text_content)
 
-            if extracted_urls2 or extracted_paths2:
-                for url in extracted_urls2:
-                    cleaned_url = (
-                        str(url)
-                        .strip()
-                        .replace("&amp;", "&")
-                        .rstrip(").,;")
-                        .strip("'\"")
-                    )
-                    if not cleaned_url:
-                        continue
-                    if await self._handle_special_candidate_url(
-                        client=client,
-                        session=session,
-                        candidate_url=cleaned_url,
-                        image_urls=image_urls,
-                        image_paths=image_paths,
-                        api_base=api_base,
-                        request_config=request_config,
-                        state=special_state,
-                    ):
-                        continue
-                    if has_request_proxy and cleaned_url.startswith(
-                        ("http://", "https://")
-                    ):
-                        _, image_path = await client._download_image(
-                            cleaned_url,
-                            session,
-                            use_cache=False,
-                            proxy=download_proxy,
+                if extracted_urls2 or extracted_paths2:
+                    for url in extracted_urls2:
+                        cleaned_url = (
+                            str(url)
+                            .strip()
+                            .replace("&amp;", "&")
+                            .rstrip(").,;")
+                            .strip("'\"")
                         )
-                        if image_path and image_path not in image_paths:
-                            image_paths.append(image_path)
-                        continue
-                    if cleaned_url not in image_urls:
-                        image_urls.append(cleaned_url)
-                for p in extracted_paths2:
-                    if p and p not in image_paths:
-                        image_paths.append(p)
+                        if not cleaned_url:
+                            continue
+                        if await self._handle_special_candidate_url(
+                            client=client,
+                            session=session,
+                            candidate_url=cleaned_url,
+                            image_urls=image_urls,
+                            image_paths=image_paths,
+                            api_base=api_base,
+                            request_config=request_config,
+                            state=special_state,
+                        ):
+                            continue
+                        if has_request_proxy and cleaned_url.startswith(
+                            ("http://", "https://")
+                        ):
+                            _, image_path = await client._download_image(
+                                cleaned_url,
+                                session,
+                                use_cache=False,
+                                proxy=download_proxy,
+                            )
+                            if image_path and image_path not in image_paths:
+                                image_paths.append(image_path)
+                            continue
+                        if cleaned_url not in image_urls:
+                            image_urls.append(cleaned_url)
+                    for p in extracted_paths2:
+                        if p and p not in image_paths:
+                            image_paths.append(p)
 
             # 仅在前面没有提取到结构化图片时，才回退扫描文本中的 URL，
             # 避免同一张图被“带签名 URL + 去签名 URL”重复收集。
@@ -546,14 +592,14 @@ class OpenAICompatProvider:
                         image_urls.append(cleaned_url)
 
                 loose_matches = re.finditer(
-                    r"data:image/([a-zA-Z0-9.+-]+);base64,([-A-Za-z0-9+/=_\\s]+)",
+                    r"data:image/([a-zA-Z0-9.+-]+);base64,([-A-Za-z0-9+/=_\s]+)",
                     text_content,
                     flags=re.IGNORECASE,
                 )
                 for m in loose_matches:
                     fmt = m.group(1)
                     b64_raw = m.group(2)
-                    b64_clean = re.sub(r"\\s+", "", b64_raw)
+                    b64_clean = re.sub(r"\s+", "", b64_raw)
                     image_path = await save_base64_image(b64_clean, fmt.lower())
                     if image_path:
                         image_urls.append(image_path)
@@ -612,20 +658,32 @@ class OpenAICompatProvider:
                 if fail_reasons
                 else ""
             )
+            redacted_text = redact_text(text_content)
+            redacted_resp = redact_text(str(response_data))
             logger.debug(
                 "[openai] 仅返回文本，长度=%s 预览=%s",
                 len(text_content),
-                text_content[:200],
+                redacted_text[:200],
             )
+            if _is_refusal_or_policy_text(text_content):
+                logger.warning(
+                    f"OpenAI返回拒绝/政策拦截文本，快速失败不再重试{detail}: {redacted_text[:200]}"
+                )
+                raise APIError(
+                    f"图像生成被模型策略拒绝：{redacted_text[:300]}",
+                    400,
+                    "content_policy_refusal",
+                    retryable=False,
+                )
             logger.warning(f"OpenAI只返回了文本响应，未生成图像，将触发重试{detail}")
-            logger.debug(f"OpenAI响应内容: {str(response_data)[:1000]}")
+            logger.debug(f"OpenAI响应内容: {redacted_resp[:1000]}")
             raise APIError(
-                f"图像生成失败：API只返回了文本响应，正在重试... | 响应预览: {str(response_data)[:300]}",
+                f"图像生成失败：API只返回了文本响应，正在重试... | 响应预览: {redacted_resp[:300]}",
                 500,
                 "no_image_retry",
             )
 
         logger.warning(
-            f"OpenAI 响应格式不支持或未找到图像数据，响应: {str(response_data)[:500]}"
+            f"OpenAI 响应格式不支持或未找到图像数据，响应: {redact_text(str(response_data))[:500]}"
         )
         return image_urls, image_paths, text_content, thought_signature

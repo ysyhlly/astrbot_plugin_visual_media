@@ -8,6 +8,8 @@ import secrets
 import time
 from collections import OrderedDict
 
+from ..search.meme_smart_select_service import embedding_search_timeout
+
 
 class EmptyCatalogueCache:
     def __init__(self, *, ttl_seconds=30, max_entries=256):
@@ -95,7 +97,7 @@ class JointReplyPrefetch:
         except Exception:
             return None
 
-    async def _search(self):
+    async def _search(self, *, local_only: bool = False):
         if not self.query:
             return "empty_query", [], None
         if not joint_search_enabled(self.plugin, self.event):
@@ -140,10 +142,11 @@ class JointReplyPrefetch:
             nonlocal outcome, observed_version
             outcome, observed_version = search_outcome, library_version
 
-        async for _ in self.plugin._search_meme_impl(
-            clone, self.query, on_outcome=report
-        ):
-            pass
+        with embedding_search_timeout(0.0 if local_only else None):
+            async for _ in self.plugin._search_meme_impl(
+                clone, self.query, on_outcome=report
+            ):
+                pass
         candidates = self.plugin._emoji_sender_engine.emoji_turn_state(
             clone
         ).get_candidates()
@@ -155,6 +158,23 @@ class JointReplyPrefetch:
         if version is not None and await self._library_version() != version:
             return await asyncio.wait_for(self._search(), timeout=self.timeout_seconds)
         return outcome, candidates, version
+
+    async def _local_fallback_candidates(self, plugin, event, wait_seconds: float | None):
+        """Return local-recall candidates (overlay/character/scene/BM25) when embedding wait expires."""
+        fallback_timeout = max(0.25, float(wait_seconds or 0.35))
+        try:
+            _outcome, local_rows, _version = await asyncio.wait_for(
+                self._search(local_only=True), timeout=fallback_timeout
+            )
+            if not joint_search_enabled(plugin, event):
+                return []
+            return [
+                dict(row)
+                for row in local_rows
+                if plugin.meme_selector.is_path_allowed_for_event(row["path"], event)
+            ]
+        except Exception:
+            return []
 
     async def result(self, plugin, event, query, *, wait_seconds=None):
         if (
@@ -181,6 +201,10 @@ class JointReplyPrefetch:
         except asyncio.CancelledError:
             raise
         except TimeoutError:
+            fallback = await self._local_fallback_candidates(plugin, event, wait_seconds)
+            if fallback:
+                self.outcome = "local_fallback"
+                return fallback
             self.outcome = "timeout"
             return []
         except Exception:

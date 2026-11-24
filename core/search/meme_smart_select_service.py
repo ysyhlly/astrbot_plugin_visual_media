@@ -5,6 +5,8 @@ import os
 import random
 import re
 from collections.abc import Awaitable, Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from astrbot.api import logger
@@ -22,11 +24,29 @@ from .text_similarity import (
     tokenize_for_bm25,
 )
 
+_EMBEDDING_TIMEOUT_VAR: ContextVar[float | None] = ContextVar(
+    "visual_media_embedding_search_timeout", default=None
+)
+
+
+@contextmanager
+def embedding_search_timeout(timeout: float | None):
+    """Bound embedding search wait inside this scope; <=0 skips remote embedding for local-only fallback."""
+    token = _EMBEDDING_TIMEOUT_VAR.set(timeout)
+    try:
+        yield
+    finally:
+        _EMBEDDING_TIMEOUT_VAR.reset(token)
+
 
 class MemeSmartSelectService:
     """负责智能选择表情包。"""
 
     SMART_BM25_BONUS_WEIGHT = 0.2
+    SMART_EMBEDDING_BONUS_WEIGHT = 0.42
+    SMART_BASE_SCORE_THRESHOLD = 0.15
+    SMART_SEMANTIC_PASSTHROUGH_MIN_SIM = 0.35
+    SMART_SEMANTIC_PASSTHROUGH_FLOOR = 0.10
     SMART_RECALL_K = 48
     SMART_OVERLAY_RECALL_LIMIT = 16
 
@@ -118,15 +138,22 @@ class MemeSmartSelectService:
         context_text: str,
         event: AstrMessageEvent | None,
         prior_categories: set[str],
-        *, require_files: bool = False,
+        *,
+        require_files: bool = False,
+        embedding_timeout: float | None = None,
     ) -> tuple[list[str], dict[str, float]]:
-        """各路独立召回后用 reciprocal rank fusion 合并，分类只作兜底。"""
+        """各路独立召回后用 reciprocal rank fusion 合并，分类只作兜底。
+
+        本地召回（图上文字/角色/场景/BM25）与远程嵌入检索并发执行；
+        当 embedding_timeout 到期或嵌入异常时直接返回本地候选，不再整路取消。
+        """
         recalled: dict[str, str] = {}
         fusion_scores: dict[str, float] = {}
         embedding_paths: dict[str, float] = {}
 
-        def _add(paths: list[str]) -> None:
+        def _add(paths: list[str]) -> int:
             seen: set[str] = set()
+            accepted = 0
             for rank, path in enumerate(paths, 1):
                 canon = canonicalize_path(path)
                 if not path or canon in seen or (require_files and not os.path.isfile(path)):
@@ -139,29 +166,31 @@ class MemeSmartSelectService:
                 seen.add(canon)
                 recalled.setdefault(canon, path)
                 fusion_scores[canon] = fusion_scores.get(canon, 0.0) + 1.0 / (60 + rank)
+                accepted += 1
+            return accepted
 
+        effective_timeout = (
+            embedding_timeout
+            if embedding_timeout is not None
+            else _EMBEDDING_TIMEOUT_VAR.get()
+        )
+        run_embedding = (
+            self._is_embedding_ready()
+            and bool(context_text.strip())
+            and (effective_timeout is None or effective_timeout > 0)
+        )
+        emb_task: asyncio.Task[list[tuple[str, float]]] | None = None
+        if run_embedding:
+            emb_task = asyncio.create_task(
+                self._embedding_service.search(context_text, k=self.SMART_RECALL_K)
+            )
+        elif not self._is_embedding_ready():
+            logger.debug("[Embedding] auto-emoji: 嵌入未就绪，改走 BM25/分类兜底")
+
+        # 本地召回与嵌入请求并行进行
         _add(self._overlay_recall_paths(idx, context_text, event, self.SMART_OVERLAY_RECALL_LIMIT))
         _add(self._character_recall_paths(idx, context_text, event, self.SMART_OVERLAY_RECALL_LIMIT))
         _add(self._scene_recall_paths(idx, context_text, event, self.SMART_OVERLAY_RECALL_LIMIT))
-
-        if self._is_embedding_ready() and context_text.strip():
-            try:
-                emb_results = await self._embedding_service.search(
-                    context_text, k=self.SMART_RECALL_K
-                )
-                emb_paths: list[str] = []
-                for path, score in emb_results:
-                    if score <= 0:
-                        continue
-                    embedding_paths[canonicalize_path(path)] = score
-                    emb_paths.append(path)
-                _add(emb_paths)
-                if embedding_paths:
-                    logger.info("[Embedding] 语义召回 topk=%d", len(embedding_paths))
-            except Exception as e:
-                logger.warning(f"[Embedding] auto-emoji 语义召回异常: {e}")
-        elif not self._is_embedding_ready():
-            logger.debug("[Embedding] auto-emoji: 嵌入未就绪，改走 BM25/分类兜底")
 
         if context_text.strip():
             try:
@@ -184,6 +213,40 @@ class MemeSmartSelectService:
                     _add(bm25_paths)
             except Exception as e:
                 logger.debug(f"[BM25] auto-emoji 召回失败: {e}")
+
+        if emb_task is not None:
+            try:
+                if effective_timeout is not None:
+                    emb_results = await asyncio.wait_for(emb_task, timeout=effective_timeout)
+                else:
+                    emb_results = await emb_task
+                emb_paths: list[str] = []
+                for path, score in emb_results:
+                    if score <= 0:
+                        continue
+                    embedding_paths[canonicalize_path(path)] = score
+                    emb_paths.append(path)
+                accepted_emb = _add(emb_paths)
+                if embedding_paths:
+                    logger.info(
+                        "[Embedding] 语义召回 raw=%d accepted=%d",
+                        len(embedding_paths),
+                        accepted_emb,
+                    )
+            except TimeoutError:
+                emb_task.cancel()
+                await asyncio.gather(emb_task, return_exceptions=True)
+                logger.info(
+                    "[Embedding] 语义召回超时(%.0fms)，回退本地候选 local=%d",
+                    float(effective_timeout or 0.0) * 1000.0,
+                    len(recalled),
+                )
+            except asyncio.CancelledError:
+                emb_task.cancel()
+                await asyncio.gather(emb_task, return_exceptions=True)
+                raise
+            except Exception as e:
+                logger.warning(f"[Embedding] auto-emoji 语义召回异常: {e}")
 
         if not recalled and prior_categories:
             for file_path, data in idx.items():
@@ -245,6 +308,7 @@ class MemeSmartSelectService:
         require_files: bool | None = None,
         penalize_recent: bool = True,
         emotion_weights: dict[str, float] | None = None,
+        embedding_timeout: float | None = None,
     ) -> list[tuple]:
         """召回并评分；JEV 模式过滤文件并禁用随机加分和提前停止。"""
         try:
@@ -265,6 +329,7 @@ class MemeSmartSelectService:
             recalled_paths, embedding_paths = await self._recall_candidate_paths(
                 idx, context_text, event, allowed_categories | set(emotion_weights or {}),
                 require_files=deterministic if require_files is None else require_files,
+                embedding_timeout=embedding_timeout,
             )
             if not recalled_paths:
                 return []
@@ -349,9 +414,10 @@ class MemeSmartSelectService:
                 bm25_bonus = fast_score * self.SMART_BM25_BONUS_WEIGHT
                 favorite_bonus = 0.04 if data.get("is_favorite") else 0.0
                 character_score = self._character_match_score(context_lower, data)
-                embedding_bonus = embedding_paths.get(
+                embedding_score = embedding_paths.get(
                     canonicalize_path(file_path), 0.0
-                ) * 0.25
+                )
+                embedding_bonus = embedding_score * self.SMART_EMBEDDING_BONUS_WEIGHT
                 base_score = (
                     overlay_score * 0.28
                     + desc_score * 0.18
@@ -362,7 +428,12 @@ class MemeSmartSelectService:
                     + embedding_bonus
                 )
 
-                if base_score < 0.15:
+                min_base_score = (
+                    self.SMART_SEMANTIC_PASSTHROUGH_FLOOR
+                    if embedding_score >= self.SMART_SEMANTIC_PASSTHROUGH_MIN_SIM
+                    else self.SMART_BASE_SCORE_THRESHOLD
+                )
+                if base_score < min_base_score:
                     continue
 
                 punctuation_bonus = max(
@@ -389,6 +460,11 @@ class MemeSmartSelectService:
                         )
                     )
 
+            logger.info(
+                "[SmartSelect] 候选评分 raw=%d accepted=%d",
+                len(recalled_paths),
+                len(candidates),
+            )
             if not candidates:
                 return []
 

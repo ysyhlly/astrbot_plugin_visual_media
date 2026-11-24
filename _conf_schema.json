@@ -3149,7 +3149,7 @@
             "description": "Gallery 容量上限（MB）",
             "type": "int",
             "hint": "超限后从最旧任务整组清理图片；填 0 表示不自动清理。",
-            "default": 512,
+            "default": 256,
             "slider": {
               "min": 0,
               "max": 10240,
@@ -3539,7 +3539,7 @@
             "description": "生成图缓存容量上限（MB）",
             "type": "float",
             "hint": "插件数据目录 images/ 下生成图与帮助图的容量上限，超过时按最旧文件优先自动清理（策略与 AstrBot 临时目录清理一致）。填 0 表示不自动清理",
-            "default": 512.0
+            "default": 256.0
           },
           "theme_settings": {
             "description": "主题设置",

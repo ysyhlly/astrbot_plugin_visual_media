@@ -1,16 +1,36 @@
 """Keep SDK vector storage while pacing requests and reporting observed dimensions."""
 
 import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import numpy as np
 
 from ..util.model_requests import is_rate_limited, model_request_gate
 
+_INTERACTIVE_EMBEDDING_LANE: ContextVar[bool] = ContextVar(
+    "visual_media_interactive_embedding_lane", default=False
+)
+
+
+@contextmanager
+def interactive_embedding_lane(enabled: bool = True):
+    """Route embedding provider calls inside this scope through the interactive lane."""
+    token = _INTERACTIVE_EMBEDDING_LANE.set(bool(enabled))
+    try:
+        yield
+    finally:
+        _INTERACTIVE_EMBEDDING_LANE.reset(token)
+
 
 class EmbeddingProviderAdapter:
-    def __init__(self, service, provider):
+    def __init__(self, service, provider, *, interactive: bool = False):
         self.service = service
         self.provider = provider
+        self.interactive = bool(interactive)
+
+    def _is_interactive(self) -> bool:
+        return self.interactive or _INTERACTIVE_EMBEDDING_LANE.get()
 
     def __getattr__(self, name):
         return getattr(self.provider, name)
@@ -21,6 +41,14 @@ class EmbeddingProviderAdapter:
     async def _request(self, operation):
         key = self.service._extract_provider_id(self.provider)
         gate = model_request_gate(self.service.plugin)
+        if self._is_interactive():
+            for attempt in range(2):
+                try:
+                    return await gate.call_interactive(key, operation)
+                except Exception as exc:
+                    if not is_rate_limited(exc) or attempt == 1:
+                        raise
+                    await asyncio.sleep(0.25)
         for attempt in range(3):
             try:
                 return await gate.call(key, operation)
@@ -37,11 +65,23 @@ class EmbeddingProviderAdapter:
         return array.tolist()
 
     async def get_embedding(self, text):
+        interactive = self._is_interactive()
+        if interactive:
+            getter = getattr(self.service, "get_cached_query_embedding", None)
+            if callable(getter):
+                cached = getter(self.provider, text)
+                if cached is not None:
+                    return cached
         identity = self.service._provider_identity(self.provider)
         vector = await self._request(lambda: self.provider.get_embedding(text))
         if identity != self.service._provider_identity(self.provider):
             raise ValueError("嵌入模型在请求期间发生变化")
-        return self._validate([vector])[0]
+        validated = self._validate([vector])[0]
+        if interactive:
+            setter = getattr(self.service, "set_cached_query_embedding", None)
+            if callable(setter):
+                setter(self.provider, text, validated)
+        return validated
 
     async def get_embeddings(self, texts):
         if callable(getattr(self.provider, "get_embeddings", None)):

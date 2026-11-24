@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import shutil
 import uuid
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,9 @@ from ..core.util.safe_io import safe_remove_file
 
 
 class ImageMutationRoutes:
+    BATCH_UPLOAD_MAX_FILES = 50
+    BATCH_UPLOAD_MAX_TOTAL_BYTES = 100 * 1024 * 1024  # 100 MB
+
     # ── Upload / Update / Delete ──────────────────────────────
 
     async def handle_upload_image(self):
@@ -281,29 +285,95 @@ class ImageMutationRoutes:
             return jsonify({"success": False, "error": str(e)})
 
     async def handle_batch_upload(self):
+        spool_dir: Path | None = None
+        scheduled = False
         try:
             self._prune_batch_upload_tasks()
-            files_data = []
+            max_files = max(1, int(getattr(self, "BATCH_UPLOAD_MAX_FILES", 50)))
+            max_total_bytes = max(
+                1, int(getattr(self, "BATCH_UPLOAD_MAX_TOTAL_BYTES", 100 * 1024 * 1024))
+            )
+            task_id = str(uuid.uuid4())
+            spool_dir = self._data_dir / "temp" / f"batch_{task_id}"
+            files_data: list[dict[str, Any]] = []
+            total_bytes = 0
+
+            async def _spool_entry(filename: str, content: bytes, ext: str) -> tuple[bool, tuple[Any, int] | None]:
+                nonlocal total_bytes
+                if len(files_data) >= max_files:
+                    return (
+                        False,
+                        (
+                            jsonify(
+                                {
+                                    "success": False,
+                                    "error": f"单批最多上传 {max_files} 个文件",
+                                }
+                            ),
+                            400,
+                        ),
+                    )
+                total_bytes += len(content)
+                if total_bytes > max_total_bytes:
+                    max_mb = max(1, max_total_bytes // (1024 * 1024))
+                    return (
+                        False,
+                        (
+                            jsonify(
+                                {
+                                    "success": False,
+                                    "error": f"单批上传总大小超过上限（{max_mb} MB）",
+                                }
+                            ),
+                            413,
+                        ),
+                    )
+                file_hash = hashlib.sha256(content).hexdigest()
+                spool_path = spool_dir / f"{len(files_data):04d}_{file_hash[:16]}{ext}"
+
+                def _write_spooled() -> None:
+                    spool_dir.mkdir(parents=True, exist_ok=True)
+                    spool_path.write_bytes(content)
+
+                await asyncio.to_thread(_write_spooled)
+                files_data.append(
+                    {
+                        "filename": filename,
+                        "temp_path": str(spool_path),
+                        "hash": file_hash,
+                        "ext": ext,
+                        "size": len(content),
+                    }
+                )
+                return True, None
+
             try:
                 data = await request.get_json()
             except Exception:
                 data = None
             if data and "_files" in data:
-                for fi in data.get("_files", []):
+                raw_files = data.get("_files", []) or []
+                if len(raw_files) > max_files:
+                    return (
+                        jsonify(
+                            {
+                                "success": False,
+                                "error": f"单批最多上传 {max_files} 个文件",
+                            }
+                        ),
+                        400,
+                    )
+                for fi in raw_files:
                     b64 = fi.get("base64", "")
                     content = self._decode_base64_payload(b64)
-                    ext = Path(fi.get("name", "upload.png")).suffix.lower()
+                    filename = fi.get("name", "upload.png")
+                    ext = Path(filename).suffix.lower()
                     if not self._is_allowed_ext(ext):
                         continue
                     if content:
-                        files_data.append(
-                            {
-                                "filename": fi.get("name", "upload.png"),
-                                "content": content,
-                                "hash": hashlib.sha256(content).hexdigest(),
-                                "ext": ext,
-                            }
-                        )
+                        ok, err_resp = await _spool_entry(filename, content, ext)
+                        if not ok and err_resp is not None:
+                            return err_resp
                 category = str(data.get("category", "")).strip()
                 auto_analyze = str(data.get("auto_analyze", "false")).lower() == "true"
                 character = self._normalize_character_key(str(data.get("character", "") or ""))
@@ -313,21 +383,28 @@ class ImageMutationRoutes:
                 category = form.get("category", "").strip()
                 auto_analyze = form.get("auto_analyze", "false").lower() == "true"
                 character = self._normalize_character_key(str(form.get("character", "") or ""))
-                for field_name in files:
+                field_names = list(files)
+                if len(field_names) > max_files:
+                    return (
+                        jsonify(
+                            {
+                                "success": False,
+                                "error": f"单批最多上传 {max_files} 个文件",
+                            }
+                        ),
+                        400,
+                    )
+                for field_name in field_names:
                     f = files[field_name]
-                    ext = Path(f.filename or "upload.png").suffix.lower()
+                    filename = f.filename or "upload.png"
+                    ext = Path(filename).suffix.lower()
                     if not self._is_allowed_ext(ext):
                         continue
                     content = f.read()
                     if content:
-                        files_data.append(
-                            {
-                                "filename": f.filename or "upload.png",
-                                "content": content,
-                                "hash": hashlib.sha256(content).hexdigest(),
-                                "ext": ext,
-                            }
-                        )
+                        ok, err_resp = await _spool_entry(filename, content, ext)
+                        if not ok and err_resp is not None:
+                            return err_resp
 
             if not files_data:
                 return jsonify({"success": False, "error": "没有上传有效的图片文件"})
@@ -338,7 +415,6 @@ class ImageMutationRoutes:
             if not fallback:
                 return jsonify({"success": False, "error": "未配置任何分类"})
 
-            task_id = str(uuid.uuid4())
             now = self._task_now()
             self.batch_upload_tasks[task_id] = {
                 "status": "processing",
@@ -350,38 +426,85 @@ class ImageMutationRoutes:
                 "created_at": now,
                 "updated_at": now,
             }
-            asyncio.create_task(
-                self._process_batch(task_id, files_data, category, auto_analyze, fallback, character)
+            coro = self._process_batch(
+                task_id,
+                files_data,
+                category,
+                auto_analyze,
+                fallback,
+                character,
+                spool_dir=spool_dir,
             )
+            scheduler = getattr(self.plugin, "task_scheduler", None)
+            if scheduler is not None and callable(getattr(scheduler, "create_task", None)):
+                task = scheduler.create_task(
+                    f"batch_upload:{task_id}",
+                    coro,
+                    replace_existing=True,
+                )
+                if task is None:
+                    coro.close()
+                    self.batch_upload_tasks.pop(task_id, None)
+                    return jsonify({"success": False, "error": "无法创建批量上传后台任务"}), 503
+            else:
+                batch_tasks = getattr(self, "_batch_upload_bg_tasks", None)
+                if batch_tasks is None:
+                    batch_tasks = set()
+                    self._batch_upload_bg_tasks = batch_tasks
+                task = asyncio.create_task(coro)
+                batch_tasks.add(task)
+                task.add_done_callback(batch_tasks.discard)
+            scheduled = True
             return jsonify({"success": True, "task_id": task_id, "total": len(files_data)})
         except Exception as e:
             logger.error(f"批量上传失败: {e}", exc_info=True)
             return jsonify({"success": False, "error": str(e)})
+        finally:
+            if not scheduled and spool_dir is not None and spool_dir.exists():
+                await asyncio.to_thread(shutil.rmtree, spool_dir, True)
 
     async def _process_batch(
-        self, task_id: str, files_data: list[dict], category: str, auto_analyze: bool, fallback: str, character: str = ""
+        self,
+        task_id: str,
+        files_data: list[dict],
+        category: str,
+        auto_analyze: bool,
+        fallback: str,
+        character: str = "",
+        *,
+        spool_dir: Path | None = None,
     ) -> None:
         try:
             task = self.batch_upload_tasks.get(task_id)
             if not task:
                 return
             for fd in files_data:
+                temp_path_str = fd.get("temp_path")
+                spooled = Path(temp_path_str) if temp_path_str else None
                 tmp: Path | None = None
                 try:
+                    if spooled is not None:
+                        file_content = await asyncio.to_thread(spooled.read_bytes)
+                    else:
+                        file_content = fd["content"]
                     tags, desc, scenes = [], "", []
                     overlay_text, emotions = "", []
                     final_cat = category or fallback
                     if auto_analyze:
                         try:
-                            img_hash = fd["hash"]
-                            tmp = self._data_dir / "temp" / f"{img_hash}{fd['ext']}"
-                            tmp.parent.mkdir(parents=True, exist_ok=True)
-                            await asyncio.to_thread(lambda: tmp.write_bytes(fd["content"]))
+                            if spooled is not None and spooled.is_file():
+                                analyze_path = spooled
+                            else:
+                                img_hash = fd["hash"]
+                                tmp = self._data_dir / "temp" / f"{img_hash}{fd['ext']}"
+                                tmp.parent.mkdir(parents=True, exist_ok=True)
+                                await asyncio.to_thread(tmp.write_bytes, file_content)
+                                analyze_path = tmp
                             proc = self.plugin.image_processor_service
                             if proc:
                                 classified = await proc.classify_image(
                                     event=None,
-                                    file_path=str(tmp),
+                                    file_path=str(analyze_path),
                                     categories=list(self._cfg.categories or []),
                                     content_filtration=False,
                                 )
@@ -400,7 +523,7 @@ class ImageMutationRoutes:
                                 await asyncio.to_thread(lambda: tmp.unlink() if tmp.exists() else None)
 
                     img = await self._persist_image(
-                        file_content=fd["content"],
+                        file_content=file_content,
                         file_ext=fd["ext"],
                         category=final_cat,
                         file_hash=fd["hash"],
@@ -421,6 +544,11 @@ class ImageMutationRoutes:
                         {"filename": fd["filename"], "success": False, "error": str(e)}
                     )
                     task["failed"] += 1
+                finally:
+                    if spooled is not None:
+                        await asyncio.to_thread(
+                            lambda p=spooled: p.unlink(missing_ok=True)
+                        )
                 task["processed"] += 1
                 task["updated_at"] = self._task_now()
             if not self._db:
@@ -437,6 +565,9 @@ class ImageMutationRoutes:
                 self.batch_upload_tasks[task_id]["error"] = str(e)
                 self.batch_upload_tasks[task_id]["completed_at"] = self._task_now()
                 self.batch_upload_tasks[task_id]["updated_at"] = self.batch_upload_tasks[task_id]["completed_at"]
+        finally:
+            if spool_dir is not None and spool_dir.exists():
+                await asyncio.to_thread(shutil.rmtree, spool_dir, True)
 
     async def handle_batch_upload_status(self):
         self._prune_batch_upload_tasks()

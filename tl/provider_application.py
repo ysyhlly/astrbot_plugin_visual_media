@@ -189,6 +189,7 @@ class ProviderApplication:
         ]
         client = plugin.api_client or get_api_client(keys)
         plugin.api_client = client
+        client.context = getattr(plugin, "context", None)
         client.provider_runtime = plugin.provider_runtime
         client.generation_scheduler = getattr(plugin, "generation_scheduler", None)
         client.api_keys = keys

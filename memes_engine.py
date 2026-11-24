@@ -106,6 +106,12 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
         # 运行时属性
         self._terminated: bool = False  # 终止标志位，防止重复清理
 
+    @property
+    def embedding_service(self):
+        """暴露嵌入向量服务实例，供生命周期补初始化与健康检查使用。"""
+        smart_service = getattr(self.meme_selector, "_smart_select_service", None)
+        return getattr(smart_service, "_embedding_service", None)
+
     def __getattr__(self, name: str):
         """将未定义的属性访问自动代理到 plugin_config。
 

@@ -72,7 +72,7 @@ from .tl.provider_capabilities import parse_model_selector, select_candidates
 from .tl.provider_runtime import ProviderRuntime, provider_operation
 from .tl.provider_settings import candidate_is_keyless
 from .tl.reference_image import REFERENCE_IMAGE_CACHE_DIR
-from .tl.tl_api import APIClient, ApiRequestConfig, get_api_client
+from .tl.tl_api import APIClient, ApiRequestConfig, clear_api_client, get_api_client
 from .tl.tl_utils import (
     AvatarManager,
     format_error_message,
@@ -177,6 +177,7 @@ class GeminiImageGenerationPlugin(Component):
         self.studio_templates = None
         self._web_routes: list[tuple[Any, ...]] = []
         self._web_closed = False
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
         # 初始化各功能模块
         self._init_modules()
@@ -471,10 +472,42 @@ class GeminiImageGenerationPlugin(Component):
                 f"[WebUI] 工作台路由注册失败，其他功能不受影响: {redact_text(str(e))[:240]}"
             )
 
+    def _track_background_task(
+        self, task: asyncio.Task[Any]
+    ) -> asyncio.Task[Any]:
+        """登记后台任务强引用，完成后自动移除。"""
+        tasks = getattr(self, "_background_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._background_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return task
+
+    async def _cancel_background_tasks(self) -> None:
+        """在插件卸载时取消并等待所有受管后台任务结束。"""
+        tasks = getattr(self, "_background_tasks", None)
+        if not tasks:
+            return
+        pending = [task for task in list(tasks) if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        tasks.clear()
+
     async def terminate(self):
         """插件卸载/重载时调用"""
         self._web_closed = True
         self.provider_runtime.closed = True
+        bg_tasks = getattr(self, "_background_tasks", None)
+        if bg_tasks:
+            pending = [task for task in list(bg_tasks) if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            bg_tasks.clear()
         await self._public_service.close()
         await self.generation_scheduler.close()
         if self.studio_providers is not None:
@@ -518,6 +551,11 @@ class GeminiImageGenerationPlugin(Component):
                 await self.api_client.close()
             except Exception as e:
                 logger.warning(f"关闭 API 会话失败: {redact_text(e)[:240]}")
+        self.api_client = None
+        try:
+            clear_api_client()
+        except NameError:
+            pass
         try:
             await self.rate_limiter.close()
         except Exception as e:
@@ -631,6 +669,7 @@ class GeminiImageGenerationPlugin(Component):
             for candidate in usable_candidates
         ):
             self.api_client = get_api_client(all_api_keys)
+            self.api_client.context = self.context
             self.api_client.provider_runtime = self.provider_runtime
             self.api_client.generation_scheduler = self.generation_scheduler
             self.api_client.api_keys = all_api_keys
@@ -680,16 +719,19 @@ class GeminiImageGenerationPlugin(Component):
 
     async def on_astrbot_loaded(self):
         """AstrBot 完成初始化后加载插件 API 配置"""
-        # 初始化时尝试加载
-        self._load_api_client_from_config(quiet=True)
-        if self.llm_image_tool:
-            self.llm_image_tool.refresh_from_plugin()
-        if self.llm_batch_tool:
-            self.llm_batch_tool.refresh_from_plugin()
+        # 仅在构造阶段尚未初始化客户端时尝试加载，避免单次启动重复重建与 invalidate_session
+        if self.api_client is None:
+            self._load_api_client_from_config(quiet=True)
+            if self.llm_image_tool:
+                self.llm_image_tool.refresh_from_plugin()
+            if self.llm_batch_tool:
+                self.llm_batch_tool.refresh_from_plugin()
         if self.cfg.help_render_mode == "local":
-            asyncio.create_task(self._ensure_font_for_local_mode())
+            self._track_background_task(
+                asyncio.create_task(self._ensure_font_for_local_mode())
+            )
 
-        if not self.api_client:
+        if self.api_client is None:
             self._load_api_client_from_config()
             if self.llm_image_tool:
                 self.llm_image_tool.refresh_from_plugin()
