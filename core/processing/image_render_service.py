@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import os
+import threading
 import time
 from io import BytesIO
 from typing import Any
@@ -36,6 +37,7 @@ class ImageRenderService:
 
     def __init__(self, plugin_instance: Any = None) -> None:
         self.plugin = plugin_instance
+        self._gif_cache_lock = threading.RLock()
         self._gif_base64_cache: dict[str, tuple[float, str]] = {}
         self._gif_base64_cache_max_size = self.GIF_CACHE_MAX_SIZE
         self._gif_base64_cache_expire_time = self.CACHE_EXPIRE_TIME
@@ -67,7 +69,8 @@ class ImageRenderService:
 
         cache_key = f"{file_path}:{stat_mtime}"
         now = time.time()
-        cached = self._gif_base64_cache.get(cache_key)
+        with self._gif_cache_lock:
+            cached = self._gif_base64_cache.get(cache_key)
         if cached is not None:
             cached_at, cached_b64 = cached
             if now - cached_at <= self._gif_base64_cache_expire_time and cached_b64:
@@ -79,8 +82,9 @@ class ImageRenderService:
             if self._is_gif_file(file_path):
                 result = await self.file_to_base64(file_path)
                 if result:
-                    self._gif_base64_cache[cache_key] = (time.time(), result)
-                    self._evict_gif_base64_cache()
+                    with self._gif_cache_lock:
+                        self._gif_base64_cache[cache_key] = (time.time(), result)
+                        self._evict_gif_base64_cache()
                 return result
 
             if PILImage is None:
@@ -161,8 +165,9 @@ class ImageRenderService:
                         im.save(buf, format="GIF", optimize=False)
 
                     result = base64.b64encode(buf.getvalue()).decode("utf-8")
-                    self._gif_base64_cache[cache_key] = (time.time(), result)
-                    self._evict_gif_base64_cache()
+                    with self._gif_cache_lock:
+                        self._gif_base64_cache[cache_key] = (time.time(), result)
+                        self._evict_gif_base64_cache()
                     return result
 
             return await asyncio.to_thread(_sync_convert_to_gif, file_path)
@@ -200,29 +205,33 @@ class ImageRenderService:
 
     def _evict_gif_base64_cache(self) -> None:
         """淘汰 _gif_base64_cache 中最旧的条目。"""
-        total_bytes = sum(len(v[1]) for v in self._gif_base64_cache.values())
-        if (
-            len(self._gif_base64_cache) <= self._gif_base64_cache_max_size
-            and total_bytes <= self.GIF_CACHE_MAX_SIZE_BYTES
-        ):
-            return
+        with self._gif_cache_lock:
+            total_bytes = sum(len(v[1]) for v in self._gif_base64_cache.values())
+            if (
+                len(self._gif_base64_cache) <= self._gif_base64_cache_max_size
+                and total_bytes <= self.GIF_CACHE_MAX_SIZE_BYTES
+            ):
+                return
 
-        sorted_items = sorted(self._gif_base64_cache.items(), key=lambda kv: kv[1][0])
-        target_count = max(1, self._gif_base64_cache_max_size // 2)
-        target_bytes = max(1024 * 1024, self.GIF_CACHE_MAX_SIZE_BYTES // 2)
+            sorted_items = sorted(
+                self._gif_base64_cache.items(), key=lambda kv: kv[1][0]
+            )
+            target_count = max(1, self._gif_base64_cache_max_size // 2)
+            target_bytes = max(1024 * 1024, self.GIF_CACHE_MAX_SIZE_BYTES // 2)
 
-        keep_items = []
-        current_bytes = 0
-        for key, value in reversed(sorted_items):
-            if len(keep_items) >= target_count or current_bytes >= target_bytes:
-                break
-            keep_items.append((key, value))
-            current_bytes += len(value[1])
+            keep_items = []
+            current_bytes = 0
+            for key, value in reversed(sorted_items):
+                if len(keep_items) >= target_count or current_bytes >= target_bytes:
+                    break
+                keep_items.append((key, value))
+                current_bytes += len(value[1])
 
-        self._gif_base64_cache.clear()
-        self._gif_base64_cache.update(keep_items)
+            self._gif_base64_cache.clear()
+            self._gif_base64_cache.update(keep_items)
+            remaining_count = len(self._gif_base64_cache)
         logger.debug(
-            f"_gif_base64_cache 淘汰完成，当前 {len(self._gif_base64_cache)} 条，"
+            f"_gif_base64_cache 淘汰完成，当前 {remaining_count} 条，"
             f"总大小 {current_bytes / 1024 / 1024:.2f}MB"
         )
 
@@ -583,7 +592,8 @@ class ImageRenderService:
 
     def cleanup(self) -> None:
         """清理渲染缓存。"""
-        self._gif_base64_cache.clear()
+        with self._gif_cache_lock:
+            self._gif_base64_cache.clear()
         logger.debug("ImageRenderService 缓存已清理")
 
 

@@ -130,8 +130,13 @@ class IndexManager:
             try:
                 entry = await asyncio.to_thread(self.db_service.get_emoji, path)
                 await embedding.delete_by_path(path)
-                if entry and await embedding.insert_emoji(path, entry) is False:
-                    raise RuntimeError("embedding provider unavailable")
+                if entry:
+                    build_text = getattr(embedding, "_build_search_text", None)
+                    search_text = build_text(entry) if callable(build_text) else None
+                    if isinstance(search_text, str) and not search_text.strip():
+                        logger.debug(f"[Embedding] 跳过空文本条目，避免无限重试: {path}")
+                    elif await embedding.insert_emoji(path, entry) is False:
+                        raise RuntimeError("embedding provider unavailable")
             except Exception as exc:
                 error = str(exc) or type(exc).__name__
                 limiter = getattr(embedding, "warning_rate_limited", None)

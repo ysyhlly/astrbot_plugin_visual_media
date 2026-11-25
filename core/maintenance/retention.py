@@ -2,9 +2,13 @@
 
 import math
 import os
+from collections.abc import Collection
+
+from ..util.normalization import canonicalize_path
 
 DEFAULT_MAX_DISK_BYTES = 256 * 1024 * 1024  # 256 MB
 DEFAULT_MAX_PENDING_DISK_BYTES = 128 * 1024 * 1024  # 128 MB
+PROTECTED_PENDING_STATUSES = frozenset({"queued", "processing", "approved"})
 
 
 def library_group(meta: dict) -> str:
@@ -128,14 +132,45 @@ def eviction_candidates(
     return [(path, created) for path, _, created, _ in selected]
 
 
+def is_pending_evictable(
+    row: object,
+    *,
+    protected_paths: Collection[str] | None = None,
+) -> bool:
+    """Return whether a pending row may be evicted by disk quota cleanup.
+
+    Strictly protects in-flight VLM jobs (``queued`` / ``processing``),
+    already-approved entries (``approved``), and any path still referenced
+    by the live library.
+    """
+    if not isinstance(row, dict):
+        return False
+    path = str(row.get("path") or "").strip()
+    if not path:
+        return False
+    status = str(row.get("review_status") or "pending").strip().lower()
+    if status in PROTECTED_PENDING_STATUSES:
+        return False
+    if protected_paths and canonicalize_path(path) in protected_paths:
+        return False
+    return True
+
+
 def pending_eviction_candidates(
     pending_rows: list[dict],
     max_disk_bytes: int | None = DEFAULT_MAX_PENDING_DISK_BYTES,
+    *,
+    protected_paths: Collection[str] | None = None,
 ) -> list[dict]:
-    """Select oldest pending entries to evict when pending/ disk usage exceeds ``max_disk_bytes``."""
+    """Select oldest evictable pending entries when pending/ disk usage exceeds ``max_disk_bytes``."""
     byte_cap = int(max_disk_bytes) if max_disk_bytes is not None and max_disk_bytes > 0 else 0
     if byte_cap <= 0 or not pending_rows:
         return []
+    normalized_protected = (
+        {canonicalize_path(p) for p in protected_paths if p}
+        if protected_paths
+        else None
+    )
     sized: list[tuple[int, int, str, dict, int]] = []
     total_bytes = 0
     for row in pending_rows:
@@ -146,6 +181,8 @@ def pending_eviction_candidates(
             continue
         size = entry_file_size(path, row)
         total_bytes += size
+        if not is_pending_evictable(row, protected_paths=normalized_protected):
+            continue
         created_raw = row.get("created_at")
         try:
             created = int(nonnegative_number(created_raw, 0))

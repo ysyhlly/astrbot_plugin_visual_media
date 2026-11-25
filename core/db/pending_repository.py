@@ -495,20 +495,44 @@ class PendingRepository:
             conn.execute("COMMIT")
             return {"path": row["path"], "hash": row["hash"]}
 
-    def delete_pending_batch(self, ids: list[int]) -> list[dict[str, Any]]:
-        """批量删除待审核记录，返回每条被删行的 {path, hash}。"""
+    def delete_pending_batch(
+        self,
+        ids: list[int],
+        *,
+        exclude_statuses: tuple[str, ...] = ("processing",),
+    ) -> list[dict[str, Any]]:
+        """批量删除待审核记录，返回每条实际被删行的 {path, hash}。"""
         clean_ids = [i for i in ids if isinstance(i, int)]
         if not clean_ids:
             return []
+        excluded = tuple(
+            str(s).strip().lower()
+            for s in (exclude_statuses or ())
+            if str(s or "").strip()
+        )
         with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             placeholders = ",".join("?" * len(clean_ids))
+            params: list[Any] = list(clean_ids)
+            status_clause = ""
+            if excluded:
+                status_placeholders = ",".join("?" * len(excluded))
+                status_clause = (
+                    f" AND LOWER(COALESCE(review_status, 'pending')) "
+                    f"NOT IN ({status_placeholders})"
+                )
+                params.extend(excluded)
             rows = conn.execute(
-                f"SELECT id, path, hash FROM emoji_pending WHERE id IN ({placeholders}) AND review_status != 'processing'",
-                clean_ids,
+                f"SELECT id, path, hash FROM emoji_pending "
+                f"WHERE id IN ({placeholders}){status_clause}",
+                params,
             ).fetchall()
-            conn.execute(
-                f"DELETE FROM emoji_pending WHERE id IN ({placeholders}) AND review_status != 'processing'", clean_ids
-            )
+            if rows:
+                delete_ids = [r["id"] for r in rows]
+                del_placeholders = ",".join("?" * len(delete_ids))
+                conn.execute(
+                    f"DELETE FROM emoji_pending WHERE id IN ({del_placeholders})",
+                    delete_ids,
+                )
             conn.execute("COMMIT")
             return [{"path": r["path"], "hash": r["hash"]} for r in rows]

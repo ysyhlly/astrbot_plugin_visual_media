@@ -276,49 +276,53 @@ class VisionHandler:
         if not self.vision_provider_id:
             return None
 
-        # 视觉识别前确保拿到可读取的本地文件路径（URL 需要先下载）
         local_path = image_path
-        if isinstance(image_path, str) and image_path.startswith(
-            ("http://", "https://")
-        ):
-            try:
-                if self.api_client and hasattr(self.api_client, "_get_session"):
-                    session = await self.api_client._get_session()
-                    _, downloaded = await self.api_client._download_image(
-                        image_path, session, use_cache=False
-                    )
-                    if downloaded and Path(downloaded).exists():
-                        local_path = downloaded
-            except Exception as e:
-                logger.debug(f"[GRID_DETECT] 下载图片失败，回退使用原始URL: {e}")
-
+        downloaded_path: Path | None = None
         tmp_path: Path | None = None
         try:
-            with PILImage.open(local_path) as img:
-                width, height = img.size
-                max_side = max(width, height)
+            # 视觉识别前确保拿到可读取的本地文件路径（URL 需要先下载）
+            if isinstance(image_path, str) and image_path.startswith(
+                ("http://", "https://")
+            ):
+                try:
+                    if self.api_client and hasattr(self.api_client, "_get_session"):
+                        session = await self.api_client._get_session()
+                        _, downloaded = await self.api_client._download_image(
+                            image_path, session, use_cache=False
+                        )
+                        if downloaded:
+                            candidate = Path(downloaded)
+                            if candidate.exists():
+                                downloaded_path = candidate
+                                local_path = str(candidate)
+                except Exception as e:
+                    logger.debug(f"[GRID_DETECT] 下载图片失败，回退使用原始URL: {e}")
+
+            try:
+                with PILImage.open(local_path) as img:
+                    width, height = img.size
+                    max_side = max(width, height)
+                    vision_input_path = local_path
+                    if max_side > 1200:
+                        ratio = 1200 / max_side
+                        new_w = int(width * ratio)
+                        new_h = int(height * ratio)
+                        img = img.resize((new_w, new_h))
+                        tmp_file = tempfile.NamedTemporaryFile(
+                            prefix=f"grid_detect_{Path(local_path).stem}_",
+                            suffix=".png",
+                            delete=False,
+                        )
+                        tmp_path = Path(tmp_file.name)
+                        tmp_file.close()
+                        img.save(tmp_path, format="PNG")
+                        vision_input_path = str(tmp_path)
+            except Exception as e:
+                logger.debug(f"[GRID_DETECT] 读取/压缩图片失败，使用原图: {e}")
                 vision_input_path = local_path
-                if max_side > 1200:
-                    ratio = 1200 / max_side
-                    new_w = int(width * ratio)
-                    new_h = int(height * ratio)
-                    img = img.resize((new_w, new_h))
-                    tmp_file = tempfile.NamedTemporaryFile(
-                        prefix=f"grid_detect_{Path(local_path).stem}_",
-                        suffix=".png",
-                        delete=False,
-                    )
-                    tmp_path = Path(tmp_file.name)
-                    tmp_file.close()
-                    img.save(tmp_path, format="PNG")
-                    vision_input_path = str(tmp_path)
-        except Exception as e:
-            logger.debug(f"[GRID_DETECT] 读取/压缩图片失败，使用原图: {e}")
-            vision_input_path = local_path
 
-        prompt = get_grid_detect_prompt()
+            prompt = get_grid_detect_prompt()
 
-        try:
             resp = await series_llm_call(
                 self.context,
                 self.vision_provider_id,
@@ -355,12 +359,12 @@ class VisionHandler:
                 return rows, cols
         except Exception as e:
             logger.debug(f"[GRID_DETECT] 视觉识别失败: {e}")
-
         finally:
-            if tmp_path:
-                try:
-                    tmp_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+            for artifact in (tmp_path, downloaded_path):
+                if artifact is not None:
+                    try:
+                        artifact.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
         return None

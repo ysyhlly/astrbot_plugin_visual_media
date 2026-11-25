@@ -293,6 +293,43 @@ class EmbeddingService:
         self._faiss_db = None
         self._faiss_available = None
 
+    def _cleanup_stale_faiss_files(self, active_signature: str) -> int:
+        """切换嵌入模型时清理旧签名遗留的 emoji_faiss_{old_sig}.* 索引文件。"""
+        active_short = str(active_signature or "").split(":")[-1][:24]
+        try:
+            data_dir = Path(self._resolve_data_dir())
+        except Exception as exc:
+            logger.debug(f"[Embedding] 解析数据目录失败，跳过旧 Faiss 文件清理: {exc}")
+            return 0
+        if not data_dir.is_dir():
+            return 0
+
+        keep_prefix = f"emoji_faiss_{active_short}." if active_short else ""
+        removed = 0
+        for pattern in (
+            "emoji_faiss_*.db",
+            "emoji_faiss_*.db-wal",
+            "emoji_faiss_*.db-shm",
+            "emoji_faiss_*.index",
+            "emoji_faiss.db",
+            "emoji_faiss.db-wal",
+            "emoji_faiss.db-shm",
+            "emoji_faiss.index",
+        ):
+            for candidate in data_dir.glob(pattern):
+                if not candidate.is_file():
+                    continue
+                if keep_prefix and candidate.name.startswith(keep_prefix):
+                    continue
+                try:
+                    candidate.unlink()
+                    removed += 1
+                except OSError as exc:
+                    logger.debug(f"[Embedding] 删除旧 Faiss 文件失败 {candidate}: {exc}")
+        if removed > 0:
+            logger.info(f"[Embedding] 模型切换已清理 {removed} 个旧 Faiss 索引文件")
+        return removed
+
     async def _ensure_provider_ready(self):
         async with self._provider_ready_lock:
             provider = self._get_provider()
@@ -309,11 +346,12 @@ class EmbeddingService:
             if self._provider_identity(provider) != identity:
                 self._observed_identity = ""
                 raise ValueError("嵌入模型在请求期间发生变化")
+            signature = self._fallback_signature(provider)
             db = getattr(self.plugin, "db_service", None)
             if db is not None:
-                signature = self._fallback_signature(provider)
                 previous = await asyncio.to_thread(db.get_meta_value, "embedding_active_signature")
                 if previous != signature:
+                    await asyncio.to_thread(self._cleanup_stale_faiss_files, signature)
                     await asyncio.to_thread(db.enqueue_search_refresh, db.get_all_paths())
                     await asyncio.to_thread(db.set_meta_value, "embedding_active_signature", signature)
 
@@ -565,7 +603,7 @@ class EmbeddingService:
             self.warning_rate_limited("probe", f"[Embedding] 模型检测等待重试: {exc}")
             return False
 
-        text = self._build_search_text(entry)
+        text = self._build_search_text(entry).strip()
         if not text:
             return False
 
@@ -888,8 +926,12 @@ class EmbeddingService:
             batch = missing[start:start + batch_size]
             generations = await asyncio.to_thread(db.get_search_refresh_generations, batch)
             entries = await asyncio.to_thread(db.get_entries, batch)
-            items = [(path, entry, self._build_search_text(entry)[:4000]) for path, entry in entries.items()]
-            items = [item for item in items if item[2]]
+            all_items = [
+                (path, entry, self._build_search_text(entry).strip()[:4000])
+                for path, entry in entries.items()
+            ]
+            skipped_empty = [path for path, _entry, text in all_items if not text]
+            items = [item for item in all_items if item[2]]
             successful = []
             if using_faiss and items:
                 try:
@@ -919,7 +961,7 @@ class EmbeddingService:
                     else:
                         await asyncio.to_thread(db.enqueue_search_refresh, [path])
             written += len(successful)
-            for path in successful:
+            for path in (*successful, *skipped_empty):
                 if path in generations:
                     await asyncio.to_thread(db.finish_search_refresh, path, generations[path])
         self.invalidate_cache()
@@ -952,14 +994,7 @@ class EmbeddingService:
             self._faiss_db = None
             self._faiss_available = None
 
-        data_dir = Path(self._resolve_data_dir())
-        for name in ("emoji_faiss.db", "emoji_faiss.index"):
-            path = data_dir / name
-            try:
-                if path.exists():
-                    path.unlink()
-            except Exception as e:
-                logger.debug(f"[Embedding] 删除旧 Faiss 文件失败 {path}: {e}")
+        await asyncio.to_thread(self._cleanup_stale_faiss_files, "")
 
         if hasattr(db, "clear_all_embeddings"):
             try:

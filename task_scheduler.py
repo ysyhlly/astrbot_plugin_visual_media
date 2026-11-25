@@ -60,11 +60,11 @@ class TaskScheduler:
             return None
 
     async def cancel_task(self, name: str) -> bool:
-        if name not in self._tasks:
+        task = self._tasks.get(name)
+        if task is None:
             return False
 
         try:
-            task = self._tasks[name]
             if not task.done():
                 try:
                     task.cancel()
@@ -73,7 +73,8 @@ class TaskScheduler:
                     pass
                 except Exception as e:
                     logger.error(f"任务 {name} 取消时出错: {e}")
-            del self._tasks[name]
+            if self._tasks.get(name) is task:
+                self._tasks.pop(name, None)
             logger.info(f"取消任务: {name}")
             return True
         except Exception as e:

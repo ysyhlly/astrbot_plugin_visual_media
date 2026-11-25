@@ -13,6 +13,7 @@ from ..util.safe_io import safe_remove_file
 from .retention import (
     DEFAULT_MAX_DISK_BYTES,
     DEFAULT_MAX_PENDING_DISK_BYTES,
+    PROTECTED_PENDING_STATUSES,
     automatic_disk_bytes,
     library_counts,
     pending_eviction_candidates,
@@ -147,24 +148,86 @@ class MaintenanceService:
             if not pending:
                 return 0
 
+            library_paths: set[str] = set()
+            if hasattr(db, "get_all_paths"):
+                try:
+                    library_paths = {
+                        canonicalize_path(p)
+                        for p in await asyncio.to_thread(db.get_all_paths)
+                        if p
+                    }
+                except Exception:
+                    library_paths = set()
+
             evict_rows = await asyncio.to_thread(
-                pending_eviction_candidates, pending, max_pending_bytes
+                pending_eviction_candidates,
+                pending,
+                max_pending_bytes,
+                protected_paths=library_paths,
             )
             if not evict_rows:
                 return 0
 
             evict_ids = [row["id"] for row in evict_rows if row.get("id") is not None]
-            for row in evict_rows:
-                path = str(row.get("path") or "")
-                if path:
-                    await safe_remove_file(path)
-            if evict_ids:
-                await asyncio.to_thread(db.delete_pending_batch, evict_ids)
+            if not evict_ids:
+                return 0
+
+            # 必须先原子删除 DB 记录（同时排除 queued/processing/approved），
+            # 再按实际被删记录清理磁盘孤儿文件，避免并发批准或在途 VLM 原图被误删。
+            protected_statuses = tuple(sorted(PROTECTED_PENDING_STATUSES))
+
+            def _delete_pending_records():
+                try:
+                    return db.delete_pending_batch(
+                        evict_ids, exclude_statuses=protected_statuses
+                    )
+                except TypeError:
+                    return db.delete_pending_batch(evict_ids)
+
+            deleted_rows = await asyncio.to_thread(_delete_pending_records)
+            if isinstance(deleted_rows, list):
+                paths_to_remove = [
+                    str(row.get("path") or "")
+                    for row in deleted_rows
+                    if isinstance(row, dict) and row.get("path")
+                ]
+            else:
+                paths_to_remove = [
+                    str(row.get("path") or "")
+                    for row in evict_rows
+                    if row.get("path")
+                ]
+
+            if not paths_to_remove:
+                return 0
+
+            # 删盘前二次核对正式库路径，防止并发 approve 在两次查询间已引用该文件。
+            live_library_paths = library_paths
+            if hasattr(db, "get_all_paths"):
+                try:
+                    live_library_paths = {
+                        canonicalize_path(p)
+                        for p in await asyncio.to_thread(db.get_all_paths)
+                        if p
+                    }
+                except Exception:
+                    pass
+
+            removed = 0
+            for path in paths_to_remove:
+                if canonicalize_path(path) in live_library_paths:
+                    logger.debug(
+                        f"[PendingCap] 跳过已被正式库引用的路径，避免误删原图: {path}"
+                    )
+                    continue
+                await safe_remove_file(path)
+                removed += 1
+
             logger.info(
-                f"[PendingCap] Evicted {len(evict_rows)} oldest pending items to stay under "
+                f"[PendingCap] Evicted {removed} oldest pending items to stay under "
                 f"{max_pending_bytes / (1024 * 1024):.1f} MB"
             )
-            return len(evict_rows)
+            return removed
         except Exception as e:
             logger.debug(f"[PendingCap] pending 容量控制异常（不阻塞）: {e}")
             return 0
