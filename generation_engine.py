@@ -464,6 +464,7 @@ class GeminiImageGenerationPlugin(Component):
                 providers_service=self.studio_providers,
                 templates_service=self.studio_templates,
                 is_closed=lambda: self._web_closed,
+                context=self.context,
             )
             self._web_routes = self._web_api.register(self.context)
             logger.info(f"[WebUI] 工作台路由注册完成: 路由数={len(self._web_routes)}")

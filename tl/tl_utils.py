@@ -263,6 +263,8 @@ async def save_image_stream(
     stream_reader,
     image_format: str = "png",
     target_path: Path | None = None,
+    *,
+    max_bytes: int = 50 * 1024 * 1024,
 ) -> str | None:
     """
     将异步流式读取到的图片保存到文件，避免一次性加载到内存
@@ -271,26 +273,39 @@ async def save_image_stream(
         stream_reader: aiohttp.StreamReader 或任意异步可迭代的字节流
         image_format: 图片格式
         target_path: 指定文件路径，便于缓存复用
+        max_bytes: 单图最大字节数上限
 
     Raises:
         APIError: 会话工作区不可用时抛出（不落盘）
     """
     file_path = target_path or _build_image_path(image_format)
+    total = 0
     try:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         with open(file_path, "wb") as f:
             if hasattr(stream_reader, "iter_chunked"):
                 async for chunk in stream_reader.iter_chunked(8192):
                     if chunk:
+                        total += len(chunk)
+                        if max_bytes > 0 and total > max_bytes:
+                            raise ValueError(f"流式图像超过单图字节上限 ({max_bytes} bytes)")
                         f.write(chunk)
             else:
                 async for chunk in stream_reader:
                     if chunk:
+                        total += len(chunk)
+                        if max_bytes > 0 and total > max_bytes:
+                            raise ValueError(f"流式图像超过单图字节上限 ({max_bytes} bytes)")
                         f.write(chunk)
 
         logger.debug(f"图像已流式保存: {file_path}")
         return str(file_path)
     except Exception as e:
+        try:
+            if file_path.exists():
+                file_path.unlink()
+        except OSError:
+            pass
         logger.error(f"流式保存图像失败: {e}")
         return None
 
@@ -785,18 +800,65 @@ async def resolve_image_source_to_path(
                     )
 
             if not data_url:
+                from .core.path_policy import validate_remote_url_async
+                from .core.remote_fetch import _SSRFGuardedResolver
+                from .reference_image import (
+                    MAX_REFERENCE_IMAGE_BYTES,
+                    MAX_REFERENCE_IMAGE_REDIRECTS,
+                    _REDIRECT_STATUSES,
+                    _read_bounded_response,
+                )
+
+                trust_env_flag = not is_qq
+                has_env_proxy = trust_env_flag and any(
+                    os.environ.get(key)
+                    for key in (
+                        "HTTP_PROXY",
+                        "HTTPS_PROXY",
+                        "ALL_PROXY",
+                        "http_proxy",
+                        "https_proxy",
+                        "all_proxy",
+                    )
+                )
+                safe_url = await validate_remote_url_async(
+                    src, resolve_dns=not has_env_proxy
+                )
                 timeout = aiohttp.ClientTimeout(total=12, connect=5)
                 headers = build_reference_image_headers(parsed_host, for_qq=is_qq)
-                trust_env_flag = not is_qq
+                connector = aiohttp.TCPConnector(
+                    resolver=None if has_env_proxy else _SSRFGuardedResolver()
+                )
                 async with aiohttp.ClientSession(
-                    headers=headers, trust_env=trust_env_flag
+                    headers=headers, trust_env=trust_env_flag, connector=connector
                 ) as session:
-                    async with session.get(src, timeout=timeout) as resp:
-                        if resp.status == 200:
-                            mime = resp.headers.get("Content-Type", "image/png")
-                            content = await resp.read()
-                            b64 = base64.b64encode(content).decode()
-                            data_url = f"data:{mime};base64,{b64}"
+                    current_url = safe_url
+                    for hop in range(MAX_REFERENCE_IMAGE_REDIRECTS + 1):
+                        current_url = await validate_remote_url_async(
+                            current_url, resolve_dns=not has_env_proxy
+                        )
+                        async with session.get(
+                            current_url, timeout=timeout, allow_redirects=False
+                        ) as resp:
+                            if resp.status in _REDIRECT_STATUSES:
+                                if hop >= MAX_REFERENCE_IMAGE_REDIRECTS:
+                                    break
+                                location = resp.headers.get("Location", "")
+                                if not location:
+                                    break
+                                current_url = await validate_remote_url_async(
+                                    urllib.parse.urljoin(current_url, location),
+                                    resolve_dns=not has_env_proxy,
+                                )
+                                continue
+                            if resp.status == 200:
+                                mime = resp.headers.get("Content-Type", "image/png")
+                                content = await _read_bounded_response(
+                                    resp, MAX_REFERENCE_IMAGE_BYTES
+                                )
+                                b64 = base64.b64encode(content).decode()
+                                data_url = f"data:{mime};base64,{b64}"
+                            break
 
             # 使用统一的解码函数
             if data_url and is_valid_checker(data_url):

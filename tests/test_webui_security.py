@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,8 +14,27 @@ from tests.test_web_api import _api, _Context, _match
 from tl.generation_tracker import GenerationTracker
 
 
+def _install_dashboard_auth(monkeypatch, *, verified_user: str | None = "admin"):
+    auth_mod = types.ModuleType("astrbot.dashboard.api.auth")
+
+    async def require_dashboard_user(_raw):
+        if not verified_user:
+            raise PermissionError("unauthenticated")
+        return verified_user
+
+    auth_mod.require_dashboard_user = require_dashboard_user
+    dash_mod = sys.modules.get("astrbot.dashboard") or types.ModuleType("astrbot.dashboard")
+    api_mod = sys.modules.get("astrbot.dashboard.api") or types.ModuleType("astrbot.dashboard.api")
+    api_mod.auth = auth_mod
+    dash_mod.api = api_mod
+    monkeypatch.setitem(sys.modules, "astrbot.dashboard", dash_mod)
+    monkeypatch.setitem(sys.modules, "astrbot.dashboard.api", api_mod)
+    monkeypatch.setitem(sys.modules, "astrbot.dashboard.api.auth", auth_mod)
+
+
 def route(api, path, method):
     context = _Context()
+    context.get_config = lambda: {"dashboard": {"username": "admin"}}
     api.register(context)
     matched = _match(
         context.registered_web_apis,
@@ -25,14 +46,28 @@ def route(api, path, method):
 
 
 def set_request(
-    monkeypatch, *, username, method, headers=None, query=None, payload=None
+    monkeypatch,
+    *,
+    username,
+    method,
+    headers=None,
+    query=None,
+    payload=None,
+    verified_user=None,
 ):
     import tl.web_api as module
 
+    _install_dashboard_auth(
+        monkeypatch,
+        verified_user=username if verified_user is None else verified_user,
+    )
     raw = SimpleNamespace(
         _body=b"",
         _receive=None,
         url=SimpleNamespace(scheme="https"),
+        headers=headers or {},
+        cookies={},
+        method=method,
     )
     adapter = SimpleNamespace(
         username=username,
@@ -128,22 +163,68 @@ async def test_fetch_metadata_cross_site_post_is_rejected(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_api_key_can_read_history_and_generate(tmp_path, monkeypatch):
+async def test_api_key_is_rejected_on_all_studio_routes_under_series_admin(
+    tmp_path, monkeypatch
+):
     api = _api(tmp_path, monkeypatch)
     history, history_kwargs = route(api, "/history", "GET")
     set_request(monkeypatch, username="api_key:key-1", method="GET", query={})
-    assert (await history(**history_kwargs)).status_code == 200
+    assert (await history(**history_kwargs)).status_code == 403
 
     generate, generate_kwargs = route(api, "/generate", "POST")
     set_request(
         monkeypatch,
         username="api_key:key-1",
         method="POST",
+        headers={
+            "Host": "dashboard.local",
+            "Origin": "https://dashboard.local",
+            "Sec-Fetch-Site": "same-origin",
+        },
+        payload={"prompt": "draw"},
+    )
+    response = await generate(**generate_kwargs)
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_can_read_history_and_generate_with_same_origin(
+    tmp_path, monkeypatch
+):
+    api = _api(tmp_path, monkeypatch)
+    history, history_kwargs = route(api, "/history", "GET")
+    set_request(monkeypatch, username="admin", method="GET", query={})
+    assert (await history(**history_kwargs)).status_code == 200
+
+    generate, generate_kwargs = route(api, "/generate", "POST")
+    set_request(
+        monkeypatch,
+        username="admin",
+        method="POST",
+        headers={
+            "Host": "dashboard.local",
+            "Origin": "https://dashboard.local",
+            "Sec-Fetch-Site": "same-origin",
+        },
         payload={"prompt": "draw"},
     )
     response = await generate(**generate_kwargs)
     assert response.status_code == 202
     assert json.loads(response.body)["data"]["job_id"] == "job-one"
+
+
+@pytest.mark.asyncio
+async def test_cross_site_delete_is_rejected(tmp_path, monkeypatch):
+    api = _api(tmp_path, monkeypatch)
+    handler, kwargs = route(api, "/templates/hub/key", "DELETE")
+    set_request(
+        monkeypatch,
+        username="admin",
+        method="DELETE",
+        headers={"Host": "dashboard.local", "Origin": "https://evil.local"},
+    )
+    response = await handler(**kwargs)
+    assert response.status_code == 403
 
 
 @pytest.mark.asyncio

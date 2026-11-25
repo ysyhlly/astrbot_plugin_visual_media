@@ -1,10 +1,13 @@
-"""Dashboard API for the integrated library; reuse host authorization guards."""
+"""Dashboard API for the integrated library; reuse unified series admin & CSRF guards."""
 
 import asyncio
 
 from astrbot.api.web import json_response, request
 
-from .tl.web_api import WebStudioAPI
+try:
+    from .series_panels import require_series_admin
+except ImportError:
+    from series_panels import require_series_admin
 
 
 class MediaAPI:
@@ -32,10 +35,17 @@ class MediaAPI:
                 "Visual Media library",
             )
 
-    def guard(self):
-        denied = WebStudioAPI._access_guard("/providers")
-        if denied is not None:
-            return denied
+    async def guard(self, *, check_csrf: bool = True):
+        try:
+            await require_series_admin(
+                getattr(self.owner, "context", None),
+                request,
+                check_csrf=check_csrf,
+            )
+        except PermissionError as exc:
+            return json_response(
+                {"status": "error", "message": str(exc)}, status_code=403
+            )
         if self.owner._closed:
             return json_response(
                 {"status": "error", "message": "插件正在关闭"}, status_code=503
@@ -43,7 +53,7 @@ class MediaAPI:
         return None
 
     async def overview(self):
-        if (denied := self.guard()) is not None:
+        if (denied := await self.guard(check_csrf=False)) is not None:
             return denied
         gen = self.owner.generation
         history = gen.generation_tracker.query_history(
@@ -62,7 +72,7 @@ class MediaAPI:
         )
 
     async def references(self):
-        if (denied := self.guard()) is not None:
+        if (denied := await self.guard(check_csrf=False)) is not None:
             return denied
         try:
             page = max(1, min(10000, int(request.query.get("page", "1"))))
@@ -108,7 +118,7 @@ class MediaAPI:
         return json_response({"status": "ok", "data": await asyncio.to_thread(listing)})
 
     async def reference_image(self):
-        if (denied := self.guard()) is not None:
+        if (denied := await self.guard(check_csrf=False)) is not None:
             return denied
         import base64
         import io
@@ -145,7 +155,7 @@ class MediaAPI:
             )
 
     async def tasks(self):
-        if (denied := self.guard()) is not None:
+        if (denied := await self.guard(check_csrf=False)) is not None:
             return denied
         try:
             job_id = request.query.get("job_id")
@@ -164,7 +174,7 @@ class MediaAPI:
             )
 
     async def task_preview(self):
-        if (denied := self.guard()) is not None:
+        if (denied := await self.guard(check_csrf=False)) is not None:
             return denied
         import base64
         import io
@@ -198,7 +208,7 @@ class MediaAPI:
             )
 
     async def recover_task(self):
-        if (denied := self.guard()) is not None:
+        if (denied := await self.guard(check_csrf=True)) is not None:
             return denied
         try:
             data = await request.json()
@@ -214,7 +224,7 @@ class MediaAPI:
             )
 
     async def behavior(self):
-        if (denied := self.guard()) is not None:
+        if (denied := await self.guard(check_csrf=False)) is not None:
             return denied
         store = self.owner.behavior
         records, preferences = await asyncio.gather(
@@ -236,7 +246,7 @@ class MediaAPI:
         )
 
     async def reset_preference(self):
-        if (denied := self.guard()) is not None:
+        if (denied := await self.guard(check_csrf=True)) is not None:
             return denied
         import re
 
@@ -252,7 +262,7 @@ class MediaAPI:
         return json_response({"status": "ok", "data": {"reset": True}})
 
     async def save(self):
-        if (denied := self.guard()) is not None:
+        if (denied := await self.guard(check_csrf=True)) is not None:
             return denied
         try:
             data = await request.json()
@@ -272,7 +282,7 @@ class MediaAPI:
             )
 
     async def profiles(self):
-        if (denied := self.guard()) is not None:
+        if (denied := await self.guard(check_csrf=True)) is not None:
             return denied
         try:
             if request.method == "GET":
@@ -293,7 +303,7 @@ class MediaAPI:
             )
 
     async def generate(self):
-        if (denied := self.guard()) is not None:
+        if (denied := await self.guard(check_csrf=True)) is not None:
             return denied
         from .tl.plugin_service import PluginServiceError
 

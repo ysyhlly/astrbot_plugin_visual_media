@@ -35,14 +35,37 @@ def app_for(owner):
 
 
 @pytest.mark.asyncio
-async def test_real_http_library_and_studio_contracts(owner):
+async def test_real_http_library_and_studio_contracts(owner, monkeypatch):
+    import astrbot.dashboard.api.auth as dash_auth
+
+    async def fake_require_dashboard_user(raw_request):
+        user = raw_request.headers.get("x-test-user")
+        if not user:
+            raise PermissionError("需要登录")
+        return user
+
+    monkeypatch.setattr(dash_auth, "require_dashboard_user", fake_require_dashboard_user)
+    orig_get_config = owner.context.get_config
+
+    def patched_get_config():
+        cfg = dict(orig_get_config() or {})
+        cfg.setdefault("dashboard", {"username": "admin"})
+        if not cfg["dashboard"].get("username"):
+            cfg["dashboard"] = {**cfg["dashboard"], "username": "admin"}
+        return cfg
+
+    monkeypatch.setattr(owner.context, "get_config", patched_get_config)
+
     app = app_for(owner)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         prefix = "/astrbot_plugin_visual_media"
         assert (await client.get(prefix + "/media/overview")).status_code == 403
+        assert (await client.get(prefix + "/images")).status_code == 403
         client.headers["x-test-user"] = "admin"
+        client.headers["origin"] = "http://test"
+        client.headers["sec-fetch-site"] = "same-origin"
         overview = await client.get(prefix + "/media/overview")
         assert overview.status_code == 200
         assert overview.json()["data"]["memes"] == 0
@@ -73,7 +96,12 @@ async def test_real_http_library_and_studio_contracts(owner):
         assert (
             await client.post(prefix + "/media/profiles", json={"key": "denied"})
         ).status_code == 403
-        del client.headers["origin"]
+        assert (
+            await client.request(
+                "DELETE", prefix + "/media/profiles", json={"key": "anan"}
+            )
+        ).status_code == 403
+        client.headers["origin"] = "http://test"
         client.headers["x-test-user"] = "api_key:limited"
         assert (
             await client.post(prefix + "/media/profiles", json={"key": "denied"})

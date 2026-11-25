@@ -2043,6 +2043,28 @@ class GeminiAPIClient:
         cleaned_url = (
             image_url.replace("&amp;", "&") if isinstance(image_url, str) else image_url
         )
+        from .core.errors import PathPolicyError
+        from .core.path_policy import validate_remote_url_async
+        from .reference_image import (
+            MAX_REFERENCE_IMAGE_REDIRECTS,
+            _REDIRECT_STATUSES,
+            _SENSITIVE_REDIRECT_HEADERS,
+            _url_origin,
+        )
+
+        request_proxy = (
+            self._http_proxy if proxy is _DOWNLOAD_PROXY_DEFAULT else proxy
+        )
+        resolve_dns = not bool(request_proxy)
+
+        try:
+            cleaned_url = await validate_remote_url_async(
+                str(cleaned_url or ""), resolve_dns=resolve_dns
+            )
+        except PathPolicyError as e:
+            logger.warning("下载图像被安全策略拒绝: %s", e)
+            return None, None
+
         parsed = urllib.parse.urlparse(cleaned_url)
         is_http = parsed.scheme in {"http", "https"}
         cache_key = None
@@ -2089,125 +2111,171 @@ class GeminiAPIClient:
                     max_retries,
                 )
 
-                request_proxy = (
-                    self._http_proxy if proxy is _DOWNLOAD_PROXY_DEFAULT else proxy
-                )
+                current_url = cleaned_url
+                req_headers = dict(headers)
 
-                async with session.get(
-                    cleaned_url,
-                    timeout=aiohttp.ClientTimeout(total=30),
-                    proxy=request_proxy,
-                    headers=headers or None,
-                ) as response:
-                    if response.status != 200:
-                        try:
-                            err_text = await response.text()
-                        except Exception:
-                            err_text = ""
-
-                        response_reason = response.reason or ""
-                        response_content_type = response.headers.get("Content-Type", "")
-                        query_params = urllib.parse.parse_qs(parsed.query)
-                        param_issues: list[str] = []
-
-                        # 仅在出现 400 错误时进行参数合法性检查
-                        if response.status == 400:
-                            appid = (query_params.get("appid") or [None])[0]
-                            if appid and not re.fullmatch(r"[A-Za-z0-9]+", appid):
-                                param_issues.append("appid 格式异常（仅允许字母数字）")
-
-                            fileid = (query_params.get("fileid") or [None])[0]
-                            if fileid and not re.fullmatch(r"[A-Za-z0-9._-]+", fileid):
-                                param_issues.append(
-                                    "fileid 格式异常（仅允许字母数字、.、_、-）"
-                                )
-
-                            rkey = (query_params.get("rkey") or [None])[0]
-                            if rkey and re.search(r"[^A-Za-z0-9._-]", rkey):
-                                param_issues.append("rkey 包含特殊字符")
-
-                            spec = (query_params.get("spec") or [None])[0]
-                            if spec and not str(spec).isdigit():
-                                param_issues.append("spec 参数应为数字")
-
-                        # 根据响应内容与校验结果给出建议
-                        suggestions: list[str] = []
-                        if " " in cleaned_url or "%20" in cleaned_url:
-                            suggestions.append("URL格式错误 → 检查URL编码")
-                        if param_issues:
-                            suggestions.append("参数错误 → 检查参数格式")
-                        err_lower = err_text.lower() if err_text else ""
-                        if any(keyword in err_lower for keyword in ["auth", "key"]):
-                            suggestions.append("认证错误 → 检查API密钥")
-                        if any(
-                            keyword in err_lower
-                            for keyword in ["limit", "频率", "限制"]
-                        ):
-                            suggestions.append("服务器限制 → 建议稍后重试")
-                        if not suggestions:
-                            suggestions.append("服务器限制 → 建议稍后重试")
-
-                        logger.error(
-                            "下载图像失败: HTTP %s %s url=%s 响应摘要=%s 建议=%s",
-                            response.status,
-                            response_reason,
-                            redact_url(cleaned_url),
-                            redact_text(err_text[:200])[:200],
-                            "；".join(dict.fromkeys(suggestions)),
-                        )
-
-                        logger.debug(
-                            "HTTP 400 参数检查结果: %s",
-                            "; ".join(param_issues)
-                            if param_issues
-                            else "未发现明显异常",
-                        )
-                        logger.debug("完整请求头: %s", headers or {})
-                        logger.debug(
-                            "User-Agent: %s", (headers or {}).get("User-Agent", "")
-                        )
-                        logger.debug(
-                            "Content-Type: %s, Accept: %s",
-                            (headers or {}).get("Content-Type", "未设置"),
-                            (headers or {}).get("Accept", "未设置"),
-                        )
-                        logger.debug(
-                            "服务器响应详情: status=%s, reason=%s, phrase=%s, content-type=%s",
-                            response.status,
-                            response_reason,
-                            getattr(response, "reason", ""),
-                            response_content_type,
-                        )
-                        logger.debug(
-                            "服务器响应体预览: %s",
-                            redact_text(err_text)[:1000] if err_text else "<empty>",
-                        )
-
-                        if response.status == 400 and attempt < max_retries:
-                            await asyncio.sleep(retry_interval * attempt)
-                            continue
-                        return None, None
-
-                    content_type = response.headers.get("Content-Type", "")
-
-                    if "/" in content_type:
-                        image_format = content_type.split("/")[1].split(";")[0] or "png"
-                    else:
-                        image_format = "png"
-
-                    target_path = None
-                    if cache_key:
-                        target_path = (
-                            REFERENCE_IMAGE_CACHE_DIR / f"{cache_key}.{image_format}"
-                        )
-
-                    image_path = await save_image_stream(
-                        response.content, image_format, target_path=target_path
+                for hop in range(MAX_REFERENCE_IMAGE_REDIRECTS + 1):
+                    current_url = await validate_remote_url_async(
+                        current_url, resolve_dns=resolve_dns
                     )
-                    if image_path:
-                        # 直接使用文件路径，不使用 file:// URI（根据 AstrBot 文档要求）
-                        image_url_local = image_path
-                        return image_url_local, image_path
+                    async with session.get(
+                        current_url,
+                        timeout=aiohttp.ClientTimeout(total=30),
+                        proxy=request_proxy,
+                        headers=req_headers or None,
+                        allow_redirects=False,
+                    ) as response:
+                        if response.status in _REDIRECT_STATUSES:
+                            if hop >= MAX_REFERENCE_IMAGE_REDIRECTS:
+                                logger.warning(
+                                    "下载图像重定向超过 %s 次: %s",
+                                    MAX_REFERENCE_IMAGE_REDIRECTS,
+                                    redact_url(current_url),
+                                )
+                                return None, None
+                            location = response.headers.get("Location", "")
+                            if not location:
+                                logger.warning(
+                                    "下载图像重定向缺少 Location: %s",
+                                    redact_url(current_url),
+                                )
+                                return None, None
+                            next_url = urllib.parse.urljoin(current_url, location)
+                            next_url = await validate_remote_url_async(
+                                next_url, resolve_dns=resolve_dns
+                            )
+                            if _url_origin(next_url) != _url_origin(current_url):
+                                req_headers = {
+                                    k: v
+                                    for k, v in req_headers.items()
+                                    if k.lower() not in _SENSITIVE_REDIRECT_HEADERS
+                                }
+                            current_url = next_url
+                            continue
+
+                        if response.status != 200:
+                            try:
+                                err_text = await response.text()
+                            except Exception:
+                                err_text = ""
+
+                            response_reason = response.reason or ""
+                            response_content_type = response.headers.get(
+                                "Content-Type", ""
+                            )
+                            query_params = urllib.parse.parse_qs(
+                                urllib.parse.urlparse(current_url).query
+                            )
+                            param_issues: list[str] = []
+
+                            # 仅在出现 400 错误时进行参数合法性检查
+                            if response.status == 400:
+                                appid = (query_params.get("appid") or [None])[0]
+                                if appid and not re.fullmatch(r"[A-Za-z0-9]+", appid):
+                                    param_issues.append("appid 格式异常（仅允许字母数字）")
+
+                                fileid = (query_params.get("fileid") or [None])[0]
+                                if fileid and not re.fullmatch(
+                                    r"[A-Za-z0-9._-]+", fileid
+                                ):
+                                    param_issues.append(
+                                        "fileid 格式异常（仅允许字母数字、.、_、-）"
+                                    )
+
+                                rkey = (query_params.get("rkey") or [None])[0]
+                                if rkey and re.search(r"[^A-Za-z0-9._-]", rkey):
+                                    param_issues.append("rkey 包含特殊字符")
+
+                                spec = (query_params.get("spec") or [None])[0]
+                                if spec and not str(spec).isdigit():
+                                    param_issues.append("spec 参数应为数字")
+
+                            # 根据响应内容与校验结果给出建议
+                            suggestions: list[str] = []
+                            if " " in current_url or "%20" in current_url:
+                                suggestions.append("URL格式错误 → 检查URL编码")
+                            if param_issues:
+                                suggestions.append("参数错误 → 检查参数格式")
+                            err_lower = err_text.lower() if err_text else ""
+                            if any(keyword in err_lower for keyword in ["auth", "key"]):
+                                suggestions.append("认证错误 → 检查API密钥")
+                            if any(
+                                keyword in err_lower
+                                for keyword in ["limit", "频率", "限制"]
+                            ):
+                                suggestions.append("服务器限制 → 建议稍后重试")
+                            if not suggestions:
+                                suggestions.append("服务器限制 → 建议稍后重试")
+
+                            logger.error(
+                                "下载图像失败: HTTP %s %s url=%s 响应摘要=%s 建议=%s",
+                                response.status,
+                                response_reason,
+                                redact_url(current_url),
+                                redact_text(err_text[:200])[:200],
+                                "；".join(dict.fromkeys(suggestions)),
+                            )
+
+                            logger.debug(
+                                "HTTP 400 参数检查结果: %s",
+                                "; ".join(param_issues)
+                                if param_issues
+                                else "未发现明显异常",
+                            )
+                            logger.debug("完整请求头: %s", req_headers or {})
+                            logger.debug(
+                                "User-Agent: %s",
+                                (req_headers or {}).get("User-Agent", ""),
+                            )
+                            logger.debug(
+                                "Content-Type: %s, Accept: %s",
+                                (req_headers or {}).get("Content-Type", "未设置"),
+                                (req_headers or {}).get("Accept", "未设置"),
+                            )
+                            logger.debug(
+                                "服务器响应详情: status=%s, reason=%s, phrase=%s, content-type=%s",
+                                response.status,
+                                response_reason,
+                                getattr(response, "reason", ""),
+                                response_content_type,
+                            )
+                            logger.debug(
+                                "服务器响应体预览: %s",
+                                redact_text(err_text)[:1000] if err_text else "<empty>",
+                            )
+
+                            if response.status == 400 and attempt < max_retries:
+                                await asyncio.sleep(retry_interval * attempt)
+                                break
+                            return None, None
+
+                        content_type = response.headers.get("Content-Type", "")
+
+                        if "/" in content_type:
+                            image_format = (
+                                content_type.split("/")[1].split(";")[0] or "png"
+                            )
+                        else:
+                            image_format = "png"
+
+                        target_path = None
+                        if cache_key:
+                            target_path = (
+                                REFERENCE_IMAGE_CACHE_DIR
+                                / f"{cache_key}.{image_format}"
+                            )
+
+                        image_path = await save_image_stream(
+                            response.content, image_format, target_path=target_path
+                        )
+                        if image_path:
+                            # 直接使用文件路径，不使用 file:// URI（根据 AstrBot 文档要求）
+                            image_url_local = image_path
+                            return image_url_local, image_path
+                        return None, None
+            except PathPolicyError as e:
+                logger.warning("下载图像重定向被安全策略拒绝: %s", e)
+                return None, None
             except aiohttp.ClientError as e:
                 logger.error("下载图像发生网络异常: %s", redact_text(str(e))[:240])
             except Exception as e:

@@ -17,6 +17,10 @@ import aiohttp
 
 from astrbot.api import logger
 
+from .core.errors import PathPolicyError, redact_url
+from .core.path_policy import validate_remote_url_async
+from .core.remote_fetch import _SSRFGuardedResolver
+
 try:
     from PIL import Image as PILImage
 except ImportError:  # pragma: no cover - depends on runtime optional dependency
@@ -30,6 +34,49 @@ SUPPORTED_REFERENCE_IMAGE_MIME_TYPES = frozenset(
 QQ_REFERENCE_IMAGE_HOSTS = frozenset(
     {"qpic.cn", "qq.com", "nt.qq.com", "gchat.qpic.cn"}
 )
+
+MAX_REFERENCE_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_REFERENCE_IMAGE_PIXELS = 40_000_000
+MAX_REFERENCE_IMAGE_REDIRECTS = 5
+_REFERENCE_READ_CHUNK_BYTES = 64 * 1024
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_SENSITIVE_REDIRECT_HEADERS = frozenset(
+    {"authorization", "proxy-authorization", "cookie", "cookie2"}
+)
+
+
+def _url_origin(url: str) -> tuple[str, str, int | None]:
+    parsed = urllib.parse.urlsplit(url)
+    return (parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port)
+
+
+async def _read_bounded_response(
+    resp: aiohttp.ClientResponse,
+    max_bytes: int,
+) -> bytes:
+    """流式读取 HTTP 响应体并严格执行字节上限，防止超大响应导致 OOM。"""
+    raw_len = (resp.headers.get("Content-Length", "") if getattr(resp, "headers", None) else "").strip()
+    if raw_len.isdigit() and int(raw_len) > max_bytes:
+        raise ValueError(f"参考图响应体超过大小上限 ({max_bytes} bytes)")
+
+    content = getattr(resp, "content", None)
+    iter_chunked = getattr(content, "iter_chunked", None)
+    if callable(iter_chunked):
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in iter_chunked(_REFERENCE_READ_CHUNK_BYTES):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"参考图响应体超过大小上限 ({max_bytes} bytes)")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    data = await resp.read()
+    if len(data) > max_bytes:
+        raise ValueError(f"参考图响应体超过大小上限 ({max_bytes} bytes)")
+    return data
 
 
 def get_reference_image_cache_dir() -> Path:
@@ -192,7 +239,10 @@ def _encode_file_to_base64(file_path: Path, chunk_size: int = 65536) -> str:
 
 
 def coerce_reference_image_bytes(
-    mime_type: str | None, raw_bytes: bytes
+    mime_type: str | None,
+    raw_bytes: bytes,
+    *,
+    max_bytes: int = MAX_REFERENCE_IMAGE_BYTES,
 ) -> tuple[str | None, str | None]:
     """
     Convert image bytes to a provider-supported MIME/base64 pair.
@@ -200,6 +250,12 @@ def coerce_reference_image_bytes(
     PNG/JPEG/WEBP/HEIC/HEIF bytes pass through unchanged. Unsupported formats are
     re-encoded with Pillow when it is available.
     """
+    if len(raw_bytes) > max_bytes:
+        logger.warning(
+            f"参考图超过单图字节上限: size={len(raw_bytes)}, limit={max_bytes}"
+        )
+        return None, None
+
     normalized_mime = (mime_type or "").lower()
     detected_mime = detect_reference_image_mime(raw_bytes)
     if detected_mime:
@@ -221,6 +277,11 @@ def coerce_reference_image_bytes(
 
     try:
         with PILImage.open(io.BytesIO(raw_bytes)) as img:
+            if img.width * img.height > MAX_REFERENCE_IMAGE_PIXELS:
+                logger.warning(
+                    f"参考图像素尺寸超过上限: {img.width}x{img.height} > {MAX_REFERENCE_IMAGE_PIXELS}"
+                )
+                return None, None
             if target_mime == "image/png":
                 save_format = "PNG"
                 if img.mode not in ("RGB", "RGBA"):
@@ -242,7 +303,13 @@ def coerce_reference_image_bytes(
             buffer = io.BytesIO()
             img.save(buffer, format=save_format)
             buffer.seek(0)
-            encoded = base64.b64encode(buffer.read()).decode("utf-8")
+            out_bytes = buffer.read()
+            if len(out_bytes) > max_bytes:
+                logger.warning(
+                    f"参考图转码后超过单图字节上限: size={len(out_bytes)}, limit={max_bytes}"
+                )
+                return None, None
+            encoded = base64.b64encode(out_bytes).decode("utf-8")
             return target_mime, encoded
     except Exception as e:
         logger.warning(f"参考图格式不受支持且转换失败: mime={mime_type}, err={e}")
@@ -250,15 +317,23 @@ def coerce_reference_image_bytes(
 
 
 def coerce_reference_image(
-    mime_type: str | None, base64_data: str
+    mime_type: str | None,
+    base64_data: str,
+    *,
+    max_bytes: int = MAX_REFERENCE_IMAGE_BYTES,
 ) -> tuple[str | None, str | None]:
     """Decode base64 image data and coerce it to a supported reference image."""
+    if len(base64_data) > ((max_bytes * 4) // 3 + 16):
+        logger.warning(
+            f"参考图 base64 超过字节上限: len={len(base64_data)}, limit={max_bytes}"
+        )
+        return None, None
     try:
         raw = base64.b64decode(base64_data, validate=False)
     except Exception as e:
         logger.warning(f"base64 解码失败，无法转换为参考图: {e}")
         return None, None
-    return coerce_reference_image_bytes(mime_type, raw)
+    return coerce_reference_image_bytes(mime_type, raw, max_bytes=max_bytes)
 
 
 async def normalize_reference_image_input(
@@ -268,6 +343,7 @@ async def normalize_reference_image_input(
     image_input_mode: str = "force_base64",
     session: aiohttp.ClientSession | None = None,
     proxy: str | None = None,
+    max_bytes: int = MAX_REFERENCE_IMAGE_BYTES,
 ) -> tuple[str | None, str | None]:
     """
     Normalize a reference image input to (mime_type, base64_data).
@@ -293,12 +369,15 @@ async def normalize_reference_image_input(
             header, data = image_str.split(";base64,", 1)
             mime_type = header.replace("data:", "")
             logger.debug(f"检测到参考图 data URI，mime={mime_type}")
+            if len(data) > ((max_bytes * 4) // 3 + 16):
+                logger.warning("参考图 data URL 超过单图字节上限")
+                return None, None
             try:
                 raw = base64.b64decode(data, validate=False)
             except Exception:
                 logger.warning("参考图 data URL base64 解码失败")
                 return None, None
-            return coerce_reference_image_bytes(mime_type, raw)
+            return coerce_reference_image_bytes(mime_type, raw, max_bytes=max_bytes)
 
         if image_str.startswith("file://"):
             parsed = urllib.parse.urlparse(image_str)
@@ -308,8 +387,13 @@ async def normalize_reference_image_input(
                 mime_type = f"image/{suffix}"
                 logger.debug(f"使用参考图 file:// 路径: {image_path}")
                 try:
+                    if image_path.stat().st_size > max_bytes:
+                        logger.warning(f"参考图 file:// 超过大小上限: {image_path}")
+                        return None, None
                     data_bytes = image_path.read_bytes()
-                    return coerce_reference_image_bytes(mime_type, data_bytes)
+                    return coerce_reference_image_bytes(
+                        mime_type, data_bytes, max_bytes=max_bytes
+                    )
                 except Exception as e:
                     logger.warning(f"读取参考图 file:// 路径失败: {e}")
             else:
@@ -325,8 +409,13 @@ async def normalize_reference_image_input(
             mime_type = f"image/{suffix}"
             logger.debug(f"使用参考图本地路径: {image_path}")
             try:
+                if image_path.stat().st_size > max_bytes:
+                    logger.warning(f"参考图本地路径超过大小上限: {image_path}")
+                    return None, None
                 data_bytes = image_path.read_bytes()
-                return coerce_reference_image_bytes(mime_type, data_bytes)
+                return coerce_reference_image_bytes(
+                    mime_type, data_bytes, max_bytes=max_bytes
+                )
             except Exception as e:
                 logger.warning(f"读取参考图本地路径失败: {e}")
 
@@ -334,86 +423,155 @@ async def normalize_reference_image_input(
             cleaned_url = image_str.replace("&amp;", "&")
             parsed_url = urllib.parse.urlparse(cleaned_url)
             parsed_host = parsed_url.netloc or ""
-            logger.debug(f"下载 http(s) 参考图: {cleaned_url}")
+            is_qq = is_qq_image_host(parsed_host)
+            request_proxy = None if is_qq else proxy
+            trust_env = not is_qq
+            has_env_proxy = trust_env and any(
+                os.environ.get(key)
+                for key in (
+                    "HTTP_PROXY",
+                    "HTTPS_PROXY",
+                    "ALL_PROXY",
+                    "http_proxy",
+                    "https_proxy",
+                    "all_proxy",
+                )
+            )
+            use_proxy = bool(request_proxy) or has_env_proxy
+            try:
+                cleaned_url = await validate_remote_url_async(
+                    cleaned_url, resolve_dns=not use_proxy
+                )
+            except PathPolicyError as e:
+                logger.warning(f"参考图 URL 被安全策略拒绝: {e}")
+                return None, None
+
+            logger.debug(f"下载 http(s) 参考图: {redact_url(cleaned_url)}")
 
             cached = check_reference_image_cache(cleaned_url, cache_dir)
             if cached:
                 mime_guess = f"image/{cached.suffix.lstrip('.') or 'png'}"
-                logger.debug(f"参考图命中缓存: {cleaned_url}")
+                logger.debug(f"参考图命中缓存: {redact_url(cleaned_url)}")
                 try:
+                    if cached.stat().st_size > max_bytes:
+                        logger.warning(f"参考图缓存文件超过大小上限: {cached}")
+                        return None, None
                     data_bytes = cached.read_bytes()
                 except Exception as e:
                     logger.warning(f"读取参考图缓存失败: {e}")
                 else:
-                    return coerce_reference_image_bytes(mime_guess, data_bytes)
+                    return coerce_reference_image_bytes(
+                        mime_guess, data_bytes, max_bytes=max_bytes
+                    )
 
-            is_qq = is_qq_image_host(parsed_host)
             headers = build_reference_image_headers(parsed_host, for_qq=is_qq)
 
             timeout = aiohttp.ClientTimeout(total=20, connect=10)
-            trust_env = not is_qq
-            request_proxy = None if is_qq else proxy
 
             async def fetch_with_session(
                 active_session: aiohttp.ClientSession,
             ) -> tuple[str | None, str | None]:
                 fallback_reason = None
+                current_url = cleaned_url
+                req_headers = dict(headers)
 
                 try:
-                    async with active_session.get(
-                        cleaned_url,
-                        headers=headers,
-                        timeout=timeout,
-                        proxy=request_proxy,
-                    ) as resp:
-                        if resp.status == 200:
-                            content_type = resp.headers.get("Content-Type", "image/png")
-                            mime_type = (
-                                content_type.split(";")[0]
-                                if content_type
-                                else "image/png"
-                            )
-                            try:
-                                data_bytes = await resp.read()
-                            except Exception as e:
-                                fallback_reason = f"读取响应体失败: {e}"
-                            else:
-                                save_reference_image_cache(
-                                    cleaned_url, data_bytes, mime_type, cache_dir
+                    for hop in range(MAX_REFERENCE_IMAGE_REDIRECTS + 1):
+                        current_url = await validate_remote_url_async(
+                            current_url, resolve_dns=not use_proxy
+                        )
+                        async with active_session.get(
+                            current_url,
+                            headers=req_headers,
+                            timeout=timeout,
+                            proxy=request_proxy,
+                            allow_redirects=False,
+                        ) as resp:
+                            if resp.status in _REDIRECT_STATUSES:
+                                if hop >= MAX_REFERENCE_IMAGE_REDIRECTS:
+                                    fallback_reason = (
+                                        f"重定向超过 {MAX_REFERENCE_IMAGE_REDIRECTS} 次"
+                                    )
+                                    break
+                                location = resp.headers.get("Location", "")
+                                if not location:
+                                    fallback_reason = "重定向缺少 Location 头"
+                                    break
+                                next_url = urllib.parse.urljoin(current_url, location)
+                                next_url = await validate_remote_url_async(
+                                    next_url, resolve_dns=not use_proxy
                                 )
-                                return coerce_reference_image_bytes(
-                                    mime_type, data_bytes
+                                if _url_origin(next_url) != _url_origin(current_url):
+                                    req_headers = {
+                                        k: v
+                                        for k, v in req_headers.items()
+                                        if k.lower() not in _SENSITIVE_REDIRECT_HEADERS
+                                    }
+                                current_url = next_url
+                                continue
+
+                            if resp.status == 200:
+                                content_type = resp.headers.get(
+                                    "Content-Type", "image/png"
                                 )
-                        else:
+                                mime_type = (
+                                    content_type.split(";")[0]
+                                    if content_type
+                                    else "image/png"
+                                )
+                                try:
+                                    data_bytes = await _read_bounded_response(
+                                        resp, max_bytes
+                                    )
+                                except Exception as e:
+                                    fallback_reason = f"读取响应体失败: {e}"
+                                else:
+                                    save_reference_image_cache(
+                                        cleaned_url, data_bytes, mime_type, cache_dir
+                                    )
+                                    return coerce_reference_image_bytes(
+                                        mime_type, data_bytes, max_bytes=max_bytes
+                                    )
+                                break
                             fallback_reason = f"HTTP {resp.status} {resp.reason}"
+                            break
+                except PathPolicyError as e:
+                    fallback_reason = f"安全策略拒绝: {e}"
                 except Exception as e:
                     fallback_reason = str(e)
                 if fallback_reason:
                     logger.warning(
-                        f"下载参考图失败: {cleaned_url}，原因: {fallback_reason}"
+                        f"下载参考图失败: {redact_url(cleaned_url)}，原因: {fallback_reason}"
                     )
                 return None, None
 
             if session is not None and not session.closed:
                 return await fetch_with_session(session)
 
+            connector = aiohttp.TCPConnector(
+                resolver=None if use_proxy else _SSRFGuardedResolver()
+            )
             async with aiohttp.ClientSession(
-                timeout=timeout, trust_env=trust_env
+                timeout=timeout, trust_env=trust_env, connector=connector
             ) as new_session:
                 return await fetch_with_session(new_session)
 
         logger.debug("尝试将参考图输入视为纯 base64")
         try:
+            if len(image_str) > ((max_bytes * 4) // 3 + 16):
+                return None, None
             base64.b64decode(image_str, validate=False)
-            return coerce_reference_image(None, image_str)
+            return coerce_reference_image(None, image_str, max_bytes=max_bytes)
         except binascii.Error:
             cleaned = re.sub(r"[^A-Za-z0-9+/=_-]", "", image_str)
+            if len(cleaned) > ((max_bytes * 4) // 3 + 16):
+                return None, None
             pad_len = (-len(cleaned)) % 4
             if pad_len:
                 cleaned += "=" * pad_len
             try:
                 base64.b64decode(cleaned, validate=False)
-                return coerce_reference_image(None, cleaned)
+                return coerce_reference_image(None, cleaned, max_bytes=max_bytes)
             except Exception:
                 return None, None
 

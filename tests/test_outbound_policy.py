@@ -21,9 +21,19 @@ from tl.web_studio_service import WebStudioService
         "javascript:alert(1)",
         "http:///img.png",
         "https://user:pass@example.com/a.png",
+        "http://127.0.0.1:8080/img.png",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://localhost/secret.png",
+        "http://10.0.0.1/internal.png",
+        "http://192.168.1.1/lan.png",
+        "http://[::1]/loopback.png",
+        "http://[::ffff:127.0.0.1]/mapped.png",
+        "http://2130706433/decimal-loopback.png",
+        "http://0x7f000001/hex-loopback.png",
+        "http://metadata.google.internal/computeMetadata/v1/",
     ],
 )
-def test_outbound_rejects_non_http_and_userinfo(url) -> None:
+def test_outbound_rejects_non_http_userinfo_and_ssrf_targets(url) -> None:
     with pytest.raises(PathPolicyError):
         check_remote_url(url)
 
@@ -35,11 +45,9 @@ def test_outbound_rejects_non_http_and_userinfo(url) -> None:
         "https://[2606:4700::1111]/img.png",
         "HTTP://93.184.216.34/img.png",
         "https://example.com/img.png?token=secret",
-        "http://127.0.0.1:8080/img.png",
-        "http://169.254.169.254/latest/meta-data/",
     ],
 )
-def test_outbound_accepts_http_urls_without_userinfo(url) -> None:
+def test_outbound_accepts_public_http_urls_without_userinfo(url) -> None:
     assert check_remote_url(url) == url
 
 
@@ -86,7 +94,7 @@ async def test_archive_redirect_to_non_http_is_not_followed(tmp_path, monkeypatc
     service = WebStudioService(None, tracker, _config(), tmp_path)
     try:
         with pytest.raises(PathPolicyError):
-            await service._download_remote_image("https://example.com/start.png")
-        assert requested == ["https://example.com/start.png"]
+            await service._download_remote_image("https://93.184.216.34/start.png")
+        assert requested == ["https://93.184.216.34/start.png"]
     finally:
         await tracker.close()

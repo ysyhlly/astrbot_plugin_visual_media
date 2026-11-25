@@ -35,7 +35,7 @@ from .core.errors import (
     StudioBusyError,
     redact_url,
 )
-from .core.path_policy import check_remote_url
+from .core.path_policy import check_remote_url, validate_remote_url_async
 from .core.remote_fetch import PROBE_BYTES
 from .file_uri import file_uri_to_path
 from .generation_tracker import (
@@ -968,14 +968,18 @@ class WebStudioService:
             connector = ProxyConnector.from_url(proxy)
             http_proxy = None
         elif not proxy:
-            connector = aiohttp.TCPConnector()
+            from .core.remote_fetch import _SSRFGuardedResolver
+
+            connector = aiohttp.TCPConnector(resolver=_SSRFGuardedResolver())
         current = url
         try:
             async with aiohttp.ClientSession(
                 timeout=timeout, connector=connector
             ) as session:
                 for hop in range(4):
-                    current = check_remote_url(current)
+                    current = await validate_remote_url_async(
+                        current, resolve_dns=not bool(proxy)
+                    )
                     async with session.get(
                         current, proxy=http_proxy, allow_redirects=False
                     ) as response:

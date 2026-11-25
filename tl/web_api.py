@@ -12,9 +12,21 @@ import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
-from urllib.parse import urlsplit
 
 from astrbot.api import logger
+
+try:
+    from ..series_panels import (
+        CSRF_PROTECTED_METHODS,
+        require_series_admin,
+        verify_series_csrf,
+    )
+except (ImportError, ValueError):
+    from series_panels import (
+        CSRF_PROTECTED_METHODS,
+        require_series_admin,
+        verify_series_csrf,
+    )
 
 from .core.errors import redact_url
 from .generation_tracker import GenerationTracker, without_session_origin
@@ -43,6 +55,7 @@ except (ImportError, AttributeError):
 PLUGIN_NAME = "astrbot_plugin_visual_media"
 WEBUI_PREFIX = f"/{PLUGIN_NAME}/webui"
 _SAFE_FILE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+_STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _JSON_MAX_BYTES = 2 * 1024 * 1024
 _PREFERENCES_COOKIE = "gemini_studio_browser"
 _BROWSER_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -198,23 +211,36 @@ class WebStudioAPI:
         providers_service: Any = None,
         templates_service: Any = None,
         is_closed: Callable[[], bool] | None = None,
+        context: Any = None,
     ) -> None:
         self.tracker = tracker
         self.service = service
         self.limits_service = limits_service
         self.providers_service = providers_service
         self.templates_service = templates_service
+        self._context = context
         self._web_closed = False
         self._is_closed = is_closed or (lambda: self._web_closed)
         self._registered_entries: list[tuple[Any, ...]] = []
         self._upload_request_lock = asyncio.Lock()
 
-    def _guarded(self, handler: Callable, suffix: str) -> Callable:
+    def _guarded(
+        self,
+        handler: Callable,
+        suffix: str,
+        methods: list[str] | tuple[str, ...] = (),
+    ) -> Callable:
+        check_csrf = (
+            any(str(m).upper() in CSRF_PROTECTED_METHODS for m in methods)
+            if methods
+            else True
+        )
+
         async def call(*args, **kwargs):
             started = time.monotonic()
             response = None
             try:
-                if denied := self._access_guard(suffix):
+                if denied := await self._require_admin(suffix, check_csrf=check_csrf):
                     response = denied
                     return response
                 response = await handler(*args, **kwargs)
@@ -222,7 +248,7 @@ class WebStudioAPI:
             finally:
                 logger.debug(
                     "[WebUI] %s %s status=%s elapsed=%.1fms",
-                    request.method,
+                    getattr(request, "method", ""),
                     getattr(request, "path", ""),
                     getattr(response, "status_code", None),
                     (time.monotonic() - started) * 1000,
@@ -230,61 +256,63 @@ class WebStudioAPI:
 
         return call
 
+    async def _require_admin(self, suffix: str, *, check_csrf: bool = True):
+        try:
+            await require_series_admin(
+                self._context,
+                request,
+                check_csrf=check_csrf,
+            )
+        except PermissionError as exc:
+            logger.info(
+                "[WebUI] 拒绝未授权或跨站请求: %s %s suffix=%s reason=%s",
+                getattr(request, "method", ""),
+                getattr(request, "path", ""),
+                suffix,
+                exc,
+            )
+            return error_response(str(exc), status_code=403)
+        return None
+
     @staticmethod
     def _access_guard(suffix: str):
-        username = str(getattr(request, "username", "") or "")
+        username = str(getattr(request, "username", "") or "").strip()
         if not username:
             logger.info(
                 "[WebUI] 拒绝未登录请求: %s %s",
-                request.method,
+                getattr(request, "method", ""),
                 getattr(request, "path", ""),
             )
             return error_response("请登录 AstrBot Dashboard 后操作", status_code=403)
-        if username.startswith("api_key:") and request.method.upper() in (
-            _PANEL_ONLY_METHODS.get(suffix) or ()
-        ):
+        if username.startswith("api_key:"):
             logger.info(
                 "[WebUI] 拒绝 API Key 面板操作: %s %s",
-                request.method,
+                getattr(request, "method", ""),
                 getattr(request, "path", ""),
             )
             return error_response("API Key 无权执行此操作", status_code=403)
-        if request.method.upper() == "POST":
-            headers = request.headers
-            origin = headers.get("Origin")
-            if origin:
-                origin_host = urlsplit(origin).netloc
-                if (
-                    not origin_host
-                    or origin_host.lower() != headers.get("Host", "").lower()
-                ):
-                    logger.info(
-                        "[WebUI] 拒绝跨站来源: %s %s origin=%s host=%s",
-                        request.method,
-                        getattr(request, "path", ""),
-                        origin,
-                        headers.get("Host", ""),
-                    )
-                    return error_response("跨站请求来源不一致", status_code=403)
-            if headers.get("Sec-Fetch-Site", "").strip().lower() == "cross-site":
+        if str(getattr(request, "method", "") or "").upper() in _STATE_CHANGING_METHODS:
+            try:
+                verify_series_csrf(request)
+            except PermissionError as exc:
                 logger.info(
-                    "[WebUI] 拒绝跨站请求头: %s %s sec_fetch_site=%s",
-                    request.method,
+                    "[WebUI] 拒绝跨站请求: %s %s reason=%s",
+                    getattr(request, "method", ""),
                     getattr(request, "path", ""),
-                    headers.get("Sec-Fetch-Site", ""),
+                    exc,
                 )
-                return error_response("拒绝跨站请求", status_code=403)
-        # 单用户面板可操作全部记录；历史读取对宿主已鉴权的面板与 API Key 开放。
+                return error_response(str(exc), status_code=403)
         return None
 
     def register(self, context: Any) -> list[tuple[Any, ...]]:
         if not WEB_API_AVAILABLE:
             return []
+        self._context = context
         entries = []
         registered = getattr(context, "registered_web_apis", [])
         for suffix, method_name, methods, description in self.ROUTES:
             route = f"{WEBUI_PREFIX}{suffix}"
-            handler = self._guarded(getattr(self, method_name), suffix)
+            handler = self._guarded(getattr(self, method_name), suffix, methods)
             context.register_web_api(route, handler, methods, description)
             entry = next(
                 (

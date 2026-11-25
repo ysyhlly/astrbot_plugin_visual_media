@@ -1,5 +1,6 @@
 import base64
 import binascii
+import functools
 import hashlib
 import time
 import uuid
@@ -8,6 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
+
+try:
+    from .series_panels import CSRF_PROTECTED_METHODS, require_series_admin
+except ImportError:
+    from series_panels import CSRF_PROTECTED_METHODS, require_series_admin
 
 from .api.external_sources import ExternalSourceRoutes
 from .api.image_mutations import ImageMutationRoutes
@@ -57,6 +63,37 @@ class PluginAPI(
 
     # ── Registration ──────────────────────────────────────────
 
+    @staticmethod
+    def _auth_error_response(message: str, status_code: int = 403):
+        payload = {
+            "success": False,
+            "status": "error",
+            "error": message,
+            "message": message,
+        }
+        try:
+            from astrbot.api.web import json_response as web_json_response
+
+            if callable(web_json_response):
+                return web_json_response(payload, status_code=status_code)
+        except ImportError:
+            pass
+        from quart import jsonify
+
+        return jsonify(payload), status_code
+
+    def _guarded_handler(self, handler, *, context: Any, check_csrf: bool):
+        @functools.wraps(handler)
+        async def wrapped(*args, **kwargs):
+            ctx = context or getattr(self.plugin, "context", None)
+            try:
+                await require_series_admin(ctx, check_csrf=check_csrf)
+            except PermissionError as exc:
+                return self._auth_error_response(str(exc), status_code=403)
+            return await handler(*args, **kwargs)
+
+        return wrapped
+
     def register(self, context) -> None:
         routes: list[tuple[str, str, list[str]]] = [
             ("/images", "handle_list_images", ["GET"]),
@@ -101,9 +138,15 @@ class PluginAPI(
         ]
         for route, handler_name, methods in routes:
             handler = getattr(self, handler_name)
+            check_csrf = any(
+                str(method).upper() in CSRF_PROTECTED_METHODS for method in methods
+            )
+            guarded = self._guarded_handler(
+                handler, context=context, check_csrf=check_csrf
+            )
             context.register_web_api(
                 f"/{PLUGIN_NAME}{route}",
-                handler,
+                guarded,
                 methods,
                 f"Plugin Page: {handler_name}",
             )

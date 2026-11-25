@@ -17,7 +17,8 @@ import aiohttp
 from astrbot.api import logger
 
 from ..api_types import APIError, ApiRequestConfig
-from ..core.errors import redact_text, redact_url
+from ..core.errors import PathPolicyError, redact_text, redact_url
+from ..core.path_policy import validate_remote_url_async
 from ..tl_utils import save_base64_image
 from .base import ProviderRequest
 from .provider_limits import MAX_REFERENCE_IMAGES_OPENAI_COMPAT
@@ -168,110 +169,124 @@ class OpenAICompatProvider:
                 seen_keys.add(image_str)
                 unique_tasks.append((idx, image_input, image_str))
 
+            reference_sem = asyncio.Semaphore(4)
+
             async def _prepare_single_reference(
                 idx: int, image_input: Any, image_str: str
             ) -> tuple[str, dict[str, Any] | None]:
-                per_start = time.perf_counter()
-                parsed = urllib.parse.urlparse(image_str)
-                image_payload: dict[str, Any] | None = None
+                async with reference_sem:
+                    per_start = time.perf_counter()
+                    parsed = urllib.parse.urlparse(image_str)
+                    image_payload: dict[str, Any] | None = None
 
-                try:
-                    if (
-                        parsed.scheme in ("http", "https")
-                        and parsed.netloc
-                        and not force_b64
-                    ):
-                        ext = Path(parsed.path).suffix.lower().lstrip(".")
-                        if ext and ext not in supported_exts:
-                            logger.debug(
-                                "参考图像URL扩展名不在常见列表: idx=%s ext=%s url=%s",
-                                idx,
-                                ext,
-                                redact_url(image_str)[:80],
-                            )
-
-                        image_payload = {
-                            "type": "image_url",
-                            "image_url": {"url": image_str},
-                        }
-                        logger.info(
-                            f"📎 图片 {idx + 1}/{processed_ref_count} 已加入发送请求 (URL)"
-                        )
-                        logger.debug(
-                            "OpenAI兼容API使用URL参考图: idx=%s ext=%s url=%s",
-                            idx,
-                            ext or "unknown",
-                            redact_url(image_str)[:120],
-                        )
-
-                    elif (
-                        image_str.startswith("data:image/") and ";base64," in image_str
-                    ):
-                        # 校验性解码收口到共享管道：无效 data URI 跳过并警告
-                        if await reference_data_uri(
-                            client,
-                            config,
-                            image_str,
-                            log_prefix="OpenAI兼容",
-                            error_label="openai_compat",
-                            validate_data_uri=True,
+                    try:
+                        if (
+                            parsed.scheme in ("http", "https")
+                            and parsed.netloc
+                            and not force_b64
                         ):
+                            try:
+                                safe_url = await validate_remote_url_async(image_str)
+                            except PathPolicyError as exc:
+                                logger.warning(
+                                    "跳过受限参考图像 URL: idx=%s err=%s",
+                                    idx,
+                                    exc,
+                                )
+                                return image_str, None
+
+                            ext = Path(parsed.path).suffix.lower().lstrip(".")
+                            if ext and ext not in supported_exts:
+                                logger.debug(
+                                    "参考图像URL扩展名不在常见列表: idx=%s ext=%s url=%s",
+                                    idx,
+                                    ext,
+                                    redact_url(safe_url)[:80],
+                                )
+
                             image_payload = {
                                 "type": "image_url",
-                                "image_url": {"url": image_str},
+                                "image_url": {"url": safe_url},
                             }
                             logger.info(
-                                f"📎 图片 {idx + 1}/{processed_ref_count} 已加入发送请求 (data URL)"
+                                f"📎 图片 {idx + 1}/{processed_ref_count} 已加入发送请求 (URL)"
                             )
                             logger.debug(
-                                "OpenAI兼容API使用data URL参考图: idx=%s",
+                                "OpenAI兼容API使用URL参考图: idx=%s ext=%s url=%s",
                                 idx,
+                                ext or "unknown",
+                                redact_url(safe_url)[:120],
                             )
+
+                        elif (
+                            image_str.startswith("data:image/")
+                            and ";base64," in image_str
+                        ):
+                            # 校验性解码收口到共享管道：无效 data URI 跳过并警告
+                            if await reference_data_uri(
+                                client,
+                                config,
+                                image_str,
+                                log_prefix="OpenAI兼容",
+                                error_label="openai_compat",
+                                validate_data_uri=True,
+                            ):
+                                image_payload = {
+                                    "type": "image_url",
+                                    "image_url": {"url": image_str},
+                                }
+                                logger.info(
+                                    f"📎 图片 {idx + 1}/{processed_ref_count} 已加入发送请求 (data URL)"
+                                )
+                                logger.debug(
+                                    "OpenAI兼容API使用data URL参考图: idx=%s",
+                                    idx,
+                                )
+                            else:
+                                logger.warning("跳过无效的 data URL 参考图: idx=%s", idx)
+
                         else:
-                            logger.warning("跳过无效的 data URL 参考图: idx=%s", idx)
-
-                    else:
-                        # 本地路径/file:// 及 force 模式的 URL 统一走共享管道
-                        payload_url = await reference_data_uri(
-                            client,
-                            config,
-                            image_input,
-                            log_prefix="OpenAI兼容",
-                            error_label="openai_compat",
-                            force_b64=force_b64,
-                        )
-                        if not payload_url:
-                            logger.warning(
-                                f"📎 图片 {idx + 1}/{processed_ref_count} 未能加入发送请求 - 无法转换"
+                            # 本地路径/file:// 及 force 模式的 URL 统一走共享管道
+                            payload_url = await reference_data_uri(
+                                client,
+                                config,
+                                image_input,
+                                log_prefix="OpenAI兼容",
+                                error_label="openai_compat",
+                                force_b64=force_b64,
                             )
+                            if not payload_url:
+                                logger.warning(
+                                    f"📎 图片 {idx + 1}/{processed_ref_count} 未能加入发送请求 - 无法转换"
+                                )
+                                logger.debug(
+                                    "跳过无法识别/读取的参考图像: idx=%s type=%s",
+                                    idx,
+                                    type(image_input),
+                                )
+                                return image_str, None
+
+                            image_payload = {
+                                "type": "image_url",
+                                "image_url": {"url": payload_url},
+                            }
+
+                        if image_payload:
+                            elapsed_ms = (time.perf_counter() - per_start) * 1000
                             logger.debug(
-                                "跳过无法识别/读取的参考图像: idx=%s type=%s",
+                                "参考图像处理完成: idx=%s 耗时=%.2fms 来源=%s",
                                 idx,
-                                type(image_input),
+                                elapsed_ms,
+                                parsed.scheme or "normalized",
                             )
-                            return image_str, None
+                        return image_str, image_payload
 
-                        image_payload = {
-                            "type": "image_url",
-                            "image_url": {"url": payload_url},
-                        }
-
-                    if image_payload:
-                        elapsed_ms = (time.perf_counter() - per_start) * 1000
-                        logger.debug(
-                            "参考图像处理完成: idx=%s 耗时=%.2fms 来源=%s",
-                            idx,
-                            elapsed_ms,
-                            parsed.scheme or "normalized",
+                    except Exception as e:
+                        logger.warning(
+                            f"📎 图片 {idx + 1}/{processed_ref_count} 未能加入发送请求 - {str(e)[:30]}"
                         )
-                    return image_str, image_payload
-
-                except Exception as e:
-                    logger.warning(
-                        f"📎 图片 {idx + 1}/{processed_ref_count} 未能加入发送请求 - {str(e)[:30]}"
-                    )
-                    logger.debug("处理参考图像时出现异常: idx=%s err=%s", idx, e)
-                    return image_str, None
+                        logger.debug("处理参考图像时出现异常: idx=%s err=%s", idx, e)
+                        return image_str, None
 
             prepared_results = await asyncio.gather(
                 *(

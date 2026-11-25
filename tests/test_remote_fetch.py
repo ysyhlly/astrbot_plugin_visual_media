@@ -32,6 +32,7 @@ _PNG_BYTES = _make_png(900, 900)
 
 
 def _service(**kwargs) -> RemoteFetchService:
+    kwargs.setdefault("allow_private", True)
     return RemoteFetchService(**kwargs)
 
 
@@ -87,7 +88,18 @@ async def _start(app: web.Application) -> TestServer:
 
 
 @pytest.mark.asyncio
-async def test_fetch_loopback_ok() -> None:
+async def test_fetch_loopback_rejected_by_default() -> None:
+    server = await _start(_app())
+    try:
+        service = RemoteFetchService()
+        with pytest.raises(RemoteFetchRejectedError):
+            await service.fetch(str(server.make_url("/img.png")))
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_loopback_ok_when_explicitly_allowed() -> None:
     server = await _start(_app())
     try:
         service = _service()
@@ -218,7 +230,7 @@ async def test_cross_origin_redirect_drops_sensitive_headers(monkeypatch) -> Non
         def get(self, url, **kwargs):
             calls.append((url, kwargs["headers"]))
             if len(calls) == 1:
-                return Response(302, "https://other.invalid/image.png")
+                return Response(302, "https://93.184.216.35/image.png")
             return Response(200)
 
     monkeypatch.setattr("tl.core.remote_fetch.aiohttp.ClientSession", Session)
@@ -226,7 +238,7 @@ async def test_cross_origin_redirect_drops_sensitive_headers(monkeypatch) -> Non
 
     assert (
         await service.fetch(
-            "https://first.invalid/image.png",
+            "https://93.184.216.34/image.png",
             headers={"Authorization": "Bearer secret", "Accept": "image/*"},
         )
         == b"ok"
@@ -270,7 +282,7 @@ async def test_redirect_hops_share_deadline(monkeypatch) -> None:
         def get(self, url, **kwargs):
             calls.append(url)
             return Response(
-                f"https://example.invalid/hop-{len(calls) + 1}.png"
+                f"https://93.184.216.34/hop-{len(calls) + 1}.png"
                 if len(calls) < 3
                 else None
             )
@@ -280,11 +292,11 @@ async def test_redirect_hops_share_deadline(monkeypatch) -> None:
     deadline = datetime.now(timezone.utc) + timedelta(seconds=0.04)
     with pytest.raises(RemoteFetchTimeoutError):
         await RemoteFetchService().fetch(
-            "https://example.invalid/start.png", deadline_at=deadline
+            "https://93.184.216.34/start.png", deadline_at=deadline
         )
     assert calls == [
-        "https://example.invalid/start.png",
-        "https://example.invalid/hop-2.png",
+        "https://93.184.216.34/start.png",
+        "https://93.184.216.34/hop-2.png",
     ]
 
 

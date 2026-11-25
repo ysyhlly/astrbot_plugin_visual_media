@@ -21,19 +21,57 @@ from ..core.maintenance.retention import library_counts, library_group
 
 class LibraryRoutes:
     # ── Image serving ─────────────────────────────────────────
+    SERVE_IMAGE_ALLOWED_SUBDIRS = ("categories", "pending", "thumb_cache", "raw")
+    _SERVE_IMAGE_ERROR = "图片不存在或无权访问"
+
+    def _resolve_serve_image_path(self, raw_path: Any) -> Path | None:
+        """先做媒体子目录与图片扩展名白名单校验，再检查文件是否存在。"""
+        text = str(raw_path or "").strip()
+        if not text or "\x00" in text:
+            return None
+        try:
+            data_dir = self._data_dir.resolve()
+            allowed_roots = tuple(
+                (data_dir / subdir).resolve()
+                for subdir in self.SERVE_IMAGE_ALLOWED_SUBDIRS
+            )
+            candidate = Path(text)
+            if not candidate.is_absolute():
+                candidate = data_dir / candidate
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+        if not any(
+            resolved != root and resolved.is_relative_to(root)
+            for root in allowed_roots
+        ):
+            return None
+
+        allowed_exts = getattr(
+            self,
+            "ALLOWED_IMAGE_EXTS",
+            (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"),
+        )
+        if resolved.suffix.lower() not in allowed_exts:
+            return None
+
+        try:
+            if not resolved.is_file():
+                return None
+        except OSError:
+            return None
+        return resolved
 
     async def handle_serve_image(self):
         """直接服务图片文件（用于页面展示）。"""
         if send_file is None:
             return jsonify({"success": False, "error": "send_file 不可用"}), 500
         file_path = request.args.get("path", "")
-        if not file_path or not os.path.isfile(file_path):
-            return jsonify({"success": False, "error": "文件不存在"}), 404
-        try:
-            Path(file_path).resolve().relative_to(self._data_dir.resolve())
-        except ValueError:
-            return jsonify({"success": False, "error": "路径非法"}), 403
-        return await send_file(file_path)
+        resolved = self._resolve_serve_image_path(file_path)
+        if resolved is None:
+            return jsonify({"success": False, "error": self._SERVE_IMAGE_ERROR}), 404
+        return await send_file(str(resolved))
 
     async def handle_image_data(self):
         """返回图片的 base64 data URL。"""

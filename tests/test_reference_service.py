@@ -68,7 +68,9 @@ def _policy(root: Path) -> PathPolicy:
 
 def _service(root: Path, cache_dir: Path, **kwargs) -> ReferenceService:
     policy = _policy(root)
-    return ReferenceService(policy, RemoteFetchService(), cache_dir, **kwargs)
+    return ReferenceService(
+        policy, RemoteFetchService(allow_private=True), cache_dir, **kwargs
+    )
 
 
 async def _collect(service: ReferenceService, refs, **kwargs):
