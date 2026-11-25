@@ -1,4 +1,11 @@
-# astrbot_plugin_visual_media 0.5.0-rc.9
+# astrbot_plugin_visual_media 0.5.0-rc.10
+
+## 0.5.0-rc.10 — 2026-11-25
+
+- 安全加固（Batch 1）：加固 `serve-image` 文件边界与 SSRF 防护，全面接入统一管理鉴权与 CSRF 校验。
+- 数据与并发修复（Batch 2）：保护在途 `pending` 媒体不被误清，修复任务调度 `KeyError` 与 GIF 缓存锁竞争。
+- 性能优化（Batch 3）：解耦 FAISS 锁与远程向量化网络 I/O，并将热点处理下沉后台线程。
+- 依赖与发布治理（Batch 4）：声明 `rank-bm25` 依赖并保留纯 Python 优雅回退，加固发布打包、修复 `series_panels` 热重载并同步共享资产。
 
 ## 0.5.0-rc.9 — 2026-11-24
 
