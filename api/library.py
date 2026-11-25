@@ -85,15 +85,17 @@ class LibraryRoutes:
             db = self._db
             if db and hasattr(db, "get_pending_by_hash"):
                 try:
-                    pending_row = db.get_pending_by_hash(image_hash)
+                    pending_row = await asyncio.to_thread(
+                        db.get_pending_by_hash, image_hash
+                    )
                 except Exception:
                     pending_row = None
                 if pending_row:
                     file_path = pending_row.get("path")
 
-        if file_path and os.path.isfile(file_path):
+        if file_path and await asyncio.to_thread(os.path.isfile, file_path):
             try:
-                data_url = self._file_base64(file_path)
+                data_url = await asyncio.to_thread(self._file_base64, file_path)
                 return jsonify({"success": True, "hash": image_hash, "url": data_url})
             except Exception as e:
                 logger.warning(f"读取图片失败: {e}")
@@ -106,15 +108,14 @@ class LibraryRoutes:
         thumb_dir = self._data_dir / "thumb_cache"
         thumb_path = thumb_dir / f"{img_hash}_{max_size}.jpg"
 
-        if thumb_path.exists():
-            return str(thumb_path)
+        def _get_or_create() -> str:
+            if thumb_path.exists():
+                return str(thumb_path)
 
-        if not os.path.isfile(file_path):
-            raise FileNotFoundError(file_path)
+            if not os.path.isfile(file_path):
+                raise FileNotFoundError(file_path)
 
-        thumb_dir.mkdir(parents=True, exist_ok=True)
-
-        def _create() -> str:
+            thumb_dir.mkdir(parents=True, exist_ok=True)
             with Image.open(file_path) as img:
                 try:
                     img.seek(0)
@@ -130,7 +131,7 @@ class LibraryRoutes:
                 img.save(thumb_path, "JPEG", quality=82, optimize=True)
             return str(thumb_path)
 
-        return await asyncio.to_thread(_create)
+        return await asyncio.to_thread(_get_or_create)
 
     async def handle_thumbnail(self):
         """返回缩略图的 base64 data URL，用于列表展示。"""
@@ -144,31 +145,30 @@ class LibraryRoutes:
         if not img_hash:
             return jsonify({"success": False, "error": "缺少 hash"}), 400
 
-        file_path = None
-        for p, m in self._get_index().items():
-            if isinstance(m, dict) and m.get("hash") == img_hash:
-                file_path = p
-                break
+        found = await asyncio.to_thread(self._find_index_entry_by_hash, img_hash)
+        file_path = found[0] if found else None
 
         # 回退：正式库未命中时查待审核池（审核区缩略图走此路径）
         if not file_path:
             db = self._db
             if db and hasattr(db, "get_pending_by_hash"):
                 try:
-                    pending_row = db.get_pending_by_hash(img_hash)
+                    pending_row = await asyncio.to_thread(
+                        db.get_pending_by_hash, img_hash
+                    )
                 except Exception:
                     pending_row = None
                 if pending_row:
                     file_path = pending_row.get("path")
 
-        if not file_path or not os.path.isfile(file_path):
+        if not file_path or not await asyncio.to_thread(os.path.isfile, file_path):
             return jsonify({"success": False, "error": "图片未找到"}), 404
 
         try:
             thumb_path = await self._get_or_create_thumbnail(
                 img_hash, file_path, max_size
             )
-            data_url = self._file_base64(thumb_path)
+            data_url = await asyncio.to_thread(self._file_base64, thumb_path)
             return jsonify({"success": True, "hash": img_hash, "url": data_url})
         except Exception as e:
             logger.warning(f"生成缩略图失败: {e}")

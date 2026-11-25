@@ -11,6 +11,9 @@ from ..util.model_requests import is_rate_limited, model_request_gate
 _INTERACTIVE_EMBEDDING_LANE: ContextVar[bool] = ContextVar(
     "visual_media_interactive_embedding_lane", default=False
 )
+_PRECOMPUTED_EMBEDDINGS: ContextVar[dict[str, list[float]] | None] = ContextVar(
+    "visual_media_precomputed_embeddings", default=None
+)
 
 
 @contextmanager
@@ -21,6 +24,16 @@ def interactive_embedding_lane(enabled: bool = True):
         yield
     finally:
         _INTERACTIVE_EMBEDDING_LANE.reset(token)
+
+
+@contextmanager
+def precomputed_embeddings(mapping: dict[str, list[float]] | None):
+    """Serve precomputed vectors inside Faiss critical sections without remote I/O."""
+    token = _PRECOMPUTED_EMBEDDINGS.set(dict(mapping) if mapping else None)
+    try:
+        yield
+    finally:
+        _PRECOMPUTED_EMBEDDINGS.reset(token)
 
 
 class EmbeddingProviderAdapter:
@@ -65,6 +78,9 @@ class EmbeddingProviderAdapter:
         return array.tolist()
 
     async def get_embedding(self, text):
+        precomputed = _PRECOMPUTED_EMBEDDINGS.get()
+        if precomputed is not None and text in precomputed:
+            return list(precomputed[text])
         interactive = self._is_interactive()
         if interactive:
             getter = getattr(self.service, "get_cached_query_embedding", None)
@@ -84,6 +100,9 @@ class EmbeddingProviderAdapter:
         return validated
 
     async def get_embeddings(self, texts):
+        precomputed = _PRECOMPUTED_EMBEDDINGS.get()
+        if precomputed is not None and all(text in precomputed for text in texts):
+            return [list(precomputed[text]) for text in texts]
         if callable(getattr(self.provider, "get_embeddings", None)):
             identity = self.service._provider_identity(self.provider)
             vectors = await self._request(lambda: self.provider.get_embeddings(texts))
@@ -95,6 +114,9 @@ class EmbeddingProviderAdapter:
         return [await self.get_embedding(text) for text in texts]
 
     async def get_embeddings_batch(self, texts, batch_size=16, tasks_limit=1, max_retries=1, progress_callback=None):
+        precomputed = _PRECOMPUTED_EMBEDDINGS.get()
+        if precomputed is not None and all(text in precomputed for text in texts):
+            return [list(precomputed[text]) for text in texts]
         # Reuse the framework's batch implementation with one task and one outer
         # attempt: shared pacing/retries already happen inside get_embeddings.
         from astrbot.core.provider.provider import EmbeddingProvider

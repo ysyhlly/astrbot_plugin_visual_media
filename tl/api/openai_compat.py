@@ -314,6 +314,7 @@ class OpenAICompatProvider:
                     "参考图全部处理失败，可能是网络问题或格式不支持。建议：1) 检查图片链接是否可访问；2) 尝试重新发送图片；3) 使用 Google API 格式可能有更好的错误提示。",
                     None,
                     "invalid_reference_image",
+                    retryable=False,
                 )
 
         payload: dict[str, Any] = {

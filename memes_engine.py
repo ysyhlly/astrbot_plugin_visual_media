@@ -224,28 +224,40 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
             errors.append("最大表情数量必须大于0的整数")
             fixed.append("最大表情数量已重置为100")
             fixed_values["max_reg_num"] = 100
-        if not isinstance(cfg.meme_chance, (int, float)) or not (
-            0 <= cfg.meme_chance <= 1
-        ):
+        if not isinstance(cfg.meme_chance, (int, float)) or isinstance(
+            cfg.meme_chance, bool
+        ) or not (0 <= cfg.meme_chance <= 1):
             errors.append("表情发送概率必须在0-1之间")
-            fixed.append("表情发送概率已重置为0.4")
-            fixed_values["meme_chance"] = 0.4
+            fixed.append("表情发送概率已重置为0.2")
+            fixed_values["meme_chance"] = 0.2
         if cfg.steal_mode not in ("probability", "cooldown"):
             errors.append(
                 f"偷图模式 '{cfg.steal_mode}' 无效，必须为 probability 或 cooldown"
             )
             fixed.append("偷图模式已重置为 probability")
             fixed_values["steal_mode"] = "probability"
-        if not isinstance(cfg.steal_chance, (int, float)) or not (
-            0 <= cfg.steal_chance <= 1
-        ):
+        if not isinstance(cfg.steal_chance, (int, float)) or isinstance(
+            cfg.steal_chance, bool
+        ) or not (0 <= cfg.steal_chance <= 1):
             errors.append("偷图概率必须在0-1之间")
-            fixed.append("偷图概率已重置为0.6")
-            fixed_values["steal_chance"] = 0.6
-        if not isinstance(cfg.steal_pool_capacity, int) or cfg.steal_pool_capacity < 10:
+            fixed.append("偷图概率已重置为0.3")
+            fixed_values["steal_chance"] = 0.3
+        if not isinstance(cfg.steal_pool_capacity, int) or isinstance(
+            cfg.steal_pool_capacity, bool
+        ) or cfg.steal_pool_capacity < 10:
             errors.append("待审核池容量必须是不小于10的整数")
             fixed.append("待审核池容量已重置为200")
             fixed_values["steal_pool_capacity"] = 200
+        disk_limits = {
+            "max_disk_bytes": 268435456,
+            "max_pending_disk_bytes": 134217728,
+        }
+        for name, default in disk_limits.items():
+            value = getattr(cfg, name, default)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                errors.append(f"磁盘容量上限 {name} 必须为非负整数")
+                fixed.append(f"{name} 已重置为 {default}")
+                fixed_values[name] = default
         source_limits = {
             "external_source_max_items": (1, 20_000, 2000),
             "external_source_max_image_bytes": (

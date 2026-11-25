@@ -354,6 +354,16 @@ class VLMCallService:
             retry_delay = float(getattr(self.plugin, "vision_retry_delay", 1.0))
         except (TypeError, ValueError):
             retry_delay = 1.0
+        cfg = getattr(self.plugin, "plugin_config", None)
+        raw_timeout = getattr(cfg, "vision_call_timeout", None)
+        if raw_timeout is None:
+            raw_timeout = getattr(self.plugin, "vision_call_timeout", 90.0)
+        try:
+            call_timeout = float(raw_timeout)
+        except (TypeError, ValueError):
+            call_timeout = 90.0
+        if call_timeout <= 0:
+            call_timeout = 90.0
         last_error: Exception | None = None
 
         for attempt in range(max_retries):
@@ -369,10 +379,13 @@ class VLMCallService:
                         provider_id,
                         "astrbot_plugin_visual_media",
                         "visual_vlm_analysis",
-                        lambda: self.plugin.context.llm_generate(
-                            chat_provider_id=provider_id,
-                            prompt=prompt,
-                            image_urls=[file_url],
+                        lambda: asyncio.wait_for(
+                            self.plugin.context.llm_generate(
+                                chat_provider_id=provider_id,
+                                prompt=prompt,
+                                image_urls=[file_url],
+                            ),
+                            timeout=call_timeout,
                         ),
                     ),
                 )

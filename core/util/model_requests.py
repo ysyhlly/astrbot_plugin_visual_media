@@ -46,10 +46,13 @@ class ModelRequestGate:
         operation,
         *,
         max_concurrency: int = DEFAULT_INTERACTIVE_CONCURRENCY,
+        timeout: float | None = None,
     ):
         """Zero-interval concurrent lane for interactive queries (decoupled from 5s background gate)."""
         sem = self._interactive_semaphore(provider_id, max_concurrency)
         async with sem:
+            if timeout is not None and timeout > 0:
+                return await asyncio.wait_for(operation(), timeout=timeout)
             return await operation()
 
     async def call(
@@ -59,10 +62,14 @@ class ModelRequestGate:
         *,
         interactive: bool = False,
         max_concurrency: int = DEFAULT_INTERACTIVE_CONCURRENCY,
+        timeout: float | None = None,
     ):
         if interactive:
             return await self.call_interactive(
-                provider_id, operation, max_concurrency=max_concurrency
+                provider_id,
+                operation,
+                max_concurrency=max_concurrency,
+                timeout=timeout,
             )
         lock = self._locks.setdefault(provider_id, asyncio.Lock())
         async with lock:
@@ -72,12 +79,17 @@ class ModelRequestGate:
             cfg = getattr(self.plugin, "plugin_config", None)
             interval = max(0, float(getattr(cfg, "model_request_interval", 5.0)))
             self._next[provider_id] = time.monotonic() + interval
-            try:
-                return await operation()
-            except Exception as exc:
-                if is_rate_limited(exc):
-                    self._next[provider_id] = max(self._next[provider_id], time.monotonic() + retry_after(exc))
-                raise
+        try:
+            if timeout is not None and timeout > 0:
+                return await asyncio.wait_for(operation(), timeout=timeout)
+            return await operation()
+        except Exception as exc:
+            if is_rate_limited(exc):
+                self._next[provider_id] = max(
+                    self._next.get(provider_id, 0),
+                    time.monotonic() + retry_after(exc),
+                )
+            raise
 
 
 def model_request_gate(plugin) -> ModelRequestGate:

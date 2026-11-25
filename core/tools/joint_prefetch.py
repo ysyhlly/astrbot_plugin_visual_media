@@ -69,6 +69,7 @@ def joint_search_enabled(plugin, event):
 
 class JointReplyPrefetch:
     timeout_seconds = 6
+    embedding_timeout_seconds = 1.5
 
     def __init__(self, plugin, event, query):
         self.plugin, self.event, self.query = plugin, event, query
@@ -96,6 +97,19 @@ class JointReplyPrefetch:
             return await asyncio.to_thread(self.plugin.db_service.get_library_version)
         except Exception:
             return None
+
+    def _resolve_embedding_timeout(self) -> float:
+        cfg = getattr(self.plugin, "plugin_config", None)
+        raw = getattr(cfg, "joint_prefetch_embedding_timeout", None)
+        if raw is None:
+            raw = self.embedding_timeout_seconds
+        try:
+            timeout = float(raw)
+        except (TypeError, ValueError):
+            timeout = float(self.embedding_timeout_seconds)
+        if timeout <= 0:
+            timeout = float(self.embedding_timeout_seconds)
+        return min(timeout, float(self.timeout_seconds))
 
     async def _search(self, *, local_only: bool = False):
         if not self.query:
@@ -142,7 +156,8 @@ class JointReplyPrefetch:
             nonlocal outcome, observed_version
             outcome, observed_version = search_outcome, library_version
 
-        with embedding_search_timeout(0.0 if local_only else None):
+        emb_timeout = 0.0 if local_only else self._resolve_embedding_timeout()
+        with embedding_search_timeout(emb_timeout):
             async for _ in self.plugin._search_meme_impl(
                 clone, self.query, on_outcome=report
             ):

@@ -14,8 +14,10 @@ import aiohttp
 from astrbot.api import logger
 
 from ..api_types import APIError, ApiRequestConfig
+from ..core.errors import redact_text
 from ..tl_utils import get_temp_dir, save_base64_image
 from .base import ProviderRequest
+from .openai_compat import _is_refusal_or_policy_text
 from .provider_limits import MAX_REFERENCE_IMAGES_GEMINI_INTERACTIONS
 from .reference_intake import announce_reference_intake
 
@@ -201,6 +203,18 @@ class GeminiInteractionsProvider:
             "[gemini_interactions] 未生成图像的响应: %s", str(response_data)[:1000]
         )
         if text_content:
+            redacted_text = redact_text(text_content)
+            if _is_refusal_or_policy_text(text_content):
+                logger.warning(
+                    "[gemini_interactions] API 返回拒绝/政策拦截文本，快速失败不再重试: %s",
+                    redacted_text[:200],
+                )
+                raise APIError(
+                    f"图像生成被模型策略拒绝：{redacted_text[:300]}",
+                    400,
+                    "content_policy_refusal",
+                    retryable=False,
+                )
             logger.warning(
                 "[gemini_interactions] API 只返回文本，未生成图像，将触发重试"
             )
@@ -337,6 +351,7 @@ class GeminiInteractionsProvider:
                 + (f" 详情: {'; '.join(fail_reasons[:3])}" if fail_reasons else ""),
                 None,
                 "invalid_reference_image",
+                retryable=False,
             )
         return blocks
 

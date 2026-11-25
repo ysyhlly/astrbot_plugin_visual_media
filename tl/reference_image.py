@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -372,52 +373,77 @@ async def normalize_reference_image_input(
             if len(data) > ((max_bytes * 4) // 3 + 16):
                 logger.warning("参考图 data URL 超过单图字节上限")
                 return None, None
-            try:
-                raw = base64.b64decode(data, validate=False)
-            except Exception:
-                logger.warning("参考图 data URL base64 解码失败")
-                return None, None
-            return coerce_reference_image_bytes(mime_type, raw, max_bytes=max_bytes)
+
+            def _decode_and_coerce_data_uri() -> tuple[str | None, str | None]:
+                try:
+                    raw = base64.b64decode(data, validate=False)
+                except Exception:
+                    logger.warning("参考图 data URL base64 解码失败")
+                    return None, None
+                return coerce_reference_image_bytes(
+                    mime_type, raw, max_bytes=max_bytes
+                )
+
+            return await asyncio.to_thread(_decode_and_coerce_data_uri)
 
         if image_str.startswith("file://"):
             parsed = urllib.parse.urlparse(image_str)
             image_path = Path(urllib.request.url2pathname(parsed.path))
-            if image_path.exists() and image_path.is_file():
+
+            def _read_file_uri() -> tuple[str, tuple[str | None, str | None]]:
+                if not (image_path.exists() and image_path.is_file()):
+                    return "missing", (None, None)
                 suffix = image_path.suffix.lower().lstrip(".") or "png"
                 mime_type = f"image/{suffix}"
-                logger.debug(f"使用参考图 file:// 路径: {image_path}")
                 try:
                     if image_path.stat().st_size > max_bytes:
                         logger.warning(f"参考图 file:// 超过大小上限: {image_path}")
-                        return None, None
+                        return "too_large", (None, None)
                     data_bytes = image_path.read_bytes()
-                    return coerce_reference_image_bytes(
+                    return "ok", coerce_reference_image_bytes(
                         mime_type, data_bytes, max_bytes=max_bytes
                     )
                 except Exception as e:
                     logger.warning(f"读取参考图 file:// 路径失败: {e}")
-            else:
+                    return "error", (None, None)
+
+            status, coerced = await asyncio.to_thread(_read_file_uri)
+            if status == "ok":
+                logger.debug(f"使用参考图 file:// 路径: {image_path}")
+                return coerced
+            if status == "too_large":
+                return None, None
+            if status == "missing":
                 logger.warning(f"参考图 file:// 路径不存在: {image_str}")
 
-        try:
-            is_local_file = os.path.isfile(image_str)
-        except (OSError, ValueError):
-            is_local_file = False
-        if is_local_file:
+        def _read_local_path() -> tuple[str, tuple[str | None, str | None]]:
+            try:
+                is_local_file = os.path.isfile(image_str)
+            except (OSError, ValueError):
+                is_local_file = False
+            if not is_local_file:
+                return "not_file", (None, None)
             image_path = Path(image_str)
             suffix = image_path.suffix.lower().lstrip(".") or "png"
             mime_type = f"image/{suffix}"
-            logger.debug(f"使用参考图本地路径: {image_path}")
             try:
                 if image_path.stat().st_size > max_bytes:
                     logger.warning(f"参考图本地路径超过大小上限: {image_path}")
-                    return None, None
+                    return "too_large", (None, None)
                 data_bytes = image_path.read_bytes()
-                return coerce_reference_image_bytes(
+                return "ok", coerce_reference_image_bytes(
                     mime_type, data_bytes, max_bytes=max_bytes
                 )
             except Exception as e:
                 logger.warning(f"读取参考图本地路径失败: {e}")
+                return "error", (None, None)
+
+        local_status, local_coerced = await asyncio.to_thread(_read_local_path)
+        if local_status == "ok":
+            logger.debug(f"使用参考图本地路径: {image_str}")
+            return local_coerced
+        if local_status == "too_large":
+            return None, None
 
         if image_str.startswith(("http://", "https://")):
             cleaned_url = image_str.replace("&amp;", "&")
@@ -448,21 +474,31 @@ async def normalize_reference_image_input(
 
             logger.debug(f"下载 http(s) 参考图: {redact_url(cleaned_url)}")
 
-            cached = check_reference_image_cache(cleaned_url, cache_dir)
-            if cached:
+            def _read_cached_reference() -> tuple[str, tuple[str | None, str | None]]:
+                cached = check_reference_image_cache(cleaned_url, cache_dir)
+                if not cached:
+                    return "miss", (None, None)
                 mime_guess = f"image/{cached.suffix.lstrip('.') or 'png'}"
-                logger.debug(f"参考图命中缓存: {redact_url(cleaned_url)}")
                 try:
                     if cached.stat().st_size > max_bytes:
                         logger.warning(f"参考图缓存文件超过大小上限: {cached}")
-                        return None, None
+                        return "too_large", (None, None)
                     data_bytes = cached.read_bytes()
                 except Exception as e:
                     logger.warning(f"读取参考图缓存失败: {e}")
-                else:
-                    return coerce_reference_image_bytes(
-                        mime_guess, data_bytes, max_bytes=max_bytes
-                    )
+                    return "error", (None, None)
+                return "hit", coerce_reference_image_bytes(
+                    mime_guess, data_bytes, max_bytes=max_bytes
+                )
+
+            cache_status, cached_coerced = await asyncio.to_thread(
+                _read_cached_reference
+            )
+            if cache_status == "hit":
+                logger.debug(f"参考图命中缓存: {redact_url(cleaned_url)}")
+                return cached_coerced
+            if cache_status == "too_large":
+                return None, None
 
             headers = build_reference_image_headers(parsed_host, for_qq=is_qq)
 
@@ -526,12 +562,15 @@ async def normalize_reference_image_input(
                                 except Exception as e:
                                     fallback_reason = f"读取响应体失败: {e}"
                                 else:
-                                    save_reference_image_cache(
-                                        cleaned_url, data_bytes, mime_type, cache_dir
-                                    )
-                                    return coerce_reference_image_bytes(
-                                        mime_type, data_bytes, max_bytes=max_bytes
-                                    )
+                                    def _cache_and_coerce() -> tuple[str | None, str | None]:
+                                        save_reference_image_cache(
+                                            cleaned_url, data_bytes, mime_type, cache_dir
+                                        )
+                                        return coerce_reference_image_bytes(
+                                            mime_type, data_bytes, max_bytes=max_bytes
+                                        )
+
+                                    return await asyncio.to_thread(_cache_and_coerce)
                                 break
                             fallback_reason = f"HTTP {resp.status} {resp.reason}"
                             break
@@ -557,23 +596,27 @@ async def normalize_reference_image_input(
                 return await fetch_with_session(new_session)
 
         logger.debug("尝试将参考图输入视为纯 base64")
-        try:
-            if len(image_str) > ((max_bytes * 4) // 3 + 16):
-                return None, None
-            base64.b64decode(image_str, validate=False)
-            return coerce_reference_image(None, image_str, max_bytes=max_bytes)
-        except binascii.Error:
-            cleaned = re.sub(r"[^A-Za-z0-9+/=_-]", "", image_str)
-            if len(cleaned) > ((max_bytes * 4) // 3 + 16):
-                return None, None
-            pad_len = (-len(cleaned)) % 4
-            if pad_len:
-                cleaned += "=" * pad_len
+
+        def _decode_raw_base64() -> tuple[str | None, str | None]:
             try:
-                base64.b64decode(cleaned, validate=False)
-                return coerce_reference_image(None, cleaned, max_bytes=max_bytes)
-            except Exception:
-                return None, None
+                if len(image_str) > ((max_bytes * 4) // 3 + 16):
+                    return None, None
+                base64.b64decode(image_str, validate=False)
+                return coerce_reference_image(None, image_str, max_bytes=max_bytes)
+            except binascii.Error:
+                cleaned = re.sub(r"[^A-Za-z0-9+/=_-]", "", image_str)
+                if len(cleaned) > ((max_bytes * 4) // 3 + 16):
+                    return None, None
+                pad_len = (-len(cleaned)) % 4
+                if pad_len:
+                    cleaned += "=" * pad_len
+                try:
+                    base64.b64decode(cleaned, validate=False)
+                    return coerce_reference_image(None, cleaned, max_bytes=max_bytes)
+                except Exception:
+                    return None, None
+
+        return await asyncio.to_thread(_decode_raw_base64)
 
     except Exception as e:
         logger.error(f"规范化参考图输入失败: {e}")

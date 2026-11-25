@@ -107,10 +107,10 @@ class MemeSearchToolWorkflow:
             raw_results = await self._search_meme_candidates(event, query, **search_options)
             had_raw_ranked = bool(raw_results)
 
-            # 仅对最终 Top-K 候选在工作线程校验文件存在，避免每次请求全库 os.path.isfile 扫描
+            # 对有限召回候选在工作线程校验文件存在，先经行为策略过滤再截断 Top-K
             if raw_results:
                 results = await asyncio.to_thread(
-                    lambda: [item for item in raw_results if os.path.isfile(item[0])][:max_results]
+                    lambda: [item for item in raw_results if os.path.isfile(item[0])]
                 )
             else:
                 results = []
@@ -127,6 +127,8 @@ class MemeSearchToolWorkflow:
                 ranked = await behavior.prepare_candidates(event, [{**idx.get(item[0], {}), "path": item[0]} for item in results])
                 order = {item["path"]: number for number, item in enumerate(ranked)}
                 results = sorted((item for item in results if item[0] in order), key=lambda item: order[item[0]])
+
+            results = results[:max_results]
 
             if not results:
                 outcome = "no_ranked_candidate" if idx else "files_missing"

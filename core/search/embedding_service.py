@@ -17,7 +17,11 @@ from astrbot.api import logger
 from astrbot.api.star import StarTools
 
 from ..processing.semantic_schema import EMBEDDING_TEXT_VERSION, build_meme_search_text
-from .embedding_provider_adapter import EmbeddingProviderAdapter, interactive_embedding_lane
+from .embedding_provider_adapter import (
+    EmbeddingProviderAdapter,
+    interactive_embedding_lane,
+    precomputed_embeddings,
+)
 
 
 def _load_series_panels():
@@ -352,7 +356,8 @@ class EmbeddingService:
                 previous = await asyncio.to_thread(db.get_meta_value, "embedding_active_signature")
                 if previous != signature:
                     await asyncio.to_thread(self._cleanup_stale_faiss_files, signature)
-                    await asyncio.to_thread(db.enqueue_search_refresh, db.get_all_paths())
+                    all_paths = await asyncio.to_thread(db.get_all_paths)
+                    await asyncio.to_thread(db.enqueue_search_refresh, all_paths)
                     await asyncio.to_thread(db.set_meta_value, "embedding_active_signature", signature)
 
     # ═══════════════════════════════════════════════════
@@ -611,16 +616,24 @@ class EmbeddingService:
         if len(text) > 4000:
             text = text[:4000]
 
-        # FaissVecDB 路径
+        # FaissVecDB 路径（先在锁外完成远程嵌入与限流等待，仅在内存/SQLite 临界区持锁）
         if self._init_faiss() and self._faiss_db is not None:
             try:
                 await self._ensure_faiss_initialized()
-                async with self._faiss_operation_lock:
-                    ids = await self._faiss_db.insert_batch(
-                        contents=[text],
-                        metadatas=[{"path": path, "category": str(entry.get("category", ""))}],
-                        tasks_limit=1,
-                    )
+                precomputed: dict[str, list[float]] | None = None
+                provider = self._get_provider()
+                if provider is not None:
+                    vec = await EmbeddingProviderAdapter(self, provider).get_embedding(text)
+                    if not vec:
+                        return False
+                    precomputed = {text: vec}
+                with precomputed_embeddings(precomputed):
+                    async with self._faiss_operation_lock:
+                        ids = await self._faiss_db.insert_batch(
+                            contents=[text],
+                            metadatas=[{"path": path, "category": str(entry.get("category", ""))}],
+                            tasks_limit=1,
+                        )
                 return len(ids) == 1
             except Exception as e:
                 logger.debug(f"[Embedding] FaissVecDB 插入失败: {e}")
@@ -769,14 +782,34 @@ class EmbeddingService:
             # 将查询文本截断到 2000 字符。
             processed = query[:2000] if len(query) > 2000 else query
 
-            # FaissVecDB 路径
+            # FaissVecDB 路径（远程查询嵌入在锁外执行；失败不二次请求，Faiss 失败时复用已算向量）
+            precomputed_query_vec: list[float] | None = None
             if self._init_faiss() and self._faiss_db is not None:
+                provider = self._get_provider()
+                if provider is not None:
+                    try:
+                        precomputed_query_vec = await EmbeddingProviderAdapter(
+                            self, provider, interactive=True
+                        ).get_embedding(processed)
+                        if not precomputed_query_vec:
+                            return []
+                    except Exception as e:
+                        self.warning_rate_limited(
+                            "query_embed", f"[Embedding] 查询向量计算失败: {e}"
+                        )
+                        return []
                 try:
                     await self._ensure_faiss_initialized()
-                    async with self._faiss_operation_lock:
-                        results = await self._faiss_db.retrieve(
-                            query=processed, k=k, fetch_k=k * 2, rerank=False
-                        )
+                    precomputed = (
+                        {processed: precomputed_query_vec}
+                        if precomputed_query_vec is not None
+                        else None
+                    )
+                    with precomputed_embeddings(precomputed):
+                        async with self._faiss_operation_lock:
+                            results = await self._faiss_db.retrieve(
+                                query=processed, k=k, fetch_k=k * 2, rerank=False
+                            )
                     out: list[tuple[str, float]] = []
                     for r in results:
                         data = getattr(r, "data", None)
@@ -816,10 +849,18 @@ class EmbeddingService:
                 except Exception as e:
                     self.warning_rate_limited("faiss_retrieve", f"[Embedding] FaissVecDB 检索失败: {e}")
 
-            # numpy 降级
-            return await self._fallback_search(processed, k)
+            # numpy 降级（已算好的查询向量直接复用，不触发二次远程嵌入）
+            return await self._fallback_search(
+                processed, k, query_vector=precomputed_query_vec
+            )
 
-    async def _fallback_search(self, query: str, k: int) -> list[tuple[str, float]]:
+    async def _fallback_search(
+        self,
+        query: str,
+        k: int,
+        *,
+        query_vector: list[float] | None = None,
+    ) -> list[tuple[str, float]]:
         """降级：numpy 余弦相似度检索。"""
         try:
             self._load_fallback_matrix()
@@ -830,17 +871,22 @@ class EmbeddingService:
             if provider is None:
                 return []
 
-            # 嵌入查询（走实时交互通道 + 查询向量缓存）
-            try:
-                vec = await EmbeddingProviderAdapter(
-                    self, provider, interactive=True
-                ).get_embedding(query)
-                if not vec:
+            # 优先复用 Faiss 路径已算好的查询向量，避免二次远程嵌入请求
+            if query_vector is not None:
+                vec = query_vector
+                if not vec or self._fallback_model_sig != self._fallback_signature(provider):
                     return []
-                if self._fallback_model_sig != self._fallback_signature(provider):
+            else:
+                try:
+                    vec = await EmbeddingProviderAdapter(
+                        self, provider, interactive=True
+                    ).get_embedding(query)
+                    if not vec:
+                        return []
+                    if self._fallback_model_sig != self._fallback_signature(provider):
+                        return []
+                except Exception:
                     return []
-            except Exception:
-                return []
 
             # 余弦相似度
             qv = np.array(vec, dtype=np.float32)
@@ -934,24 +980,41 @@ class EmbeddingService:
             items = [item for item in all_items if item[2]]
             successful = []
             if using_faiss and items:
+                contents = [text for _, _, text in items]
+                precomputed: dict[str, list[float]] | None = None
+                insert_started = False
+                provider = self._get_provider()
                 try:
-                    async with self._faiss_operation_lock:
-                        ids = await self._faiss_db.insert_batch(
-                            contents=[text for _, _, text in items],
-                            metadatas=[{"path": path, "category": entry.get("category", "")} for path, entry, _ in items],
-                            batch_size=batch_size, tasks_limit=1,
+                    if provider is not None:
+                        vectors = await EmbeddingProviderAdapter(
+                            self, provider
+                        ).get_embeddings_batch(
+                            contents, batch_size=batch_size, tasks_limit=1
                         )
+                        if len(vectors) != len(contents):
+                            raise RuntimeError("incomplete embedding batch")
+                        precomputed = dict(zip(contents, vectors))
+                    insert_started = True
+                    with precomputed_embeddings(precomputed):
+                        async with self._faiss_operation_lock:
+                            ids = await self._faiss_db.insert_batch(
+                                contents=contents,
+                                metadatas=[{"path": path, "category": entry.get("category", "")} for path, entry, _ in items],
+                                batch_size=batch_size, tasks_limit=1,
+                            )
                     if len(ids) != len(items):
                         raise RuntimeError("incomplete FaissVecDB batch")
                     successful = [path for path, _, _ in items]
                 except Exception as exc:
                     failed_paths = [path for path, _, _ in items]
                     # Older SDK versions can leave partial documents after a failed batch.
-                    for path in failed_paths:
-                        try:
-                            await self._faiss_db.delete_documents(metadata_filters={"path": path})
-                        except Exception:
-                            pass
+                    if insert_started:
+                        async with self._faiss_operation_lock:
+                            for path in failed_paths:
+                                try:
+                                    await self._faiss_db.delete_documents(metadata_filters={"path": path})
+                                except Exception:
+                                    pass
                     await asyncio.to_thread(db.enqueue_search_refresh, failed_paths)
                     logger.warning(f"[Embedding] Batch backfill queued for retry: {exc}")
             else:

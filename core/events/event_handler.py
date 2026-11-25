@@ -233,14 +233,18 @@ class EventHandler:
         files_actually_deleted: list[str] = []
 
         try:
-            rekeyed, stale_removed = self._normalize_capacity_index_paths(image_index)
+            rekeyed, stale_removed = await asyncio.to_thread(
+                self._normalize_capacity_index_paths, image_index
+            )
             if rekeyed or stale_removed:
                 logger.info(
                     f"[capacity] Normalized {rekeyed} index paths and removed "
                     f"{stale_removed} stale records before enforcing capacity"
                 )
 
-            items_to_remove = self._select_items_for_removal(image_index)
+            items_to_remove = await asyncio.to_thread(
+                self._select_items_for_removal, image_index
+            )
             if not items_to_remove:
                 return files_actually_deleted
 
@@ -271,7 +275,7 @@ class EventHandler:
                         continue
                     seen_paths.add(file_path)
 
-                    if Path(file_path).exists():
+                    if await asyncio.to_thread(Path(file_path).exists):
                         try:
                             removed = await safe_remove_file(file_path)
                             if removed:
@@ -286,7 +290,7 @@ class EventHandler:
                         # after the primary indexed file is confirmed gone.
                         logger.debug(f"[capacity] Candidate file is already missing: {file_path}")
 
-                if not Path(remove_path).exists():
+                if not await asyncio.to_thread(Path(remove_path).exists):
                     file_gone = True
 
                 # 只有文件确实被清理后才从索引中删除，避免产生新的"僵尸文件"

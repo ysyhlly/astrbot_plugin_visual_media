@@ -449,6 +449,24 @@
         },
         "hint": "仅计算通用库中未收藏、未指定角色的普通表情；收藏、角色表情及受保护外部导入不占额度。超限按使用次数和入库时间加权淘汰。"
       },
+      "max_disk_bytes": {
+        "description": "正式表情库磁盘占用上限（字节）",
+        "type": "int",
+        "default": 268435456,
+        "hint": "正式表情库总磁盘容量软上限，默认 268435456（256 MB），填 0 表示不限制。超限时优先淘汰低频旧图。",
+        "condition": {
+          "show_advanced_settings": true
+        }
+      },
+      "max_pending_disk_bytes": {
+        "description": "待审核池磁盘占用上限（字节）",
+        "type": "int",
+        "default": 134217728,
+        "hint": "待审核池总磁盘容量软上限，默认 134217728（128 MB），填 0 表示不限制。超限时按入队顺序淘汰最旧待审文件。",
+        "condition": {
+          "show_advanced_settings": true
+        }
+      },
       "eviction_usage_weight": {
         "description": "淘汰评分：低使用次数权重",
         "type": "float",

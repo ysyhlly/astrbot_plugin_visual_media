@@ -266,6 +266,7 @@ class MemeSmartSelectService:
         candidate_categories: list[str] | None = None,
         event: AstrMessageEvent | None = None,
         *, emotion_weights: dict[str, float] | None = None,
+        selection_lock: asyncio.Lock | None = None,
     ) -> str | None:
         """按相关度选图，只有接近同分的候选参与随机选择。"""
         candidates = await self._rank_emoji_candidates(
@@ -275,22 +276,30 @@ class MemeSmartSelectService:
         if not candidates:
             return None
         try:
-            top_candidates = [item for item in candidates[:3] if item[1] >= candidates[0][1] - 0.05]
-            if len(top_candidates) > 1:
-                weights = [item[1] for item in top_candidates]
-                total_weight = sum(weights)
-                if total_weight > 0:
-                    selected = random.choices(top_candidates, weights=weights, k=1)[0]
-                    self._selection_strategy._update_recent_usage(selected[5], selected[0])
-                    return selected[0]
+            def _pick_and_record() -> str:
+                top_candidates = [
+                    item for item in candidates[:3] if item[1] >= candidates[0][1] - 0.05
+                ]
+                if len(top_candidates) > 1:
+                    weights = [item[1] for item in top_candidates]
+                    total_weight = sum(weights)
+                    if total_weight > 0:
+                        selected = random.choices(top_candidates, weights=weights, k=1)[0]
+                        self._selection_strategy._update_recent_usage(selected[5], selected[0])
+                        return selected[0]
 
-            result = candidates[0]
-            self._selection_strategy._update_recent_usage(result[5], result[0])
-            logger.debug(
-                f"[智能选择] 分类={category}, 候选数={len(candidates)}, "
-                f"结果={result[5]}, 分数={result[1]:.2f} (desc={result[2]:.2f}, tag={result[3]:.2f}, scene={result[4]:.2f})"
-            )
-            return result[0]
+                result = candidates[0]
+                self._selection_strategy._update_recent_usage(result[5], result[0])
+                logger.debug(
+                    f"[智能选择] 分类={category}, 候选数={len(candidates)}, "
+                    f"结果={result[5]}, 分数={result[1]:.2f} (desc={result[2]:.2f}, tag={result[3]:.2f}, scene={result[4]:.2f})"
+                )
+                return result[0]
+
+            if selection_lock is not None:
+                async with selection_lock:
+                    return _pick_and_record()
+            return _pick_and_record()
 
         except Exception as e:
             logger.error(f"智能选择失败: {e}")

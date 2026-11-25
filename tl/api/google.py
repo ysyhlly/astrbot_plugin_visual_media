@@ -12,10 +12,12 @@ import aiohttp
 from astrbot.api import logger
 
 from ..api_types import APIError, ApiRequestConfig
+from ..core.errors import redact_text
 from ..provider_capabilities import gemini_image_family
 from ..thought_signature import log_thought_signature_debug
 from ..tl_utils import get_temp_dir, save_base64_image
 from .base import ProviderRequest
+from .openai_compat import _is_refusal_or_policy_text
 from .provider_limits import MAX_REFERENCE_IMAGES_GOOGLE
 from .reference_intake import announce_reference_intake
 
@@ -472,6 +474,17 @@ class GoogleProvider:
             return image_urls, image_paths, text_content, thought_signature
 
         if text_content:
+            redacted_text = redact_text(text_content)
+            if _is_refusal_or_policy_text(text_content):
+                logger.warning(
+                    f"Google返回拒绝/政策拦截文本，快速失败不再重试: {redacted_text[:200]}"
+                )
+                raise APIError(
+                    f"图像生成被模型策略拒绝：{redacted_text[:300]}",
+                    400,
+                    "content_policy_refusal",
+                    retryable=False,
+                )
             logger.warning("API只返回了文本响应，未生成图像，将触发重试")
             logger.debug(f"Google响应内容: {str(response_data)[:1000]}")
             raise APIError(

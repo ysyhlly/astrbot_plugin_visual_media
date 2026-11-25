@@ -46,15 +46,16 @@ class MemeSelector:
         if not self._check_group_allowed(event):
             return None
         history = await self._jev_selector.get_history(event)
-        async with self._selection_lock:
-            ranked = await self._smart_select_service._rank_emoji_candidates(
-                "", f"{user_message[:2000]}\n{text[:2000]}", event=event,
-                deterministic=True,
-                emotion_weights=punctuation_emotion_weights(text),
-            )
-            idx = await self._candidate_index([item[0] for item in ranked])
-            candidates = []
-            seen = set()
+        ranked = await self._smart_select_service._rank_emoji_candidates(
+            "", f"{user_message[:2000]}\n{text[:2000]}", event=event,
+            deterministic=True,
+            emotion_weights=punctuation_emotion_weights(text),
+        )
+        idx = await self._candidate_index([item[0] for item in ranked])
+
+        def _collect_existing() -> list[tuple[str, dict[str, Any]]]:
+            out: list[tuple[str, dict[str, Any]]] = []
+            seen: set[str] = set()
             for item in ranked:
                 path = item[0]
                 canon = canonicalize_path(path)
@@ -64,9 +65,12 @@ class MemeSelector:
                 if not Path(path).is_file() or not self._is_entry_allowed_for_event(data, event):
                     continue
                 seen.add(canon)
-                candidates.append((path, data))
-                if len(candidates) == JevSelector.TOP_K:
+                out.append((path, data))
+                if len(out) == JevSelector.TOP_K:
                     break
+            return out
+
+        candidates = await asyncio.to_thread(_collect_existing)
         return await self._jev_selector.select(
             candidates, history=history, user_message=user_message, reply=text,
         )
@@ -75,14 +79,17 @@ class MemeSelector:
         """网络请求及延迟后重新核验候选，再走既有发送/计数链路。"""
         idx = await self._candidate_index([path])
         data = idx.get(path) or idx.get(canonicalize_path(path))
-        if not isinstance(data, dict) or not Path(path).is_file():
+        if not isinstance(data, dict) or not await asyncio.to_thread(Path(path).is_file):
             return False
         if not self._is_entry_allowed_for_event(data, event):
             return False
         sent = await self.send_emoji_with_text(event, path, text)
         if sent:
             logger.debug(f"[JEV] 已发送图片: {path}")
-            self._selection_strategy._update_recent_usage(entry_category(data), canonicalize_path(path))
+            async with self._selection_lock:
+                self._selection_strategy._update_recent_usage(
+                    entry_category(data), canonicalize_path(path)
+                )
         return sent
 
     def _get_index(self) -> dict[str, Any]:
@@ -157,28 +164,29 @@ class MemeSelector:
         extra_categories: list[str] | None = None,
         *, emotion_weights: dict[str, float] | None = None,
     ) -> str | None:
-        """选择表情包（智能或随机）。"""
-        async with self._selection_lock:
-            use_smart = self.plugin.plugin_config.smart_meme_selection
-            extra = [item for item in (extra_categories or []) if item]
-            primary = self.normalize_category(category) or str(category or "").lower().strip()
-            candidate_categories: list[str] = []
-            if extra:
-                for item in [primary, *extra]:
-                    mapped = self.normalize_category(item) or str(item).lower().strip()
-                    if mapped and mapped not in candidate_categories:
-                        candidate_categories.append(mapped)
-            elif primary:
-                candidate_categories = self._selection_strategy._get_candidate_categories(primary)
+        """选择表情包（智能或随机）；锁仅保护最近使用状态更新，不跨远程检索。"""
+        use_smart = self.plugin.plugin_config.smart_meme_selection
+        extra = [item for item in (extra_categories or []) if item]
+        primary = self.normalize_category(category) or str(category or "").lower().strip()
+        candidate_categories: list[str] = []
+        if extra:
+            for item in [primary, *extra]:
+                mapped = self.normalize_category(item) or str(item).lower().strip()
+                if mapped and mapped not in candidate_categories:
+                    candidate_categories.append(mapped)
+        elif primary:
+            candidate_categories = self._selection_strategy._get_candidate_categories(primary)
 
-            if use_smart and context_text.strip():
-                return await self._smart_select_service._select_emoji_smart_impl(
-                    primary or (candidate_categories[0] if candidate_categories else ""),
-                    context_text,
-                    candidate_categories=candidate_categories,
-                    event=event,
-                    emotion_weights=emotion_weights,
-                )
+        if use_smart and context_text.strip():
+            return await self._smart_select_service._select_emoji_smart_impl(
+                primary or (candidate_categories[0] if candidate_categories else ""),
+                context_text,
+                candidate_categories=candidate_categories,
+                event=event,
+                emotion_weights=emotion_weights,
+                selection_lock=self._selection_lock,
+            )
+        async with self._selection_lock:
             for candidate_category in candidate_categories:
                 random_path = await asyncio.to_thread(
                     self._select_emoji_random_impl, candidate_category, event=event,
@@ -186,7 +194,7 @@ class MemeSelector:
                 if random_path:
                     return random_path
 
-            return None
+        return None
 
     def _select_emoji_random_impl(
         self,
