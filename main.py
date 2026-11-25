@@ -12,8 +12,8 @@ ensure_current(
     checks=[
         ("media_library", "MediaLibrary", "_rebuild_public_ref_cache"),
         ("media_behavior", "MediaBehavior", "records"),
+        ("series_panels", "SeriesPanels", "close"),
     ],
-    version="0.5.0-rc.9",
 )
 
 import asyncio
@@ -104,9 +104,13 @@ class VisualMediaPlugin(Star):
             self.tasks = await asyncio.to_thread(MediaTasks, self)
             self.media_api = MediaAPI(self)
             self.media_api.register(self.engine_context)
-            from .series_panels import register_series_panels
+            from importlib import reload
 
-            register_series_panels(self, "astrbot_plugin_visual_media")
+            from . import series_panels
+
+            reload(series_panels).register_series_panels(
+                self, "astrbot_plugin_visual_media"
+            )
             logger.info("[VisualMedia] Meme and generation engines initialized")
         except BaseException:
             await self.terminate()

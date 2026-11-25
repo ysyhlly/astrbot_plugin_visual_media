@@ -67,6 +67,8 @@ ROOT_FILES = {
     "THIRD_PARTY_NOTICES.md",
     "handler_manifest.json",
     "upstream-manifest.json",
+}
+SOURCE_ONLY_ROOT_FILES = {
     ".gitignore",
 }
 RUNTIME_DIRS = {
@@ -77,11 +79,29 @@ RUNTIME_DIRS = {
     "templates",
     "licenses",
     "docs",
-    "tools",
     ".astrbot-plugin",
 }
-INSTALL_EXCLUDE_PREFIXES = (("docs", "upstream-generation"), ("docs", "upstream-memes"))
-SOURCE_DIRS = RUNTIME_DIRS | {"frontend", "tests", "integration_tests"}
+INSTALL_EXCLUDE_PREFIXES = (
+    ("docs", "upstream-generation"),
+    ("docs", "upstream-memes"),
+    ("tools",),
+    (".github",),
+)
+INSTALL_FORBIDDEN_BASENAMES = {
+    ".gitignore",
+    ".gitattributes",
+    "package-lock.json",
+    "build_release.py",
+}
+INSTALL_FORBIDDEN_PREFIXES = (
+    ".github/",
+    "tools/",
+    "tests/",
+    "integration_tests/",
+    "frontend/",
+)
+PLUGIN_TOP_DIR = "astrbot_plugin_visual_media"
+SOURCE_DIRS = RUNTIME_DIRS | {"frontend", "tests", "integration_tests", "tools"}
 SKIP = {
     "__pycache__",
     "node_modules",
@@ -128,9 +148,10 @@ def build(root: Path, output: Path):
             len(rel.parts) != 3 or rel.parts[1] != "i18n" or file.suffix != ".json"
         ):
             continue
-        if (len(rel.parts) == 1 and rel.name not in ROOT_FILES) or (
-            len(rel.parts) > 1 and rel.parts[0] not in SOURCE_DIRS
-        ):
+        if (
+            len(rel.parts) == 1
+            and rel.name not in (ROOT_FILES | SOURCE_ONLY_ROOT_FILES)
+        ) or (len(rel.parts) > 1 and rel.parts[0] not in SOURCE_DIRS):
             continue
         if (
             file.suffix in FORBIDDEN_SUFFIXES
@@ -177,25 +198,29 @@ def build(root: Path, output: Path):
             for rel, _, raw in files
             if kind == "source"
             or (
-                (len(rel.parts) == 1 or rel.parts[0] in RUNTIME_DIRS)
+                (
+                    (len(rel.parts) == 1 and rel.name in ROOT_FILES)
+                    or (len(rel.parts) > 1 and rel.parts[0] in RUNTIME_DIRS)
+                )
+                and rel.name not in INSTALL_FORBIDDEN_BASENAMES
                 and not any(rel.parts[: len(p)] == p for p in INSTALL_EXCLUDE_PREFIXES)
             )
         ]
-        archive = output / f"astrbot_plugin_visual_media-{version}-{kind}.zip"
+        archive = output / f"{PLUGIN_TOP_DIR}-{version}-{kind}.zip"
         manifest = {
             rel.as_posix(): hashlib.sha256(raw).hexdigest() for rel, raw in selected
         }
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
             for rel, raw in selected:
                 info = zipfile.ZipInfo(
-                    "astrbot_plugin_visual_media/" + rel.as_posix(),
+                    f"{PLUGIN_TOP_DIR}/" + rel.as_posix(),
                     (2020, 1, 1, 0, 0, 0),
                 )
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info.external_attr = 0o644 << 16
                 z.writestr(info, raw)
             info = zipfile.ZipInfo(
-                "astrbot_plugin_visual_media/release-manifest.json",
+                f"{PLUGIN_TOP_DIR}/release-manifest.json",
                 (2020, 1, 1, 0, 0, 0),
             )
             info.compress_type = zipfile.ZIP_DEFLATED
@@ -203,12 +228,23 @@ def build(root: Path, output: Path):
             z.writestr(info, json.dumps(manifest, indent=2, sort_keys=True))
         with zipfile.ZipFile(archive) as z:
             assert z.testzip() is None
+            prefix = f"{PLUGIN_TOP_DIR}/"
+            for member in z.namelist():
+                if not member.startswith(prefix):
+                    raise ValueError(
+                        f"Archive member outside single top-level directory: {member}"
+                    )
+                if kind == "install":
+                    inner = member[len(prefix) :]
+                    if Path(inner).name in INSTALL_FORBIDDEN_BASENAMES or any(
+                        inner.startswith(bad) for bad in INSTALL_FORBIDDEN_PREFIXES
+                    ):
+                        raise ValueError(
+                            f"Forbidden dev file leaked into install archive: {inner}"
+                        )
             for name, sha in manifest.items():
                 assert (
-                    hashlib.sha256(
-                        z.read("astrbot_plugin_visual_media/" + name)
-                    ).hexdigest()
-                    == sha
+                    hashlib.sha256(z.read(prefix + name)).hexdigest() == sha
                 )
         reports.append(
             {

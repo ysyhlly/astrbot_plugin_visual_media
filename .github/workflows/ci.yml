@@ -58,6 +58,83 @@ jobs:
         working-directory: AstrBot/data/plugins/${{ github.event.repository.name }}
         run: python -m ruff check .
 
+      - name: Verify metadata, AST dependencies & release package hygiene
+        working-directory: AstrBot/data/plugins/${{ github.event.repository.name }}
+        run: |
+          python - <<'PY'
+          import ast, pathlib, re, sys, tempfile, zipfile, yaml
+
+          root = pathlib.Path(".").resolve()
+          meta = yaml.safe_load((root / "metadata.yaml").read_text(encoding="utf-8"))
+          assert meta.get("name") == "astrbot_plugin_visual_media", meta
+          version = str(meta.get("version") or "").strip()
+          assert re.fullmatch(r"\d+\.\d+\.\d+(?:[-.][0-9A-Za-z.]+)?", version), version
+
+          req_names = set()
+          for line in (root / "requirements.txt").read_text(encoding="utf-8").splitlines():
+              raw = line.split("#", 1)[0].strip()
+              if not raw:
+                  continue
+              name = re.split(r"[<>=!~;\s\[]", raw, maxsplit=1)[0].strip().lower().replace("_", "-")
+              if name:
+                  req_names.add(name)
+          assert "rank-bm25" in req_names, f"rank-bm25 missing from requirements.txt: {req_names}"
+
+          import_to_dist = {
+              "pil": "pillow",
+              "yaml": "pyyaml",
+              "cv2": "opencv-python-headless",
+              "skimage": "scikit-image",
+              "rank_bm25": "rank-bm25",
+              "aiohttp_socks": "aiohttp-socks",
+          }
+          host_or_optional = {
+              "astrbot", "aiohttp", "pydantic", "starlette", "sqlmodel", "mcp",
+              "aiocqhttp", "aiofiles", "faiss", "pillow_heif",
+          }
+          stdlib = set(sys.stdlib_module_names)
+          local_top = {p.stem for p in root.glob("*.py")} | {p.name for p in root.iterdir() if p.is_dir()}
+          skip_dirs = {".git", "__pycache__", "tests", "integration_tests", "tools", "frontend"}
+
+          missing = {}
+          for py in sorted(root.rglob("*.py")):
+              rel = py.relative_to(root)
+              if skip_dirs.intersection(rel.parts):
+                  continue
+              tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(rel))
+              for node in tree.body:
+                  mods = []
+                  if isinstance(node, ast.Import):
+                      mods = [a.name.split(".")[0] for a in node.names]
+                  elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                      mods = [node.module.split(".")[0]]
+                  for mod in mods:
+                      if mod in stdlib or mod in local_top or mod in host_or_optional:
+                          continue
+                      dist = import_to_dist.get(mod.lower(), mod.lower().replace("_", "-"))
+                      if dist not in req_names:
+                          missing.setdefault(mod, []).append(rel.as_posix())
+          assert not missing, f"Undeclared top-level third-party imports: {missing}"
+
+          sys.path.insert(0, str(root / "tools"))
+          import build_release
+          with tempfile.TemporaryDirectory() as tmp:
+              out = pathlib.Path(tmp)
+              report = build_release.build(root, out)
+              install_zip = out / f"astrbot_plugin_visual_media-{report['version']}-install.zip"
+              with zipfile.ZipFile(install_zip) as z:
+                  names = z.namelist()
+              prefix = "astrbot_plugin_visual_media/"
+              assert names and all(n.startswith(prefix) for n in names)
+              inner = {n[len(prefix):] for n in names}
+              for required in ("metadata.yaml", "main.py", "requirements.txt", "_conf_schema.json"):
+                  assert required in inner, f"Missing {required} in install.zip"
+              for bad in (".gitignore", "tools/build_release.py", "package-lock.json"):
+                  assert bad not in inner, f"Forbidden dev file leaked: {bad}"
+              assert not any(n.startswith((".github/", "tools/", "tests/", "frontend/")) for n in inner)
+          print("CI metadata, AST deps & package hygiene checks passed")
+          PY
+
       - name: Run unit tests
         working-directory: AstrBot/data/plugins/${{ github.event.repository.name }}
         env:

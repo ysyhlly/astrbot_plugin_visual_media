@@ -10,8 +10,74 @@ from collections import Counter
 from difflib import SequenceMatcher
 from functools import lru_cache
 
-from rank_bm25 import BM25Plus
-from rapidfuzz.distance.Levenshtein import distance as _levenshtein_distance
+try:
+    from rank_bm25 import BM25Plus
+except ImportError:  # pragma: no cover - fallback when optional/uninstalled in bare env
+    class BM25Plus:  # type: ignore[no-redef]
+        """Pure-Python BM25+ fallback used only when rank_bm25 is unavailable."""
+
+        def __init__(self, corpus, k1: float = 1.5, b: float = 0.75, delta: float = 0.0):
+            self.k1 = float(k1)
+            self.b = float(b)
+            self.delta = float(delta)
+            self.corpus_size = len(corpus)
+            self.doc_freqs: list[Counter[str]] = []
+            self.doc_len: list[int] = []
+            df: Counter[str] = Counter()
+            total_len = 0
+            for document in corpus:
+                counts = Counter(document)
+                self.doc_freqs.append(counts)
+                doc_length = len(document)
+                self.doc_len.append(doc_length)
+                total_len += doc_length
+                for term in counts:
+                    df[term] += 1
+            self.avgdl = (total_len / self.corpus_size) if self.corpus_size else 0.0
+            self.idf: dict[str, float] = {
+                term: math.log((self.corpus_size + 1.0) / (freq + 0.5))
+                for term, freq in df.items()
+            }
+
+        def get_scores(self, query) -> list[float]:
+            scores = [0.0] * self.corpus_size
+            if not self.corpus_size or self.avgdl <= 0:
+                return scores
+            k1 = self.k1
+            b = self.b
+            delta = self.delta
+            avgdl = self.avgdl
+            for term in query:
+                idf = self.idf.get(term)
+                if not idf:
+                    continue
+                for idx, counts in enumerate(self.doc_freqs):
+                    freq = counts.get(term, 0)
+                    if freq <= 0:
+                        continue
+                    denom = freq + k1 * (1.0 - b + b * self.doc_len[idx] / avgdl)
+                    scores[idx] += idf * (delta + (freq * (k1 + 1.0)) / denom)
+            return scores
+
+
+try:
+    from rapidfuzz.distance.Levenshtein import distance as _levenshtein_distance
+except ImportError:  # pragma: no cover - fallback when optional/uninstalled in bare env
+    def _levenshtein_distance(s1: str, s2: str) -> int:
+        if s1 == s2:
+            return 0
+        if not s1:
+            return len(s2)
+        if not s2:
+            return len(s1)
+        prev = list(range(len(s2) + 1))
+        for i, c1 in enumerate(s1, 1):
+            curr = [i]
+            for j, c2 in enumerate(s2, 1):
+                cost = 0 if c1 == c2 else 1
+                curr.append(min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost))
+            prev = curr
+        return prev[-1]
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 _PUNCT_RE = re.compile(r"[^\w\s]")
@@ -69,7 +135,8 @@ class BM25:
     def get_scores(self, query) -> list[float]:
         if self._model is None:
             return [0.0] * self.corpus_size
-        return self._model.get_scores([str(term).lower() for term in query]).tolist()
+        raw = self._model.get_scores([str(term).lower() for term in query])
+        return raw.tolist() if hasattr(raw, "tolist") else [float(s) for s in raw]
 
     def get_top_k(self, query, k=10) -> list[tuple[int, float]]:
         scores = ((index, score) for index, score in enumerate(self.get_scores(query)) if score > 0)

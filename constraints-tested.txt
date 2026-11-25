@@ -3,6 +3,7 @@ Pillow==12.3.0
 PyYAML==6.0.3
 quart==0.22.0
 RapidFuzz==3.14.6
+rank-bm25==0.2.2
 aiohttp-socks==0.12.0
 cryptography==50.0.1
 numpy==2.2.6
