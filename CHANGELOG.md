@@ -1,5 +1,10 @@
 # 更新日志
 
+## 0.5.0 — 2026-11-26
+
+- **正式版发布（GA）**：整合全部 `0.5.0-rc.x` `serve-image`/SSRF 安全加固、在途媒体保护、FAISS 锁解耦、`rank-bm25` 依赖声明与热重载修复。
+- **静态规范修复**：清理 `tl/web_studio_service.py` 未使用的 `check_remote_url` 导入，全面通过 Ruff 门禁。
+
 ## 0.5.0-rc.10 — 2026-11-25
 
 - 安全加固（Batch 1）：加固 `serve-image` 文件边界与 SSRF 防护，全面接入统一管理鉴权与 CSRF 校验。

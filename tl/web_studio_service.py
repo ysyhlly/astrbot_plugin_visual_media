@@ -35,7 +35,7 @@ from .core.errors import (
     StudioBusyError,
     redact_url,
 )
-from .core.path_policy import check_remote_url, validate_remote_url_async
+from .core.path_policy import validate_remote_url_async
 from .core.remote_fetch import PROBE_BYTES
 from .file_uri import file_uri_to_path
 from .generation_tracker import (

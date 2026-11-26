@@ -1,4 +1,9 @@
-# astrbot_plugin_visual_media 0.5.0-rc.10
+# astrbot_plugin_visual_media 0.5.0
+
+## 0.5.0 — 2026-11-26
+
+- **正式版发布（GA）**：整合全部 `0.5.0-rc.x` `serve-image`/SSRF 安全加固、在途媒体保护、FAISS 锁解耦、`rank-bm25` 依赖声明与热重载修复。
+- **静态规范修复**：清理 `tl/web_studio_service.py` 未使用的 `check_remote_url` 导入，全面通过 Ruff 门禁。
 
 ## 0.5.0-rc.10 — 2026-11-25
 
