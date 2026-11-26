@@ -4,20 +4,39 @@ import importlib
 import sys
 import types
 
+import pytest
+
 
 class _DummyLogger:
     def __init__(self) -> None:
         self.warnings: list[str] = []
         self.errors: list[str] = []
+        self.infos: list[str] = []
 
-    def warning(self, message: str) -> None:
-        self.warnings.append(message)
+    def warning(self, message: str, *args, **kwargs) -> None:
+        self.warnings.append(message % args if args else message)
 
-    def debug(self, message: str) -> None:
+    def info(self, message: str, *args, **kwargs) -> None:
+        self.infos.append(message % args if args else message)
+
+    def debug(self, message: str, *args, **kwargs) -> None:
         return None
 
-    def error(self, message: str) -> None:
-        self.errors.append(message)
+    def error(self, message: str, *args, **kwargs) -> None:
+        self.errors.append(message % args if args else message)
+
+
+@pytest.fixture(autouse=True)
+def _restore_sys_modules():
+    saved = {k: sys.modules.get(k) for k in ("astrbot", "astrbot.api", "tl.plugin_config")}
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
 
 
 def _import_plugin_config_module(logger: _DummyLogger):
