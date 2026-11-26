@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib.util
 import io
 import json
 import sys
@@ -19,6 +20,16 @@ from PIL import Image
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _module_missing(name: str) -> bool:
+    if name in sys.modules:
+        return False
+    root = name.split(".", 1)[0]
+    try:
+        return importlib.util.find_spec(root) is None
+    except (ImportError, ValueError):
+        return True
+
+
 def _ensure_astrbot_stubs() -> None:
     """Install minimal AstrBot/optional stubs so tests run offline without full AstrBot SDK."""
     astrbot_api = sys.modules.get("astrbot.api")
@@ -28,7 +39,7 @@ def _ensure_astrbot_stubs() -> None:
         if not hasattr(astrbot_api, "AstrBotConfig"):
             astrbot_api.AstrBotConfig = dict
 
-    if "astrbot.api.star" not in sys.modules:
+    if _module_missing("astrbot.api.star"):
         star_mod = ModuleType("astrbot.api.star")
 
         class _StarTools:
@@ -50,7 +61,7 @@ def _ensure_astrbot_stubs() -> None:
         if astrbot_api is not None:
             astrbot_api.star = star_mod
 
-    if "astrbot.api.event" not in sys.modules:
+    if _module_missing("astrbot.api.event"):
         event_mod = ModuleType("astrbot.api.event")
 
         class _AstrMessageEvent:
@@ -66,7 +77,7 @@ def _ensure_astrbot_stubs() -> None:
         if astrbot_api is not None:
             astrbot_api.event = event_mod
 
-    if "astrbot.api.message_components" not in sys.modules:
+    if _module_missing("astrbot.api.message_components"):
         mc_mod = ModuleType("astrbot.api.message_components")
         mc_mod.Image = type("Image", (), {})
         mc_mod.Plain = type("Plain", (), {})
@@ -74,7 +85,7 @@ def _ensure_astrbot_stubs() -> None:
         if astrbot_api is not None:
             astrbot_api.message_components = mc_mod
 
-    if "astrbot.api.provider" not in sys.modules:
+    if _module_missing("astrbot.api.provider"):
         prov_api_mod = ModuleType("astrbot.api.provider")
         prov_api_mod.LLMResponse = type("LLMResponse", (), {})
         prov_api_mod.ProviderRequest = type("ProviderRequest", (), {})
@@ -82,7 +93,7 @@ def _ensure_astrbot_stubs() -> None:
         if astrbot_api is not None:
             astrbot_api.provider = prov_api_mod
 
-    if "astrbot.core.provider.provider" not in sys.modules:
+    if _module_missing("astrbot.core.provider.provider"):
         core_mod = sys.modules.setdefault("astrbot.core", ModuleType("astrbot.core"))
         prov_pkg = sys.modules.setdefault(
             "astrbot.core.provider", ModuleType("astrbot.core.provider")
@@ -97,17 +108,17 @@ def _ensure_astrbot_stubs() -> None:
         prov_pkg.provider = prov_mod
         sys.modules["astrbot.core.provider.provider"] = prov_mod
 
-    if "quart" not in sys.modules:
+    if _module_missing("quart"):
         quart_mod = ModuleType("quart")
         quart_mod.jsonify = lambda payload: payload
         quart_mod.request = SimpleNamespace(args={})
         quart_mod.send_file = None
         sys.modules["quart"] = quart_mod
 
-    if "cv2" not in sys.modules:
+    if _module_missing("cv2"):
         sys.modules["cv2"] = ModuleType("cv2")
 
-    if "rank_bm25" not in sys.modules:
+    if _module_missing("rank_bm25"):
         bm25_mod = ModuleType("rank_bm25")
 
         class _BM25Plus:
@@ -120,7 +131,7 @@ def _ensure_astrbot_stubs() -> None:
         bm25_mod.BM25Plus = _BM25Plus
         sys.modules["rank_bm25"] = bm25_mod
 
-    if "rapidfuzz.distance.Levenshtein" not in sys.modules:
+    if _module_missing("rapidfuzz.distance.Levenshtein"):
         rf_mod = sys.modules.setdefault("rapidfuzz", ModuleType("rapidfuzz"))
         rf_dist = sys.modules.setdefault(
             "rapidfuzz.distance", ModuleType("rapidfuzz.distance")

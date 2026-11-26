@@ -24,13 +24,14 @@ def _load_reference_image(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, "PIL", fake_pil)
     monkeypatch.setitem(sys.modules, "PIL.Image", fake_image)
 
-    module_name = "real_reference_image"
+    module_name = "tl._test_real_reference_image"
     spec = importlib.util.spec_from_file_location(
         module_name,
         root / "tl" / "reference_image.py",
     )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    module.__package__ = "tl"
     monkeypatch.setitem(sys.modules, module_name, module)
     spec.loader.exec_module(module)
     return module

@@ -191,28 +191,41 @@ def test_serve_image_checks_boundary_before_filesystem_existence(
 
 
 def _load_web_api_module(monkeypatch):
-    """Import tl.web_api even if optional cv2 dependency isn't installed."""
-    if "cv2" not in sys.modules:
+    """Import tl.web_api without replacing an already-loaded module object."""
+    import importlib.util
+
+    if "cv2" not in sys.modules and importlib.util.find_spec("cv2") is None:
         monkeypatch.setitem(sys.modules, "cv2", types.ModuleType("cv2"))
-    if "astrbot.api.web" not in sys.modules:
-        web_mod = types.ModuleType("astrbot.api.web")
-        web_mod.json_response = lambda data, status_code=200, headers=None: SimpleNamespace(
-            data=data, status_code=status_code, headers=headers or {}
+    mod = importlib.import_module("tl.web_api")
+    if getattr(mod, "json_response", None) is None:
+        monkeypatch.setattr(
+            mod,
+            "json_response",
+            lambda data, status_code=200, headers=None: SimpleNamespace(
+                data=data, status_code=status_code, headers=headers or {}
+            ),
         )
-        web_mod.error_response = (
+    if getattr(mod, "error_response", None) is None:
+        monkeypatch.setattr(
+            mod,
+            "error_response",
             lambda message, status_code=400, data=None, headers=None: SimpleNamespace(
                 data={"status": "error", "message": message, "data": data},
                 status_code=status_code,
                 headers=headers or {},
-            )
+            ),
         )
-        web_mod.file_response = lambda *a, **kw: SimpleNamespace(status_code=200)
-        web_mod.stream_response = lambda *a, **kw: SimpleNamespace(status_code=200)
-        web_mod.request = SimpleNamespace()
-        monkeypatch.setitem(sys.modules, "astrbot.api.web", web_mod)
-
-    sys.modules.pop("tl.web_api", None)
-    return importlib.import_module("tl.web_api")
+    if getattr(mod, "file_response", None) is None:
+        monkeypatch.setattr(
+            mod, "file_response", lambda *a, **kw: SimpleNamespace(status_code=200)
+        )
+    if getattr(mod, "stream_response", None) is None:
+        monkeypatch.setattr(
+            mod, "stream_response", lambda *a, **kw: SimpleNamespace(status_code=200)
+        )
+    if getattr(mod, "WEB_API_AVAILABLE", False) is False:
+        monkeypatch.setattr(mod, "WEB_API_AVAILABLE", True)
+    return mod
 
 
 @pytest.mark.parametrize("method", ["POST", "DELETE", "PUT", "PATCH"])
