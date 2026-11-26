@@ -5,7 +5,11 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
-from ..maintenance.retention import DEFAULT_MAX_DISK_BYTES, automatic_disk_bytes, library_counts
+from ..maintenance.retention import (
+    DEFAULT_MAX_DISK_BYTES,
+    automatic_disk_bytes,
+    library_counts,
+)
 
 
 class CommandHandler:

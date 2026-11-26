@@ -803,9 +803,9 @@ async def resolve_image_source_to_path(
                 from .core.path_policy import validate_remote_url_async
                 from .core.remote_fetch import _SSRFGuardedResolver
                 from .reference_image import (
+                    _REDIRECT_STATUSES,
                     MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGE_REDIRECTS,
-                    _REDIRECT_STATUSES,
                     _read_bounded_response,
                 )
 

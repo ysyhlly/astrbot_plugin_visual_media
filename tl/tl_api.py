@@ -2046,9 +2046,9 @@ class GeminiAPIClient:
         from .core.errors import PathPolicyError
         from .core.path_policy import validate_remote_url_async
         from .reference_image import (
-            MAX_REFERENCE_IMAGE_REDIRECTS,
             _REDIRECT_STATUSES,
             _SENSITIVE_REDIRECT_HEADERS,
+            MAX_REFERENCE_IMAGE_REDIRECTS,
             _url_origin,
         )
 
