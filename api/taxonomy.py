@@ -4,8 +4,9 @@ import asyncio
 import shutil
 from pathlib import Path
 
-from astrbot.api import logger
 from quart import jsonify, request
+
+from astrbot.api import logger
 
 from ..core.db.index_manager import delete_index_paths, invalidate_search
 from ..core.util.normalization import (

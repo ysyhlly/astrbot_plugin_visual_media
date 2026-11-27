@@ -16,9 +16,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from PIL import Image, UnidentifiedImageError
+
 from astrbot.api import logger
 from astrbot.api.star import StarTools
-from PIL import Image, UnidentifiedImageError
 
 from ..db.index_manager import invalidate_search, refresh_search_entry
 from ..util.normalization import (

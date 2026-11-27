@@ -12,8 +12,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from astrbot.api import logger
 from PIL import Image as PILImage
+
+from astrbot.api import logger
 
 DEFAULT_PACK_EMOTIONS: tuple[tuple[str, str], ...] = (
     ("happy", "开心大笑"),

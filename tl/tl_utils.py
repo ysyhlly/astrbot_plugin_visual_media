@@ -15,8 +15,9 @@ from pathlib import Path
 from uuid import uuid4
 
 import aiohttp
-from astrbot.api import logger
 from PIL import Image, UnidentifiedImageError
+
+from astrbot.api import logger
 
 from .api_types import APIError
 from .file_uri import file_uri_to_path

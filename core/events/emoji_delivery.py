@@ -22,6 +22,7 @@ async def send_qq_image_as_sticker(
         return False
     try:
         from aiocqhttp.exceptions import ActionFailed
+
         from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
             AiocqhttpMessageEvent,
         )

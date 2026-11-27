@@ -12,6 +12,7 @@ from urllib.parse import urljoin, urlsplit
 
 import aiohttp
 from aiohttp.resolver import DefaultResolver
+
 from astrbot.api import logger
 
 from .errors import (

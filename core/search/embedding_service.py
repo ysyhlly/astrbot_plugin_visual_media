@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
 from astrbot.api import logger
 from astrbot.api.star import StarTools
 
@@ -409,6 +410,7 @@ class EmbeddingService:
 
         try:
             import faiss  # noqa: F401
+
             from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
         except ImportError:
             logger.info("[Embedding] faiss 未安装，降级 numpy")

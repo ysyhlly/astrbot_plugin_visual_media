@@ -241,8 +241,9 @@ class StudioLimitsService:
             return self.get_limits()
 
     async def _load_sessions(self) -> list[dict[str, str]]:
-        from astrbot.core.db.po import ConversationV2
         from sqlmodel import select
+
+        from astrbot.core.db.po import ConversationV2
 
         db = self.context.get_db()
         async with db.get_db() as session:

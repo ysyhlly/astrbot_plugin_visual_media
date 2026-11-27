@@ -12,8 +12,9 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-from astrbot.api import logger
 from PIL import Image
+
+from astrbot.api import logger
 
 from .core.events.event_context import unwrap_event
 

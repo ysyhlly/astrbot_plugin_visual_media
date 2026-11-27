@@ -3,13 +3,14 @@ from pathlib import Path
 
 import httpx
 import pytest
-from astrbot.api.web import PluginRequest, bind_request_context
-from astrbot.dashboard.asgi_runtime import FastAPIAppAdapter, call_request_view
 from astrbot_plugin_visual_media.tl.generation_scheduler import scheduled_generation
 from astrbot_plugin_visual_media.tl.plugin_config import ProviderCandidate
 from fastapi import FastAPI, Request
 from PIL import Image
 from test_media_library import Event, generated
+
+from astrbot.api.web import PluginRequest, bind_request_context
+from astrbot.dashboard.asgi_runtime import FastAPIAppAdapter, call_request_view
 
 
 def app_for(owner):

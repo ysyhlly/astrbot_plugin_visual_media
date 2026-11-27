@@ -20,8 +20,9 @@ from typing import Any
 from urllib.parse import urljoin
 
 import aiohttp
-from astrbot.api import logger
 from PIL import Image, ImageOps, UnidentifiedImageError
+
+from astrbot.api import logger
 
 from .core.errors import (
     CoreError,

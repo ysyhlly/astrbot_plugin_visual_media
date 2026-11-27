@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urljoin
 
 import aiohttp
+
 from astrbot.api import logger
 
 try:

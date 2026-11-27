@@ -196,8 +196,9 @@ async def test_real_hook_sets_generation_marker_only_after_matching_current_rece
 async def test_background_notifier_uses_image_receipt_not_just_text(
     owner, monkeypatch, image_sent
 ):
-    from astrbot.core.tools.message_tools import SendMessageToUserTool
     from astrbot_plugin_visual_media.tl import background_notify as notify
+
+    from astrbot.core.tools.message_tools import SendMessageToUserTool
 
     e = event()
     payload = {

@@ -3,8 +3,9 @@
 import inspect
 from typing import Any
 
-from astrbot.api import logger
 from quart import jsonify, request
+
+from astrbot.api import logger
 
 
 class PreferenceRoutes:
