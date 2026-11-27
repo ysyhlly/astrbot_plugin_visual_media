@@ -790,24 +790,16 @@ class GeminiImageGenerationPlugin(Component):
         requested_provider: str | None = None,
         requested_model: str | None = None,
         template_id: str | None = None,
+        waiting_message: str | None = None,
     ):
-        """快捷图像生成：提交 v2 Job，等待终态后发送结果。"""
+        """快捷图像生成：完成全部前置校验并提交 v2 Job 后，统一发出 1 条等待提示并等待终态。"""
         redact_error = globals().get("redact_text")
         if redact_error is None:
             from tl.core.errors import redact_text as redact_error
         if not str(prompt or "").strip():
             yield event.plain_result("❌ 图像描述不能为空")
             return
-        if not self._ensure_api_client():
-            yield event.plain_result(
-                "❌ API 客户端未初始化。\n"
-                "🧐 可能原因：未在插件供应商配置中填写有效模型或密钥。\n"
-                "✅ 建议：在 provider_settings.provider_overrides 中添加供应商条目并填写 api_keys 后重试。"
-            )
-            return
-        service = self._ensure_v2_service()
-        if service is None:
-            yield event.plain_result("❌ 生成服务尚未初始化")
+        if not self.rate_limiter.allows_group(event):
             return
 
         try:
@@ -840,6 +832,14 @@ class GeminiImageGenerationPlugin(Component):
                 )
                 return
 
+            if not self._ensure_api_client():
+                yield event.plain_result(
+                    "❌ API 客户端未初始化。\n"
+                    "🧐 可能原因：未在插件供应商配置中填写有效模型或密钥。\n"
+                    "✅ 建议：在 provider_settings.provider_overrides 中添加供应商条目并填写 api_keys 后重试。"
+                )
+                return
+
             allowed, limit_message = await self._check_command_generation_limit(
                 event,
                 requested_provider=requested_provider,
@@ -849,6 +849,11 @@ class GeminiImageGenerationPlugin(Component):
             if not allowed:
                 if limit_message:
                     yield event.plain_result(limit_message)
+                return
+
+            service = self._ensure_v2_service()
+            if service is None:
+                yield event.plain_result("❌ 生成服务尚未初始化")
                 return
 
             effective_resolution = override_resolution
@@ -933,7 +938,7 @@ class GeminiImageGenerationPlugin(Component):
                 return
 
             try:
-                yield event.plain_result("🎨  生成中...")
+                yield event.plain_result(waiting_message or "🎨 生成中...")
             except (asyncio.CancelledError, GeneratorExit):
                 # Job 已在上面提交：此处被取消或关闭，同样要取消生成。
                 await asyncio.shield(service.cancel(handle.job_id))
@@ -1127,8 +1132,6 @@ class GeminiImageGenerationPlugin(Component):
             )
         )
 
-        yield event.plain_result(f"🎨 使用{mode_name}模式生成图像...")
-
         if prompt_func:
             full_prompt = prompt_func(prompt)
         else:
@@ -1146,6 +1149,7 @@ class GeminiImageGenerationPlugin(Component):
             override_aspect_ratio=effective_aspect_ratio,
             requested_provider=requested_provider,
             requested_model=requested_model,
+            waiting_message=f"🎨 {mode_name}模式生成中...",
             **kwargs,
         ):
             yield result
@@ -1167,14 +1171,13 @@ class GeminiImageGenerationPlugin(Component):
         use_avatar = await self.avatar_handler.should_use_avatar(event)
         generation_prompt = get_generation_prompt(prompt)
 
-        yield event.plain_result("🎨 开始生成图像...")
-
         async for result in self._quick_generate_image(
             event,
             generation_prompt,
             use_avatar,
             requested_provider=requested_provider,
             requested_model=requested_model,
+            waiting_message="🎨 生成中...",
         ):
             yield result
 
@@ -1329,7 +1332,6 @@ class GeminiImageGenerationPlugin(Component):
         prompt, requested_provider, requested_model = self._parse_generation_route(
             prompt
         )
-        yield event.plain_result("🎨 使用表情包模式生成图像...")
 
         use_avatar = await self.avatar_handler.should_use_avatar(event)
         (
@@ -1383,14 +1385,11 @@ class GeminiImageGenerationPlugin(Component):
                 requested_provider=requested_provider,
                 requested_model=requested_model,
                 template_id=template.id,
+                waiting_message="🎨 表情包模式生成中...",
             ):
                 yield result
             return
 
-        v2_service = self._ensure_v2_service()
-        if v2_service is None:
-            yield event.plain_result("❌ 生成服务尚未初始化")
-            return
         allowed, limit_message = await self._check_command_generation_limit(
             event,
             requested_provider=requested_provider,
@@ -1400,6 +1399,10 @@ class GeminiImageGenerationPlugin(Component):
         if not allowed:
             if limit_message:
                 yield event.plain_result(limit_message)
+            return
+        v2_service = self._ensure_v2_service()
+        if v2_service is None:
+            yield event.plain_result("❌ 生成服务尚未初始化")
             return
 
         # 启用切割的表情包生成
@@ -1427,7 +1430,7 @@ class GeminiImageGenerationPlugin(Component):
                 return
 
             try:
-                yield event.plain_result("🎨  生成中...")
+                yield event.plain_result("🎨 表情包模式生成中...")
             except (asyncio.CancelledError, GeneratorExit):
                 # Job 已在上面提交：此处被取消或关闭，同样要取消生成。
                 await asyncio.shield(v2_service.cancel(submission.handle.job_id))
@@ -1494,7 +1497,7 @@ class GeminiImageGenerationPlugin(Component):
             # AI 识别网格
             ai_rows = None
             ai_cols = None
-            if self.cfg.vision_provider_id:
+            if self.vision_handler.effective_vision_provider_id():
                 ai_res = await self.vision_handler.detect_grid_rows_cols(
                     primary_image_path
                 )
@@ -1699,7 +1702,7 @@ class GeminiImageGenerationPlugin(Component):
         if (
             not (manual_cols and manual_rows)
             and not use_sticker_cutter
-            and self.cfg.vision_provider_id
+            and self.vision_handler.effective_vision_provider_id()
         ):
             ai_res = await self.vision_handler.detect_grid_rows_cols(local_path)
             if ai_res:
@@ -1913,8 +1916,6 @@ class GeminiImageGenerationPlugin(Component):
         # 构造改图专用提示词，确保修改意图明确
         modification_prompt = get_modification_prompt(prompt)
 
-        yield event.plain_result("🎨 开始修改图像...")
-
         use_avatar = await self.avatar_handler.should_use_avatar(event)
 
         async for result in self._quick_generate_image(
@@ -1924,6 +1925,7 @@ class GeminiImageGenerationPlugin(Component):
             is_modification=True,
             requested_provider=requested_provider,
             requested_model=requested_model,
+            waiting_message="🎨 修改生成中...",
         ):
             yield result
 
@@ -1976,10 +1978,6 @@ class GeminiImageGenerationPlugin(Component):
             )
             return
 
-        v2_service = self._ensure_v2_service()
-        if v2_service is None:
-            yield event.plain_result("❌ 生成服务尚未初始化")
-            return
         allowed, limit_message = await self._check_command_generation_limit(
             event,
             requested_provider=requested_provider,
@@ -1989,6 +1987,10 @@ class GeminiImageGenerationPlugin(Component):
         if not allowed:
             if limit_message:
                 yield event.plain_result(limit_message)
+            return
+        v2_service = self._ensure_v2_service()
+        if v2_service is None:
+            yield event.plain_result("❌ 生成服务尚未初始化")
             return
 
         # 额度与队列准入在 submit 内完成，拒绝提示必须先于"开始转换风格"发出。

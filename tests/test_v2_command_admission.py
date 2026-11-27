@@ -343,7 +343,7 @@ async def test_real_stack_group_denial_is_silent_and_charges_nothing(tmp_path):
     try:
         _, outputs = await _run(plugin, "generate_image", ("draw",), False, event)
         assert not _has_progress(outputs)
-        assert outputs == ["🎨 开始生成图像..."]
+        assert outputs == []
         assert not limiter._rate_limit_buckets
         assert client.snapshots == [] and fifo.active == 0
     finally:

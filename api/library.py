@@ -258,11 +258,15 @@ class LibraryRoutes:
         favorite_only: bool,
         character: str,
         library: str,
+        scope: str = "",
     ) -> dict:
-        """Build the same response shape from legacy index-only data."""
+        """Build the same response shape from legacy index-only data (and scope-filtered views)."""
+        from ..core.config.config import PluginConfig
+
         index = self._get_index()
         images: list[dict] = []
         category_counts: dict[str, int] = {}
+        clean_scope = str(scope or "").strip()
 
         for path_str, metadata in index.items():
             if not Path(path_str).exists():
@@ -270,6 +274,12 @@ class LibraryRoutes:
             item = self._build_image_item(path_str, metadata)
             if not item:
                 continue
+            if clean_scope:
+                item_scope_mode = str(item.get("scope_mode") or "public").strip().lower()
+                if item_scope_mode != "public" and not PluginConfig.origin_target_matches_scope(
+                    item.get("origin_target"), clean_scope
+                ):
+                    continue
             if search and not (
                 any(search in str(tag).lower() for tag in item["tags"])
                 or search in item["desc"].lower()
@@ -335,19 +345,22 @@ class LibraryRoutes:
             favorite_only = request.args.get("favorite_only", "false").lower() == "true"
             character = str(request.args.get("character", "") or "")
             library = str(request.args.get("library", "") or "")
+            scope = str(request.args.get("scope", "") or "").strip()
 
-            payload = await asyncio.to_thread(
-                self._list_images_from_database,
-                db=self._db,
-                page=page,
-                page_size=page_size,
-                category=category,
-                search=search,
-                sort_order=sort_order,
-                favorite_only=favorite_only,
-                character=character,
-                library=library,
-            )
+            payload = None
+            if not scope:
+                payload = await asyncio.to_thread(
+                    self._list_images_from_database,
+                    db=self._db,
+                    page=page,
+                    page_size=page_size,
+                    category=category,
+                    search=search,
+                    sort_order=sort_order,
+                    favorite_only=favorite_only,
+                    character=character,
+                    library=library,
+                )
             if payload is None:
                 payload = await asyncio.to_thread(
                     self._list_images_from_index,
@@ -359,6 +372,7 @@ class LibraryRoutes:
                     favorite_only=favorite_only,
                     character=character,
                     library=library,
+                    scope=scope,
                 )
             return jsonify(payload)
         except Exception as e:

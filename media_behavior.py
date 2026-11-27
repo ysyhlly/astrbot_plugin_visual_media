@@ -17,7 +17,37 @@ from threading import RLock
 from astrbot.api import logger
 
 from .core.events.event_context import unwrap_event
+from .core.util.series_config import get_series_bot_names
 from .media_settings import MediaSettings
+
+VALID_FREQUENCIES = frozenset({"auto", "less", "off", "more"})
+_HEX24_RE = re.compile(r"^[0-9a-f]{24}$")
+_FALLBACK_SCOPE_PREFIXES = ("群聊 ", "私聊 ", "会话 ")
+
+
+def _clean_label(value, max_len: int = 80) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text)[:max_len]
+
+
+def _format_umo_fallback_label(umo: str, member_name: str = "") -> str:
+    clean = str(umo or "").strip()
+    if not clean:
+        return ""
+    parts = clean.split(":", 2)
+    if len(parts) == 3 and parts[2].strip():
+        msg_type = parts[1].strip().lower()
+        session_id = parts[2].strip()
+        if "group" in msg_type:
+            return f"群聊 {session_id}"[:80]
+        if any(k in msg_type for k in ("friend", "private", "direct", "user")):
+            if member_name and member_name != session_id:
+                return f"私聊 {member_name}"[:80]
+            return f"私聊 {session_id}"[:80]
+        return f"{parts[0].strip()} · {session_id}"[:80]
+    return clean[:80]
 
 
 def user_text(event):
@@ -44,18 +74,20 @@ def evidence_only(function):
 
 
 class MediaBehavior:
-    def __init__(self, root, settings=None):
+    def __init__(self, root, settings=None, context=None, bot_names_source=None):
         self.path = Path(root) / "media_behavior.sqlite3"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.cache = OrderedDict()
         self._cache_lock = RLock()
         self._settings_source = settings
+        self._context = context
+        self._bot_names_source = bot_names_source
         self._last_cleanup = 0.0
         with self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=NORMAL")
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version > 1:
+            if version > 2:
                 raise RuntimeError(
                     "Media behavior database is newer than this plugin; upgrade the plugin before opening it"
                 )
@@ -66,8 +98,10 @@ class MediaBehavior:
             CREATE TABLE IF NOT EXISTS reservations(scope TEXT, digest TEXT, trace TEXT, expires REAL, PRIMARY KEY(scope,digest));
             CREATE TABLE IF NOT EXISTS decisions(id INTEGER PRIMARY KEY, scope TEXT, member TEXT, trace TEXT, mode TEXT, phase TEXT, reason TEXT, details TEXT, created REAL);
             CREATE INDEX IF NOT EXISTS decision_scope ON decisions(scope,created);
+            CREATE TABLE IF NOT EXISTS scope_labels(scope TEXT PRIMARY KEY, umo TEXT NOT NULL DEFAULT '', label TEXT NOT NULL DEFAULT '', updated REAL NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS member_labels(scope TEXT NOT NULL, member TEXT NOT NULL, sender_id TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '', updated REAL NOT NULL DEFAULT 0, PRIMARY KEY(scope,member));
             """)
-            db.execute("PRAGMA user_version=1")
+            db.execute("PRAGMA user_version=2")
 
     @property
     def settings(self):
@@ -89,6 +123,15 @@ class MediaBehavior:
         finally:
             db.close()
 
+    @staticmethod
+    def scope_hash(scope_or_umo: str) -> str:
+        raw = str(scope_or_umo or "").strip()
+        if not raw:
+            return ""
+        if ":" not in raw and _HEX24_RE.fullmatch(raw):
+            return raw
+        return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
     def identity(self, event):
         event = unwrap_event(event)
         origin = str(getattr(event, "unified_msg_origin", "") or "")
@@ -106,6 +149,241 @@ class MediaBehavior:
             else ""
         )
         return scope, member
+
+    def _extract_event_labels(self, event) -> tuple[str, str, str, str]:
+        event = unwrap_event(event)
+        umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        sender_id = ""
+        try:
+            sender_id = str(event.get_sender_id() or "").strip()
+        except Exception:
+            sender_id = str(getattr(event, "sender_id", "") or "").strip()
+
+        member_name = ""
+        get_sender_name = getattr(event, "get_sender_name", None)
+        if callable(get_sender_name):
+            try:
+                member_name = _clean_label(get_sender_name())
+            except Exception:
+                member_name = ""
+        if not member_name:
+            member_name = _clean_label(getattr(event, "sender_name", ""))
+        if not member_name:
+            msg_obj = getattr(event, "message_obj", None)
+            sender_obj = getattr(msg_obj, "sender", None) if msg_obj is not None else None
+            if sender_obj is not None:
+                member_name = _clean_label(
+                    getattr(sender_obj, "card", "")
+                    or getattr(sender_obj, "nickname", "")
+                    or getattr(sender_obj, "name", "")
+                )
+        if not member_name and sender_id:
+            member_name = sender_id[:80]
+
+        group_name = ""
+        get_group_name = getattr(event, "get_group_name", None)
+        if callable(get_group_name):
+            try:
+                group_name = _clean_label(get_group_name())
+            except Exception:
+                group_name = ""
+        if not group_name:
+            group_name = _clean_label(getattr(event, "group_name", ""))
+        if not group_name:
+            msg_obj = getattr(event, "message_obj", None)
+            if msg_obj is not None:
+                group_name = _clean_label(
+                    getattr(msg_obj, "group_name", "")
+                    or getattr(getattr(msg_obj, "group", None), "group_name", "")
+                    or getattr(getattr(msg_obj, "group", None), "name", "")
+                )
+        if not group_name:
+            get_extra = getattr(event, "get_extra", None)
+            if callable(get_extra):
+                try:
+                    group_name = _clean_label(get_extra("group_name", ""))
+                except Exception:
+                    group_name = ""
+
+        group_id = ""
+        get_group_id = getattr(event, "get_group_id", None)
+        if callable(get_group_id):
+            try:
+                group_id = str(get_group_id() or "").strip()
+            except Exception:
+                group_id = ""
+        if not group_id:
+            group_id = str(getattr(event, "group_id", "") or "").strip()
+        if not group_id and umo:
+            parts = umo.split(":", 2)
+            if len(parts) == 3 and "group" in parts[1].lower():
+                group_id = parts[2].strip()
+
+        if group_name:
+            if group_id and group_id not in group_name:
+                scope_label = _clean_label(f"{group_name} ({group_id})")
+            else:
+                scope_label = group_name
+        else:
+            scope_label = _format_umo_fallback_label(umo, member_name=member_name)
+
+        return umo[:1024], scope_label, sender_id[:128], member_name
+
+    @staticmethod
+    def _is_generic_scope_label(label: str) -> bool:
+        clean = str(label or "").strip()
+        return not clean or clean.startswith(_FALLBACK_SCOPE_PREFIXES)
+
+    def _upsert_labels_with_db(self, db, event, scope: str, member: str) -> None:
+        if not scope:
+            return
+        umo, scope_label, sender_id, member_name = self._extract_event_labels(event)
+        now = time.time()
+        if umo or scope_label:
+            existing = db.execute(
+                "SELECT umo, label FROM scope_labels WHERE scope=?", (scope,)
+            ).fetchone()
+            if existing is not None:
+                final_umo = umo or str(existing["umo"] or "")
+                old_label = str(existing["label"] or "")
+                if (
+                    old_label
+                    and not self._is_generic_scope_label(old_label)
+                    and self._is_generic_scope_label(scope_label)
+                ):
+                    final_label = old_label
+                else:
+                    final_label = scope_label or old_label
+            else:
+                final_umo = umo
+                final_label = scope_label
+            db.execute(
+                "INSERT OR REPLACE INTO scope_labels(scope, umo, label, updated) VALUES (?,?,?,?)",
+                (scope, final_umo, final_label, now),
+            )
+        if member and (sender_id or member_name):
+            existing_m = db.execute(
+                "SELECT sender_id, name FROM member_labels WHERE scope=? AND member=?",
+                (scope, member),
+            ).fetchone()
+            if existing_m is not None:
+                final_sid = sender_id or str(existing_m["sender_id"] or "")
+                old_name = str(existing_m["name"] or "")
+                if (
+                    old_name
+                    and old_name != final_sid
+                    and (not member_name or member_name == final_sid)
+                ):
+                    final_name = old_name
+                else:
+                    final_name = member_name or old_name
+            else:
+                final_sid = sender_id
+                final_name = member_name
+            db.execute(
+                "INSERT OR REPLACE INTO member_labels(scope, member, sender_id, name, updated) VALUES (?,?,?,?,?)",
+                (scope, member, final_sid, final_name, now),
+            )
+
+    def _resolve_bot_names(self, event=None) -> list[str]:
+        candidates: list[str] = []
+
+        def _collect(raw):
+            if raw is None or isinstance(raw, bool):
+                return
+            if isinstance(raw, str):
+                for part in raw.replace("\r", "\n").replace("\n", ",").split(","):
+                    cleaned = part.strip()
+                    if cleaned:
+                        candidates.append(cleaned)
+            elif isinstance(raw, (list, tuple, set)):
+                for item in raw:
+                    if isinstance(item, str) and item.strip():
+                        candidates.append(item.strip())
+
+        if self._bot_names_source is not None:
+            try:
+                src = (
+                    self._bot_names_source()
+                    if callable(self._bot_names_source)
+                    else self._bot_names_source
+                )
+                _collect(src)
+            except Exception:
+                pass
+
+        if self._context is not None:
+            try:
+                _collect(get_series_bot_names(self._context))
+            except Exception:
+                pass
+            get_cfg = getattr(self._context, "get_config", None)
+            if callable(get_cfg):
+                umo = str(getattr(unwrap_event(event), "unified_msg_origin", "") or "").strip() if event is not None else ""
+                try:
+                    cfg = get_cfg(umo=umo) if umo else get_cfg()
+                except TypeError:
+                    try:
+                        cfg = get_cfg()
+                    except Exception:
+                        cfg = None
+                except Exception:
+                    cfg = None
+                if isinstance(cfg, dict):
+                    for key in ("bot_names", "bot_name", "nickname", "nicknames"):
+                        _collect(cfg.get(key))
+
+        if event is not None:
+            ev = unwrap_event(event)
+            for attr in ("bot_name", "bot_names", "self_nickname", "self_name"):
+                _collect(getattr(ev, attr, None))
+            msg_obj = getattr(ev, "message_obj", None)
+            if msg_obj is not None:
+                for attr in ("self_name", "bot_name"):
+                    _collect(getattr(msg_obj, attr, None))
+            get_extra = getattr(ev, "get_extra", None)
+            if callable(get_extra):
+                for key in ("bot_name", "bot_names"):
+                    try:
+                        _collect(get_extra(key, None))
+                    except Exception:
+                        pass
+
+        # Deduplicate while preserving case-insensitive uniqueness, longest first
+        seen: set[str] = set()
+        unique: list[str] = []
+        for name in candidates:
+            key = name.casefold()
+            if key not in seen:
+                seen.add(key)
+                unique.append(name)
+        unique.sort(key=len, reverse=True)
+        return unique
+
+    def _strip_address_prefix(self, text: str, event=None) -> str:
+        clean = str(text or "").strip()
+        # Strip leading CQ:at / @mention prefixes
+        while True:
+            updated = re.sub(
+                r"^(?:\[CQ:at,[^\]]+\]|@[^\s,，:：、]+)[，,：:、\s]*",
+                "",
+                clean,
+            ).strip()
+            if updated == clean:
+                break
+            clean = updated
+        # Dynamically strip configured / session / series bot names
+        bot_names = self._resolve_bot_names(event)
+        if bot_names:
+            name_pattern = "|".join(re.escape(name) for name in bot_names)
+            clean = re.sub(
+                rf"^(?:{name_pattern})[，,：:、!！~～\s]*",
+                "",
+                clean,
+                flags=re.IGNORECASE,
+            ).strip()
+        clean = re.sub(r"^(?:请|麻烦你|麻烦|你)", "", clean).strip("。！!～~ ")
+        return clean
 
     def bind(self, event):
         event = unwrap_event(event)
@@ -192,9 +470,7 @@ class MediaBehavior:
             return None
         value = self._preferences_with_db(db, scope, member)
         old = json.dumps(value, sort_keys=True)
-        clean = re.sub(r"^(?:安安[，,\s]*)?(?:请|麻烦你|你)?", "", text).strip(
-            "。！!～~ "
-        )
+        clean = self._strip_address_prefix(text, event)
         for clean in re.split(r"[，,。；;]", clean):
             clean = re.sub(
                 r"^(?:请|你)?(?:(?:以后|之后)?(?:聊天时|说话时|聊天|说话))?(?:尽量)?",
@@ -252,11 +528,45 @@ class MediaBehavior:
                         value["style"] = style[:300]
         if old == json.dumps(value, sort_keys=True):
             return value
+        self._upsert_labels_with_db(db, event, scope, member)
         db.execute(
             "INSERT OR REPLACE INTO preferences VALUES (?,?,?,?)",
             (scope, member, json.dumps(value, ensure_ascii=False), time.time()),
         )
         return value, True
+
+    def set_member_preference(
+        self,
+        event,
+        *,
+        frequency: str | None = None,
+        style: str | None = None,
+        reset: bool = False,
+    ) -> dict:
+        """Directly query/update or reset the current member's media preference in this scope."""
+        scope, member = self.identity(event)
+        if not scope or not member:
+            raise ValueError("missing_identity")
+        if frequency is not None and frequency not in VALID_FREQUENCIES:
+            raise ValueError(f"invalid_frequency:{frequency}")
+        with self.connect() as db:
+            self._upsert_labels_with_db(db, event, scope, member)
+            if reset:
+                db.execute(
+                    "DELETE FROM preferences WHERE scope=? AND member=?",
+                    (scope, member),
+                )
+                return self._default_preferences()
+            value = self._preferences_with_db(db, scope, member)
+            if frequency is not None:
+                value["frequency"] = frequency
+            if style is not None:
+                value["style"] = str(style).strip()[:300]
+            db.execute(
+                "INSERT OR REPLACE INTO preferences VALUES (?,?,?,?)",
+                (scope, member, json.dumps(value, ensure_ascii=False), time.time()),
+            )
+            return value
 
     def remember_explicit(self, event):
         if not self.settings.preferences_enabled:
@@ -560,6 +870,7 @@ class MediaBehavior:
         if len(encoded) > 16000:
             encoded = json.dumps({"summary": "details_too_large"})
         with self.connect() as db:
+            self._upsert_labels_with_db(db, event, scope, member)
             db.execute(
                 "INSERT INTO decisions(scope,member,trace,mode,phase,reason,details,created) VALUES (?,?,?,?,?,?,?,?)",
                 (
@@ -585,12 +896,23 @@ class MediaBehavior:
             )
 
     def records(self, limit=100, scope=""):
+        resolved_scope = self.scope_hash(scope) if scope else ""
         with self.connect() as db:
             rows = db.execute(
-                'SELECT * FROM decisions WHERE (?="" OR scope=?) AND created>? ORDER BY id DESC LIMIT ?',
+                """
+                SELECT d.*,
+                       COALESCE(sl.umo, '') AS scope_umo,
+                       COALESCE(sl.label, '') AS scope_label,
+                       COALESCE(ml.name, '') AS member_name
+                FROM decisions d
+                LEFT JOIN scope_labels sl ON sl.scope = d.scope
+                LEFT JOIN member_labels ml ON ml.scope = d.scope AND ml.member = d.member
+                WHERE (?="" OR d.scope=?) AND d.created>?
+                ORDER BY d.id DESC LIMIT ?
+                """,
                 (
-                    scope,
-                    scope,
+                    resolved_scope,
+                    resolved_scope,
                     time.time() - self.settings.record_retention_days * 86400,
                     max(1, min(int(limit), 200)),
                 ),
@@ -602,9 +924,46 @@ class MediaBehavior:
             return [
                 {**dict(row), "data": json.loads(row["data"])}
                 for row in db.execute(
-                    "SELECT * FROM preferences ORDER BY updated DESC LIMIT 200"
+                    """
+                    SELECT p.*,
+                           COALESCE(sl.umo, '') AS scope_umo,
+                           COALESCE(sl.label, '') AS scope_label,
+                           COALESCE(ml.name, '') AS member_name
+                    FROM preferences p
+                    LEFT JOIN scope_labels sl ON sl.scope = p.scope
+                    LEFT JOIN member_labels ml ON ml.scope = p.scope AND ml.member = p.member
+                    ORDER BY p.updated DESC LIMIT 200
+                    """
                 )
             ]
+
+    def scope_summaries(self) -> list[dict[str, str]]:
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT scope, umo, label FROM scope_labels
+                ORDER BY updated DESC LIMIT 300
+                """
+            ).fetchall()
+            out = [
+                {
+                    "scope": str(r["scope"] or ""),
+                    "umo": str(r["umo"] or ""),
+                    "label": str(r["label"] or ""),
+                }
+                for r in rows
+                if r["scope"]
+            ]
+            known = {item["scope"] for item in out}
+            for table in ("preferences", "decisions"):
+                for r in db.execute(
+                    f"SELECT DISTINCT scope FROM {table} WHERE scope != '' LIMIT 200"
+                ).fetchall():
+                    sc = str(r["scope"] or "")
+                    if sc and sc not in known:
+                        known.add(sc)
+                        out.append({"scope": sc, "umo": "", "label": ""})
+            return out
 
     def reset(self, scope, member):
         with self.connect() as db:

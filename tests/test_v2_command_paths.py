@@ -119,7 +119,8 @@ async def test_quick_generate_v2_skips_entry_tracker_writes(command_plugin):
 
     outputs = await _run_quick(plugin)
 
-    assert "🎨 使用手办化模式生成图像..." in outputs
+    assert "🎨 手办化模式生成中..." in outputs
+    assert sum(1 for item in outputs if "生成中" in str(item)) == 1
     assert sent and sent[0]["image_urls"] == ["https://img.test/a.png"]
     # 投影负责历史：入口不再 begin/complete/fail/update。
     plugin.generation_tracker.begin.assert_not_awaited()

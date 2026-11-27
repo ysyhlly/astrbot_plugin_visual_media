@@ -866,7 +866,8 @@ async def test_quick_mode_archive_timeout_records_partial_success(
     try:
         outputs = await _run_quick(plugin)
 
-        assert "🎨 使用手办化模式生成图像..." in outputs
+        assert "🎨 手办化模式生成中..." in outputs
+        assert sum(1 for item in outputs if "生成中" in str(item)) == 1
         assert sent and sent[0]["image_urls"] == ["https://cdn.example/img.png"]
         (record,) = tracker.records_snapshot()
         assert record["status"] == "partial_success"

@@ -566,7 +566,8 @@ async def test_sticker_reference_rule_and_corrupt_store(tmp_path):
     event = _Event()
     event.message_str = ""
     outputs = await _collect(plugin.quick_sticker(event, "一只猫"))
-    assert "请附上一张清晰的角色参考图（如头像或原表情）后再试。" in outputs[1]
+    assert len(outputs) == 1
+    assert "请附上一张清晰的角色参考图（如头像或原表情）后再试。" in outputs[0]
 
     await plugin.prompt_templates.update("sticker", {"reference": "optional"})
     plugin.api_client = object()

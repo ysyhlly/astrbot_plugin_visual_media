@@ -56,9 +56,28 @@ class MediaAPI:
         if (denied := await self.guard(check_csrf=False)) is not None:
             return denied
         gen = self.owner.generation
+        umo = str(request.query.get("umo", "") or "").strip()
+        group_id = ""
+        if umo:
+            parts = umo.split(":", 2)
+            if len(parts) == 3 and "group" in parts[1].lower():
+                group_id = parts[2].strip()
         history = gen.generation_tracker.query_history(
-            page=1, size=50, keyword="", source="", group_id="", user_id=""
+            page=1, size=50, keyword="", source="", group_id=group_id, user_id=""
         )
+        if umo and isinstance(history, dict) and isinstance(history.get("items"), list):
+            filtered = [
+                item
+                for item in history["items"]
+                if str((item.get("requester") or {}).get("umo") or "").strip() == umo
+                or (
+                    not str((item.get("requester") or {}).get("umo") or "").strip()
+                    and group_id
+                    and str((item.get("requester") or {}).get("group_id") or "").strip()
+                    == group_id
+                )
+            ]
+            history = {**history, "items": filtered, "total": len(filtered)}
         return json_response(
             {
                 "status": "ok",
@@ -223,14 +242,66 @@ class MediaAPI:
                 {"status": "error", "message": str(exc)}, status_code=400
             )
 
+    async def _umo_alias_map(self) -> dict[str, str]:
+        """Best-effort map of UMO -> human-readable group/session alias from AstrBot DB."""
+        ctx = getattr(self.owner, "context", None)
+        get_db = getattr(ctx, "get_db", None)
+        if not callable(get_db):
+            return {}
+        try:
+            db = get_db()
+            alias_getter = getattr(db, "get_umo_aliases", None)
+            if not callable(alias_getter):
+                return {}
+            aliases = await alias_getter()
+        except Exception:
+            return {}
+        mapping: dict[str, str] = {}
+        for alias in aliases or ():
+            umo = str(getattr(alias, "umo", "") or "").strip()
+            display = str(
+                getattr(alias, "user_alias", "")
+                or getattr(alias, "auto_name", "")
+                or ""
+            ).strip()
+            if umo and display:
+                mapping[umo] = display[:80]
+        return mapping
+
     async def behavior(self):
         if (denied := await self.guard(check_csrf=False)) is not None:
             return denied
         store = self.owner.behavior
-        records, preferences = await asyncio.gather(
+        records, preferences, scopes, alias_map = await asyncio.gather(
             asyncio.to_thread(store.records, 200),
             asyncio.to_thread(store.preference_rows),
+            asyncio.to_thread(store.scope_summaries),
+            self._umo_alias_map(),
         )
+        if alias_map:
+            for item in scopes:
+                umo = str(item.get("umo") or "")
+                alias = alias_map.get(umo)
+                if alias and (
+                    not item.get("label")
+                    or store._is_generic_scope_label(item["label"])
+                ):
+                    item["label"] = alias
+            label_by_scope = {
+                str(item.get("scope") or ""): str(item.get("label") or "")
+                for item in scopes
+                if item.get("scope") and item.get("label")
+            }
+            for collection in (records, preferences):
+                for row in collection:
+                    sc = str(row.get("scope") or "")
+                    umo = str(row.get("scope_umo") or "")
+                    better = alias_map.get(umo) or label_by_scope.get(sc) or ""
+                    if better and (
+                        not row.get("scope_label")
+                        or store._is_generic_scope_label(row["scope_label"])
+                    ):
+                        row["scope_label"] = better
         settings = store.settings.public()
         settings["exact_repeat_minutes"] = settings["repeat_window_seconds"] / 60
         settings["dropped_audit_records"] = store.dropped_records
@@ -240,6 +311,7 @@ class MediaAPI:
                 "data": {
                     "records": records,
                     "preferences": preferences,
+                    "scopes": scopes,
                     "policy": settings,
                 },
             }

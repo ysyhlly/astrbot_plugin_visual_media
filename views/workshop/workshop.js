@@ -1,7 +1,9 @@
+import { getSharedScope, setSharedScope, formatScopeLabel } from "./series-ui.js";
 const UI=window.SeriesUI||{t:(s,p={})=>String(s).replace(/\{(\w+)\}/g,(m,k)=>Object.hasOwn(p,k)?String(p[k]??''):m),msg(s,p={}){return this.t(s,p);},text(n,v){n.textContent=String(v??'');return n;},bind(n,s,p={},a=''){if(a)n.setAttribute(a,this.t(s,p));else n.textContent=this.t(s,p);return n;},onLocaleChange:()=>()=>{}};
 const $ = (id) => document.getElementById(id);
 const bridge = (window.DynamicsPanelBridge || window.AstrBotPluginPage);
 let profiles = [];
+let activeScope = getSharedScope();
 const picker = window.VisualReferences.create($("reference-picker"), {onChange(refs) { const select=$("profile-form").elements.references; select.replaceChildren(...refs.map(hash=>new Option(hash,hash,true,true))); }});
 const notice = (text) => { $("notice").textContent = text; };
 const charactersPage = new URLSearchParams(location.search).get("section") === "characters";
@@ -141,7 +143,7 @@ function buildRemixHref(job) {
   if (jobId) url.searchParams.set("reuse", jobId);
   if (job?.character) url.searchParams.set("character", job.character);
   if (job?.prompt) url.searchParams.set("prompt", String(job.prompt).slice(0, 500));
-  url.searchParams.set("umo", window.DynamicsGetActiveScope?.() || "");
+  url.searchParams.set("umo", activeScope || getSharedScope() || window.DynamicsGetActiveScope?.() || "");
   const language = window.getLanguage?.();
   if (language) url.searchParams.set("lang", language);
   return url.href;
@@ -264,7 +266,8 @@ async function refresh() {
   try {
     if (!bridge) throw new Error(UI.t("请从 AstrBot 插件面板打开视觉工坊。"));
     await bridge.ready();
-    const data = await get("media/overview");
+    const overviewParams = activeScope ? { umo: activeScope } : {};
+    const data = await get("media/overview", overviewParams);
     profiles = Array.isArray(data.profiles) ? data.profiles : [];
     const generation = data.generation || {};
     $("meme-count").textContent = data.memes;
@@ -366,4 +369,23 @@ $("generate-form").onsubmit = async (event) => {
 };
 document.querySelectorAll("[data-close]").forEach((button) => { button.onclick = () => $(button.dataset.close).close(); });
 $("new-profile").onclick = () => editProfile(); $("refresh").onclick = refresh;
+function syncWorkshopScope(umo, { pushShared = false } = {}) {
+  const next = String(umo ?? "").trim();
+  if (pushShared) setSharedScope(next, { syncUrl: true, emit: true });
+  if (next === activeScope) return;
+  activeScope = next;
+  if (activeScope) {
+    notice(UI.t("当前作用域：{0}", { 0: formatScopeLabel(activeScope) || activeScope }));
+  } else if (!$("notice").dataset.overviewError) {
+    notice("");
+  }
+  void refresh();
+}
+window.addEventListener("dynamics-scopechange", (event) => {
+  syncWorkshopScope(event.detail?.umo ?? getSharedScope());
+});
+window.VisualWorkshopScope = {
+  get: () => activeScope,
+  set: (umo) => syncWorkshopScope(umo, { pushShared: true }),
+};
 void refresh();

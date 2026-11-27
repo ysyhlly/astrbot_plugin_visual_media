@@ -34,6 +34,7 @@ from astrbot.api.star import Context, Star
 from astrbot.core.star.star import star_registry
 
 from .core.tools.joint_reply import joint_reply_owned
+from .core.util.series_config import resolve_shared_provider
 from .generation_engine import GeminiImageGenerationPlugin as GenerationEngine
 from .media_api import MediaAPI
 from .media_library import MediaLibrary
@@ -81,6 +82,8 @@ class VisualMediaPlugin(Star):
         self.generation = None
         self._closed = False
         self._config_save_lock = threading.RLock()
+        self._scope_version_seq = 0
+        self._scope_mutation_lock = asyncio.Lock()
 
     async def initialize(self):
         try:
@@ -98,6 +101,7 @@ class VisualMediaPlugin(Star):
                 MediaRuntime,
                 self.generation._plugin_data_dir,
                 lambda: self.raw_config.get("media", {}),
+                context=self.context,
             )
             self.memes.media_behavior = self.behavior
             self.generation.media_behavior = self.behavior
@@ -338,10 +342,12 @@ class VisualMediaPlugin(Star):
             if memes is not None
             else False
         )
-        configured_emb_id = (
+        configured_emb_id = resolve_shared_provider(
+            getattr(self, "context", None),
             str(getattr(memes_cfg, "embedding_provider_id", "") or "").strip()
             if memes_cfg is not None
-            else ""
+            else "",
+            keys=("embedding_provider",),
         )
         emb = self._resolve_embedding_service()
         emb_initialized = bool(getattr(emb, "_initialized", False)) if emb is not None else False
@@ -680,25 +686,43 @@ class VisualMediaPlugin(Star):
                 "pulse": {"headline": "视觉工坊状态暂不可用", "updated_at": now_iso},
             }
 
+    @staticmethod
+    def _derive_meme_scope_target(umo: str) -> str:
+        from .core.config.config import PluginConfig
+
+        clean = str(umo or "").strip()
+        if not clean:
+            return ""
+        _, legacy = PluginConfig.parse_origin_scope(clean)
+        if legacy:
+            return legacy
+        return PluginConfig.normalize_target_entry(clean, default_scope="group")
+
     def get_series_scope_status(self, umo: str) -> dict[str, Any]:
-        """Return read-only per-scope availability and today's activity for the matrix."""
+        """Return per-scope availability, mode, version and today's activity for the matrix."""
         try:
             target_umo = str(umo or "").strip()
+            seq = int(getattr(self, "_scope_version_seq", 0) or 0)
             ready = (
                 not getattr(self, "_closed", False)
                 and (self.memes is not None or self.generation is not None)
             )
             if not ready:
                 return {
+                    "umo": target_umo,
                     "enabled": False,
+                    "writable": False,
                     "supported": False,
+                    "mode": "unready",
                     "persona_id": "",
                     "activity_today": 0,
                     "summary": "视觉工坊未就绪",
-                    "version": "0",
+                    "detail": "视觉工坊未就绪",
+                    "version": f"0:{seq}",
                 }
 
             group_id = self._extract_group_id_from_umo(target_umo)
+            meme_target = self._derive_meme_scope_target(target_umo)
             gen_allowed = self.generation is not None
             if gen_allowed and target_umo:
                 limiter = getattr(self.generation, "rate_limiter", None)
@@ -719,7 +743,7 @@ class VisualMediaPlugin(Star):
                 if cfg is not None and callable(
                     getattr(cfg, "is_targets_allowed", None)
                 ):
-                    targets = [t for t in (target_umo, group_id) if t]
+                    targets = [t for t in (meme_target, group_id) if t]
                     if targets:
                         meme_allowed = bool(cfg.is_targets_allowed("send", targets))
 
@@ -758,24 +782,33 @@ class VisualMediaPlugin(Star):
                 and self._is_excluded_by_core(umo=target_umo, group_id=group_id)
             )
             if excluded_by_core:
+                detail = "主控排除（表情采集与被动视觉已静默）"
                 return {
+                    "umo": target_umo,
                     "enabled": False,
+                    "writable": False,
                     "supported": False,
                     "excluded_by_core": True,
+                    "mode": "excluded",
                     "persona_id": "",
                     "activity_today": activity_today,
-                    "summary": "主控排除（表情采集与被动视觉已静默）",
-                    "version": "1:0:0",
+                    "summary": detail,
+                    "detail": detail,
+                    "version": f"1:0:0:{seq}",
                 }
 
             enabled = bool(gen_allowed or meme_allowed)
             if gen_allowed and meme_allowed:
+                mode = "both"
                 mode_summary = "生图与表情可用"
             elif gen_allowed:
+                mode = "generation_only"
                 mode_summary = "仅生图可用 · 表情已禁用"
             elif meme_allowed:
+                mode = "memes_only"
                 mode_summary = "仅表情可用 · 生图已禁用"
             else:
+                mode = "disabled"
                 mode_summary = "当前会话已禁用生图与表情"
             summary = (
                 f"{mode_summary} · 今日 {activity_today} 次"
@@ -783,23 +816,532 @@ class VisualMediaPlugin(Star):
                 else mode_summary
             )
             return {
+                "umo": target_umo,
                 "enabled": enabled,
+                "writable": True,
                 "supported": True,
                 "excluded_by_core": False,
+                "mode": mode,
                 "persona_id": "",
                 "activity_today": activity_today,
                 "summary": summary,
-                "version": f"1:{int(gen_allowed)}:{int(meme_allowed)}",
+                "detail": summary,
+                "version": f"1:{int(gen_allowed)}:{int(meme_allowed)}:{seq}",
             }
         except Exception:
             return {
+                "umo": str(umo or "").strip(),
                 "enabled": None,
+                "writable": False,
                 "supported": False,
+                "mode": "error",
                 "persona_id": "",
                 "activity_today": None,
                 "summary": "状态暂不可用",
+                "detail": "状态暂不可用",
                 "version": "0",
             }
+
+    async def set_series_scope_enabled(
+        self,
+        umo: str,
+        enabled: bool,
+        expected_version: str | int | None = None,
+    ) -> dict[str, Any]:
+        """Optimistically toggle generation + meme availability for ``umo``."""
+        target_umo = str(umo or "").strip()
+        if not target_umo:
+            return {
+                "ok": False,
+                "umo": "",
+                "enabled": False,
+                "version": "0",
+                "reason": "invalid_umo",
+            }
+        if getattr(self, "_closed", False) or (
+            self.memes is None and self.generation is None
+        ):
+            return {
+                "ok": False,
+                "umo": target_umo,
+                "enabled": False,
+                "version": "0",
+                "reason": "plugin_not_ready",
+            }
+
+        lock = getattr(self, "_scope_mutation_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._scope_mutation_lock = lock
+
+        async with lock:
+            current = self.get_series_scope_status(target_umo)
+            current_ver = str(current.get("version") or "0")
+            if current.get("excluded_by_core"):
+                return {
+                    "ok": False,
+                    "umo": target_umo,
+                    "enabled": False,
+                    "version": current_ver,
+                    "reason": "excluded_by_core",
+                    "summary": "主控排除，无法在此开启",
+                }
+            if (
+                expected_version is not None
+                and str(expected_version).strip() != ""
+                and str(expected_version).strip() != current_ver
+            ):
+                return {
+                    "ok": False,
+                    "conflict": True,
+                    "umo": target_umo,
+                    "enabled": bool(current.get("enabled")),
+                    "version": current_ver,
+                    "reason": "version_conflict",
+                    "summary": "版本冲突，请刷新后重试",
+                }
+
+            want_enabled = bool(enabled)
+            group_id = self._extract_group_id_from_umo(target_umo)
+            meme_target = self._derive_meme_scope_target(target_umo)
+
+            # 1. Update generation group access policy
+            if self.generation is not None and group_id:
+                cfg = getattr(self.generation, "cfg", None)
+                if cfg is not None:
+                    mode = str(getattr(cfg, "group_limit_mode", "none") or "none").strip().lower()
+                    if mode not in {"none", "whitelist", "blacklist"}:
+                        mode = "none"
+                    groups = [
+                        str(x).strip()
+                        for x in (getattr(cfg, "group_limit_list", set()) or set())
+                        if str(x).strip()
+                    ]
+                    group_set = set(groups)
+                    if want_enabled:
+                        if mode == "blacklist":
+                            group_set.discard(group_id)
+                        elif mode == "whitelist":
+                            group_set.add(group_id)
+                    else:
+                        if mode == "whitelist":
+                            group_set.discard(group_id)
+                            if not group_set:
+                                mode = "blacklist"
+                                group_set = {group_id}
+                        else:
+                            mode = "blacklist"
+                            group_set.add(group_id)
+                    cfg.group_limit_mode = mode
+                    cfg.group_limit_list = set(group_set)
+                    save_lock = getattr(self, "_config_save_lock", None)
+                    raw_cfg = getattr(self, "raw_config", None)
+                    if isinstance(raw_cfg, dict):
+                        def _persist_gen() -> None:
+                            gen_section = raw_cfg.setdefault("generation", {})
+                            limit_section = gen_section.setdefault("limit_settings", {})
+                            limit_section["group_limit_mode"] = mode
+                            limit_section["group_limit_list"] = sorted(group_set)
+                            save_fn = getattr(raw_cfg, "save_config", None)
+                            if callable(save_fn):
+                                save_fn()
+
+                        if save_lock is not None:
+                            with save_lock:
+                                _persist_gen()
+                        else:
+                            _persist_gen()
+
+            # 2. Update meme send/steal target filter policy
+            if self.memes is not None and meme_target:
+                mcfg = getattr(self.memes, "plugin_config", None)
+                if mcfg is not None:
+                    updates: dict[str, Any] = {}
+                    for action_name in ("send", "steal"):
+                        wl_key = f"{action_name}_target_whitelist"
+                        bl_key = f"{action_name}_target_blacklist"
+                        wl = [
+                            mcfg.normalize_target_entry(x)
+                            for x in (getattr(mcfg, wl_key, []) or [])
+                            if mcfg.normalize_target_entry(x)
+                        ]
+                        bl = [
+                            mcfg.normalize_target_entry(x)
+                            for x in (getattr(mcfg, bl_key, []) or [])
+                            if mcfg.normalize_target_entry(x)
+                        ]
+                        wl = list(dict.fromkeys(wl))
+                        bl = list(dict.fromkeys(bl))
+                        if want_enabled:
+                            bl = [x for x in bl if x != meme_target]
+                            if wl and meme_target not in wl:
+                                wl.append(meme_target)
+                        else:
+                            wl = [x for x in wl if x != meme_target]
+                            if meme_target not in bl:
+                                bl.append(meme_target)
+                        updates[wl_key] = wl
+                        updates[bl_key] = bl
+                    updater = getattr(self.memes, "update_config", None)
+                    if callable(updater):
+                        updater(updates)
+                    else:
+                        for k, v in updates.items():
+                            setattr(mcfg, k, v)
+
+            self._scope_version_seq = int(getattr(self, "_scope_version_seq", 0) or 0) + 1
+            sp = self._series_panels_mod()
+            if sp is not None and callable(getattr(sp, "invalidate_presence_cache", None)):
+                try:
+                    sp.invalidate_presence_cache(
+                        "astrbot_plugin_visual_media",
+                        context=getattr(self, "context", None),
+                    )
+                except Exception:
+                    pass
+
+            updated = self.get_series_scope_status(target_umo)
+            return {
+                "ok": True,
+                "umo": target_umo,
+                "enabled": bool(updated.get("enabled")),
+                "version": str(updated.get("version") or ""),
+                "reason": "updated",
+                "summary": str(updated.get("summary") or ""),
+            }
+
+    def activate_series_runtime(self) -> dict[str, Any]:
+        """Unified runtime activation hook for Series Setup Wizard step 4."""
+        if getattr(self, "_closed", False):
+            return {
+                "ok": False,
+                "ready": False,
+                "enabled": False,
+                "reason": "plugin_closed",
+            }
+        auto_send_enabled = False
+        if self.memes is not None:
+            mcfg = getattr(self.memes, "plugin_config", None)
+            if mcfg is not None and not getattr(mcfg, "auto_send_meme", True):
+                updater = getattr(self.memes, "update_config", None)
+                if callable(updater):
+                    updater({"auto_send_meme": True})
+                else:
+                    mcfg.auto_send_meme = True
+            auto_send_enabled = bool(getattr(mcfg, "auto_send_meme", True)) if mcfg is not None else True
+
+        gen_ready = False
+        if self.generation is not None:
+            ensure_client = getattr(self.generation, "_ensure_api_client", None)
+            if callable(ensure_client):
+                try:
+                    gen_ready = bool(ensure_client(quiet=True))
+                except Exception:
+                    gen_ready = bool(getattr(self.generation, "api_client", None))
+            else:
+                gen_ready = bool(getattr(self.generation, "api_client", None))
+
+        sp = self._series_panels_mod()
+        if sp is not None and callable(getattr(sp, "invalidate_presence_cache", None)):
+            try:
+                sp.invalidate_presence_cache(
+                    "astrbot_plugin_visual_media",
+                    context=getattr(self, "context", None),
+                )
+            except Exception:
+                pass
+
+        ready = (self.memes is not None) and (self.generation is not None)
+        return {
+            "ok": True,
+            "ready": ready,
+            "enabled": True,
+            "auto_send_meme": auto_send_enabled,
+            "generation_ready": gen_ready,
+            "reason": "activated",
+        }
+
+    async def generate_series_artwork(
+        self,
+        prompt: str,
+        *,
+        persona_id: str = "",
+        umo: str = "",
+        style: str = "polaroid",
+        reference_character: str = "",
+        source_plugin: str = "",
+    ) -> dict[str, Any]:
+        """Cross-plugin rate-limited artwork/polaroid generator for series companions."""
+        clean_prompt = str(prompt or "").strip()
+        if not clean_prompt:
+            return {
+                "ok": False,
+                "image_path": "",
+                "image_url": "",
+                "task_id": "",
+                "error": "prompt 不能为空",
+            }
+        if getattr(self, "_closed", False) or self.generation is None:
+            return {
+                "ok": False,
+                "image_path": "",
+                "image_url": "",
+                "task_id": "",
+                "error": "视觉工坊生图服务未就绪",
+            }
+
+        target_umo = str(umo or "").strip()
+        group_id = self._extract_group_id_from_umo(target_umo)
+        if target_umo and self._is_excluded_by_core(umo=target_umo, group_id=group_id):
+            return {
+                "ok": False,
+                "image_path": "",
+                "image_url": "",
+                "task_id": "",
+                "error": "当前会话已被主控排除",
+            }
+        if target_umo and group_id:
+            limiter = getattr(self.generation, "rate_limiter", None)
+            if limiter is not None and callable(getattr(limiter, "allows_group", None)):
+                if not limiter.allows_group(
+                    SimpleNamespace(group_id=group_id, unified_msg_origin=target_umo)
+                ):
+                    return {
+                        "ok": False,
+                        "image_path": "",
+                        "image_url": "",
+                        "task_id": "",
+                        "error": "当前群未启用图像生成",
+                    }
+
+        # Resolve optional character profile & references
+        char_hint = str(reference_character or "").strip()
+        persona_hint = str(persona_id or "").strip()
+        matched_profile = None
+        profiles = self._safe_character_profiles()
+        for candidate_hint in (char_hint, persona_hint):
+            if not candidate_hint:
+                continue
+            low = candidate_hint.casefold()
+            matched_profile = next(
+                (
+                    p
+                    for p in profiles
+                    if str(p.get("key") or "").casefold() == low
+                    or str(p.get("name") or "").casefold() == low
+                ),
+                None,
+            )
+            if matched_profile is not None:
+                break
+
+        refs: list[str] = []
+        prompt_parts: list[str] = []
+        if matched_profile is not None:
+            appearance = str(matched_profile.get("appearance") or "").strip()
+            profile_style = str(matched_profile.get("style") or "").strip()
+            if appearance:
+                prompt_parts.append(appearance)
+            if profile_style:
+                prompt_parts.append(profile_style)
+            lib = getattr(self, "library", None)
+            if lib is not None and callable(getattr(lib, "reference_path", None)):
+                for ref_hash in matched_profile.get("references") or []:
+                    try:
+                        refs.append(str(lib.reference_path(ref_hash)))
+                    except Exception:
+                        continue
+
+        style_presets = {
+            "polaroid": "拍立得相纸风格，柔和自然光，留白相框质感，温暖纪实氛围",
+            "poster": "精致活动纪念海报构图，清晰主体与氛围光影",
+            "postcard": "旅途风景明信片插画质感，通透色彩与细腻光影",
+            "sticker": "简洁 Q 版表情贴纸风格，清晰轮廓，高辨识度神态",
+        }
+        clean_style = str(style or "").strip()
+        if clean_style:
+            style_desc = style_presets.get(clean_style.lower(), clean_style)
+            prompt_parts.append(f"画面风格：{style_desc}")
+        prompt_parts.append(clean_prompt)
+        final_prompt = "\n".join(part for part in prompt_parts if part)
+
+        caller_id = str(source_plugin or "series_companion").strip()[:120] or "series_companion"
+        service_umo = target_umo if target_umo.count(":") >= 2 else None
+        task_id = ""
+        try:
+            service = self.generation.get_service(1)
+            submission = await service.submit(
+                plugin_id=caller_id,
+                plugin_name=f"群间系列 · {caller_id}",
+                prompt=final_prompt,
+                umo=service_umo,
+                reference_images=refs or None,
+                use_rate_limit=True,
+                image_count=1,
+            )
+            task_id = str(submission.get("task_id") or "")
+            task = await service.wait_task(task_id, plugin_id=caller_id)
+            status = str(task.get("status") or "").lower()
+            image_paths = [
+                str(p)
+                for p in (task.get("image_paths") or [])
+                if isinstance(p, str) and p.strip()
+            ]
+            image_urls = [
+                str(u)
+                for u in (task.get("image_urls") or [])
+                if isinstance(u, str) and u.strip()
+            ]
+            image_path = image_paths[0] if image_paths else ""
+            image_url = image_urls[0] if image_urls else ""
+            if not image_path and task.get("job_id"):
+                tracker = getattr(self.generation, "generation_tracker", None)
+                if tracker is not None:
+                    rec = tracker.get(str(task["job_id"])) or {}
+                    imgs = rec.get("images") or []
+                    if imgs and callable(getattr(tracker, "gallery_image_path", None)):
+                        resolved = tracker.gallery_image_path(imgs[0])
+                        if resolved is not None:
+                            image_path = str(resolved)
+            if status in {"succeeded", "partial_success"} and (image_path or image_url):
+                return {
+                    "ok": True,
+                    "image_path": image_path,
+                    "image_url": image_url,
+                    "task_id": task_id,
+                    "error": "",
+                }
+            return {
+                "ok": False,
+                "image_path": image_path,
+                "image_url": image_url,
+                "task_id": task_id,
+                "error": str(task.get("error") or task.get("message") or f"生成失败 ({status})"),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "image_path": "",
+                "image_url": "",
+                "task_id": task_id,
+                "error": str(exc),
+            }
+
+    def get_group_top_memes(
+        self,
+        umo: str,
+        *,
+        keyword: str = "",
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Return top memes visible in ``umo`` (for chronicle /meme-evolution & companions)."""
+        try:
+            if getattr(self, "_closed", False) or self.memes is None:
+                return []
+            try:
+                max_items = max(1, min(50, int(limit)))
+            except (TypeError, ValueError):
+                max_items = 5
+
+            target_umo = str(umo or "").strip()
+            group_id = self._extract_group_id_from_umo(target_umo)
+            if target_umo and self._is_excluded_by_core(umo=target_umo, group_id=group_id):
+                return []
+
+            kw = str(keyword or "").strip().casefold()
+            kw_tokens = [tok for tok in kw.split() if tok] if kw else []
+            ranked: list[tuple[tuple[int, int, int, int, int], dict[str, Any]]] = []
+
+            for path, meta in self._safe_meme_index().items():
+                if not isinstance(meta, dict):
+                    continue
+                scope_mode = str(meta.get("scope_mode") or "public").strip().lower()
+                origin_target = str(meta.get("origin_target") or "").strip()
+                origin_matched = bool(
+                    target_umo and self._origin_matches_scope(origin_target, target_umo)
+                )
+                if scope_mode != "public" and not origin_matched:
+                    continue
+
+                desc = str(meta.get("desc") or "").strip()
+                overlay = str(meta.get("overlay_text") or "").strip()
+                category = str(meta.get("category") or "").strip()
+                character = str(meta.get("character") or "").strip()
+                tags = (
+                    [str(t).strip() for t in meta.get("tags") or [] if str(t).strip()]
+                    if isinstance(meta.get("tags"), (list, tuple))
+                    else []
+                )
+                scenes = (
+                    [str(s).strip() for s in meta.get("scenes") or [] if str(s).strip()]
+                    if isinstance(meta.get("scenes"), (list, tuple))
+                    else []
+                )
+                emotions = (
+                    [str(e).strip() for e in meta.get("emotions") or [] if str(e).strip()]
+                    if isinstance(meta.get("emotions"), (list, tuple))
+                    else []
+                )
+
+                kw_score = 0
+                if kw:
+                    haystack = " ".join(
+                        [desc, overlay, category, character, *tags, *scenes, *emotions]
+                    ).casefold()
+                    if kw in haystack:
+                        kw_score += 2
+                    for tok in kw_tokens:
+                        if tok in haystack:
+                            kw_score += 1
+                    if kw_score <= 0:
+                        continue
+
+                try:
+                    use_count = int(meta.get("use_count") or 0)
+                except (TypeError, ValueError):
+                    use_count = 0
+                try:
+                    last_used_at = int(meta.get("last_used_at") or 0)
+                except (TypeError, ValueError):
+                    last_used_at = 0
+                try:
+                    created_at = int(meta.get("created_at") or 0)
+                except (TypeError, ValueError):
+                    created_at = 0
+
+                sort_key = (
+                    kw_score,
+                    use_count,
+                    1 if origin_matched else 0,
+                    last_used_at,
+                    created_at,
+                )
+                ranked.append(
+                    (
+                        sort_key,
+                        {
+                            "hash": str(meta.get("hash") or ""),
+                            "path": str(path),
+                            "category": category,
+                            "desc": desc,
+                            "overlay_text": overlay,
+                            "character": character,
+                            "tags": tags,
+                            "scenes": scenes,
+                            "use_count": use_count,
+                            "last_used_at": last_used_at,
+                            "created_at": created_at,
+                            "scope_mode": scope_mode,
+                            "origin_target": origin_target,
+                            "origin_matched": origin_matched,
+                        },
+                    )
+                )
+
+            ranked.sort(key=lambda pair: pair[0], reverse=True)
+            return [item for _, item in ranked[:max_items]]
+        except Exception:
+            return []
 
     def series_search_items(
         self, query: str, scope: str = "", limit: int = 8
@@ -1100,7 +1642,7 @@ class VisualMediaPlugin(Star):
     @filter.command("视觉帮助")
     async def visual_help(self, event: AstrMessageEvent):
         yield event.plain_result(
-            "视觉工坊：/meme menu 管理表情；/生图、/改图、/快速 表情包、/切图；管理面板可保存生成图为表情，并设置角色参考形象。"
+            "视觉工坊：/meme menu 管理表情；/meme pref [show|auto|less|off|more|reset] 设置个人表情偏好；/生图、/改图、/快速 表情包、/切图；管理面板可保存生成图为表情，并设置角色参考形象。"
         )
 
     # Original command and event contracts are forwarded to the internal engines.
@@ -1108,6 +1650,96 @@ class VisualMediaPlugin(Star):
     def meme(self):
         """表情包管理指令，功能面板入口：/meme menu"""
         return self.memes.meme()
+
+    @meme.command("pref")
+    async def meme_pref(self, event: AstrMessageEvent, action: str = "show"):
+        """查询或修改本人在当前会话的表情发送偏好。用法：/meme pref [show|auto|less|off|more|reset]"""
+        behavior = getattr(self, "behavior", None)
+        if behavior is None:
+            yield event.plain_result("视觉偏好服务尚未就绪，请稍后再试。")
+            return
+        if not behavior.settings.preferences_enabled:
+            yield event.plain_result("当前未开启成员视觉表达偏好记忆。")
+            return
+        scope, member = behavior.identity(event)
+        if not scope or not member:
+            yield event.plain_result("无法识别当前会话或成员身份，暂无法设置表情偏好。")
+            return
+
+        freq_labels = {
+            "auto": "自然选择 (auto)",
+            "less": "少用表情，优先文字 (less)",
+            "off": "不主动发表情 (off)",
+            "more": "合适时更常用表情 (more)",
+        }
+        raw = str(action or "show").strip().lower()
+        alias_map = {
+            "": "show",
+            "show": "show",
+            "status": "show",
+            "查看": "show",
+            "查询": "show",
+            "auto": "auto",
+            "默认": "auto",
+            "自然": "auto",
+            "less": "less",
+            "少": "less",
+            "少发": "less",
+            "off": "off",
+            "关闭": "off",
+            "不发": "off",
+            "more": "more",
+            "多": "more",
+            "多发": "more",
+            "reset": "reset",
+            "重置": "reset",
+            "恢复": "reset",
+        }
+        cmd = alias_map.get(raw)
+        if cmd is None:
+            yield event.plain_result(
+                "用法：/meme pref [show|auto|less|off|more|reset]\n"
+                "- show：查看本人在本群当前表情偏好\n"
+                "- auto：自然选择（默认）\n"
+                "- less：少用表情，优先文字\n"
+                "- off：不主动发表情\n"
+                "- more：合适时更常用表情\n"
+                "- reset：重置为默认偏好（同时清空屏蔽与画风偏好）"
+            )
+            return
+
+        if cmd == "show":
+            prefs = await asyncio.to_thread(behavior.preferences, event)
+            freq_text = freq_labels.get(prefs.get("frequency", "auto"), freq_labels["auto"])
+            style_text = prefs.get("style") or "未设置（跟随本轮要求）"
+            blocked_cnt = len(prefs.get("blocked") or [])
+            yield event.plain_result(
+                f"你在本会话的表情表达偏好：\n"
+                f"- 表情频率：{freq_text}\n"
+                f"- 偏好画风：{style_text}\n"
+                f"- 不再推荐：{blocked_cnt} 张\n"
+                f"可用 /meme pref <auto|less|off|more|reset> 调整。"
+            )
+            return
+
+        setter = getattr(behavior, "set_member_preference_async", None)
+        if cmd == "reset":
+            if callable(setter):
+                await setter(event, reset=True)
+            else:
+                await asyncio.to_thread(behavior.set_member_preference, event, reset=True)
+            yield event.plain_result("✅ 已重置你在本会话的表情表达偏好为默认（自然选择）。")
+            return
+
+        if callable(setter):
+            updated = await setter(event, frequency=cmd)
+        else:
+            updated = await asyncio.to_thread(
+                behavior.set_member_preference, event, frequency=cmd
+            )
+        yield event.plain_result(
+            f"✅ 已更新你在本会话的表情频率偏好为：{freq_labels.get(updated['frequency'], cmd)}"
+        )
 
     @filter.permission_type(PermissionType.ADMIN)
     @meme.command("on")

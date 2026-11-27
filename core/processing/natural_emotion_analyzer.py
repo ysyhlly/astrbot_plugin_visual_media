@@ -41,6 +41,18 @@ def _series_panels_mod():
 
 
 def _inherit_series_provider(context: Any) -> str:
+    try:
+        from ..util.series_config import resolve_shared_provider
+
+        shared = resolve_shared_provider(
+            context,
+            "",
+            keys=("light_analysis_provider", "decision_provider", "reply_provider"),
+        )
+        if shared:
+            return shared
+    except Exception:
+        pass
     mod = _series_panels_mod()
     if mod is None:
         return ""

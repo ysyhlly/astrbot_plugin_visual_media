@@ -141,14 +141,32 @@ class VisionHandler:
             # 若修改 system_prompt 失败，则保留原有请求但记录日志以便排查
             logger.warning(f"[LLM_CROP] 注入视觉裁剪 system_prompt 失败: {e}")
 
+    def effective_vision_provider_id(self) -> str:
+        """Return explicit vision_provider_id or inherit vision_provider from series shared config."""
+        explicit = str(self.vision_provider_id or "").strip()
+        if explicit:
+            return explicit
+        try:
+            if __package__ and "." in __package__:
+                from ..core.util.series_config import resolve_shared_provider
+            else:
+                from core.util.series_config import resolve_shared_provider
+
+            return resolve_shared_provider(
+                self.context, "", keys=("vision_provider",)
+            )
+        except Exception:
+            return ""
+
     async def llm_detect_and_split(self, image_path: str) -> list[str]:
         """使用视觉 LLM 识别裁剪框后切割，失败返回空列表"""
         if not self.enable_llm_crop:
             logger.debug("[LLM_CROP] 已关闭视觉裁剪开关，跳过识别")
             return []
 
-        # 若未单独配置视觉识别提供商，则不启用，以免占用生图模型
-        if not self.vision_provider_id:
+        provider_id = self.effective_vision_provider_id()
+        # 若未单独配置视觉识别提供商且系列共享也未提供，则不启用，以免占用生图模型
+        if not provider_id:
             logger.debug("[LLM_CROP] 未配置 vision_provider_id，跳过视觉裁剪")
             return []
 
@@ -192,18 +210,18 @@ class VisionHandler:
 
             image_urls = [vision_input_path] if vision_input_path else []
             logger.debug(
-                f"[LLM_CROP] 调用视觉模型裁剪: provider={self.vision_provider_id}"
+                f"[LLM_CROP] 调用视觉模型裁剪: provider={provider_id}"
             )
             # 注意：这里直接设置 system_prompt 而非增强调用方可能已有的 prompt，
             # 因为这是独立的视觉识别请求，需要精确控制提示词以确保返回 JSON 格式的裁剪框数据。
             # 如需增强而非覆盖，可使用 inject_vision_system_prompt 方法。
             resp = await series_llm_call(
                 self.context,
-                self.vision_provider_id,
+                provider_id,
                 "astrbot_plugin_visual_media",
                 "visual_sticker_crop",
                 lambda: self.context.llm_generate(
-                    chat_provider_id=self.vision_provider_id,
+                    chat_provider_id=provider_id,
                     prompt=prompt,
                     image_urls=image_urls,
                     max_output_tokens=600,
@@ -273,7 +291,8 @@ class VisionHandler:
 
     async def detect_grid_rows_cols(self, image_path: str) -> tuple[int, int] | None:
         """使用视觉提供商识别网格行列数；失败返回 None"""
-        if not self.vision_provider_id:
+        provider_id = self.effective_vision_provider_id()
+        if not provider_id:
             return None
 
         local_path = image_path
@@ -325,11 +344,11 @@ class VisionHandler:
 
             resp = await series_llm_call(
                 self.context,
-                self.vision_provider_id,
+                provider_id,
                 "astrbot_plugin_visual_media",
                 "visual_grid_detect",
                 lambda: self.context.llm_generate(
-                    chat_provider_id=self.vision_provider_id,
+                    chat_provider_id=provider_id,
                     prompt=prompt,
                     image_urls=[vision_input_path],
                     max_output_tokens=200,

@@ -12,8 +12,13 @@ from .media_behavior import MediaBehavior
 
 
 class MediaRuntime(MediaBehavior):
-    def __init__(self, root, settings=None):
-        super().__init__(root, settings)
+    def __init__(self, root, settings=None, context=None, bot_names_source=None):
+        super().__init__(
+            root,
+            settings,
+            context=context,
+            bot_names_source=bot_names_source,
+        )
         self._hot = OrderedDict()
         self._hot_lock = RLock()
         self._leases = {}
@@ -133,9 +138,19 @@ class MediaRuntime(MediaBehavior):
             sender = event.get_sender_id()
         except AttributeError:
             sender = ""
+        try:
+            sender_name = event.get_sender_name()
+        except Exception:
+            sender_name = getattr(event, "sender_name", "") or ""
+        try:
+            group_name = event.get_group_name()
+        except Exception:
+            group_name = getattr(event, "group_name", "") or ""
         frozen = SimpleNamespace(
             unified_msg_origin=event.unified_msg_origin,
             get_sender_id=lambda: sender,
+            get_sender_name=lambda: sender_name,
+            get_group_name=lambda: group_name,
             _visual_media_trace=event._visual_media_trace,
         )
         task = loop.create_task(asyncio.to_thread(self.record, frozen, *args, **kwargs))
@@ -148,6 +163,34 @@ class MediaRuntime(MediaBehavior):
                 logger.warning("[VisualMedia] audit record failed")
 
         task.add_done_callback(completed)
+
+    async def set_member_preference_async(
+        self, event, *, frequency=None, style=None, reset: bool = False
+    ):
+        updated = await asyncio.to_thread(
+            self.set_member_preference,
+            event,
+            frequency=frequency,
+            style=style,
+            reset=reset,
+        )
+        scope, member = self.identity(event)
+        with self._hot_lock:
+            if scope and member and scope in self._hot:
+                self._hot[scope]["members"][member] = dict(updated)
+        await self.arecord(
+            event,
+            "preference",
+            "saved",
+            "command_member_preference",
+            {
+                "frequency": updated["frequency"],
+                "style": updated.get("style", ""),
+                "blocked_count": len(updated.get("blocked") or []),
+                "reset": bool(reset),
+            },
+        )
+        return updated
 
     async def reset_async(self, scope, member):
         await asyncio.to_thread(self.reset, scope, member)

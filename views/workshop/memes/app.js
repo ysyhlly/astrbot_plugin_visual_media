@@ -2,6 +2,7 @@ import { TEMPLATE, EMOTION_LABELS_TEMPLATE } from './template.js';
 import { ImagePreviewClient } from './image_preview_client.js';
 import { createSourceActions } from './source_actions.js';
 import { formatItemOriginLabel } from './source_labels.js';
+import { getSharedScope, setSharedScope, formatScopeLabel } from '../series-ui.js';
 const { createApp, ref, reactive, computed, onMounted, onUnmounted, nextTick } = Vue;
 
 const PLACEHOLDER = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
@@ -52,6 +53,16 @@ createApp({
         const selectedCategory = ref('');
         const selectedCharacter = ref('');
         const selectedLibrary = ref('');
+        const activeScope = ref(getSharedScope());
+        const setActiveScope = (umo) => {
+            const next = setSharedScope(umo, { syncUrl: true, emit: true });
+            if (next !== activeScope.value) {
+                activeScope.value = next;
+                if (activeSection.value === 'pending') fetchPendingImages(1);
+                else fetchImages(1);
+            }
+            return next;
+        };
         const libraries = reactive({ general: 0, favorites: 0, characters: 0, automatic: 0 });
         const automaticLimit = ref(100);
         const characters = ref([]);
@@ -836,6 +847,9 @@ createApp({
                 }
                 if (selectedCharacter.value) {
                     params.set('character', selectedCharacter.value);
+                }
+                if (activeScope.value) {
+                    params.set('scope', activeScope.value);
                 }
                 const res = await apiFetch('api/images?' + params.toString());
                 const data = await res.json();
@@ -2507,6 +2521,19 @@ createApp({
             localeVersion.value += 1;
             updateDocumentMeta();
         };
+        const handleScopeChange = (event) => {
+            const next = String(event?.detail?.umo ?? getSharedScope() ?? '').trim();
+            if (next === activeScope.value) return;
+            activeScope.value = next;
+            if (sourceOpen.value && !sourceForm.origin_target && next) {
+                sourceForm.origin_target = `umo:${next}`;
+            }
+            if (activeSection.value === 'pending') {
+                fetchPendingImages(1);
+            } else {
+                fetchImages(1);
+            }
+        };
         onMounted(() => {
             const pollPending = async () => {
                 if (pendingPollStopped) return;
@@ -2524,6 +2551,7 @@ createApp({
                 syncThemeFromContext(context);
             });
             window.addEventListener('series-languagechange', refreshLocale);
+            window.addEventListener('dynamics-scopechange', handleScopeChange);
             updatePageSize();
             window.addEventListener('keydown', handleKeydown);
             window.addEventListener('resize', handleResize);
@@ -2547,6 +2575,7 @@ createApp({
 
         onUnmounted(() => {
             window.removeEventListener('series-languagechange', refreshLocale);
+            window.removeEventListener('dynamics-scopechange', handleScopeChange);
             pendingPollStopped = true;
             clearTimeout(pendingPollTimer);
             window.removeEventListener('keydown', handleKeydown);
@@ -2575,6 +2604,9 @@ createApp({
             selectedCategory,
             selectedCharacter,
             selectedLibrary,
+            activeScope,
+            setActiveScope,
+            formatScopeLabel,
             libraryTitle,
             retentionLabel,
             selectLibrary,

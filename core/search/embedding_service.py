@@ -6,6 +6,7 @@
 import asyncio
 import hashlib
 import json
+import sqlite3
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -17,6 +18,7 @@ from astrbot.api import logger
 from astrbot.api.star import StarTools
 
 from ..processing.semantic_schema import EMBEDDING_TEXT_VERSION, build_meme_search_text
+from ..util.series_config import resolve_shared_provider
 from .embedding_provider_adapter import (
     EmbeddingProviderAdapter,
     interactive_embedding_lane,
@@ -97,10 +99,20 @@ class EmbeddingService:
         """读取插件配置中的嵌入检索开关。"""
         return getattr(self.plugin, "enable_embedding_search", False)
 
+    def _resolve_embedding_provider_id(self) -> str:
+        explicit = str(getattr(self.plugin, "embedding_provider_id", "") or "").strip()
+        if explicit:
+            return explicit
+        return resolve_shared_provider(
+            getattr(self.plugin, "context", None),
+            "",
+            keys=("embedding_provider",),
+        )
+
     def _reset_provider_state_if_changed(self) -> None:
         """配置开关或 provider ID 变化时重置 provider 探测状态。"""
         current_enable = self._embedding_enabled()
-        current_id = str(getattr(self.plugin, "embedding_provider_id", "") or "").strip()
+        current_id = self._resolve_embedding_provider_id()
         if (
             self._last_enable_embedding_search != current_enable
             or self._last_embedding_provider_id != current_id
@@ -115,7 +127,7 @@ class EmbeddingService:
             self._last_embedding_provider_id = current_id
 
     def _get_provider(self) -> Any | None:
-        """获取 EmbeddingProvider（优先配置 ID，留空取首个）。"""
+        """获取 EmbeddingProvider（优先配置 ID -> 系列共享 embedding_provider -> 框架首个）。"""
         # 开关关闭时直接跳过，不触发 provider 探测与日志
         if not self._embedding_enabled():
             return None
@@ -125,9 +137,9 @@ class EmbeddingService:
         if self._provider is not None:
             return self._provider
 
-        provider_id = getattr(self.plugin, "embedding_provider_id", None) or ""
+        provider_id = self._resolve_embedding_provider_id()
 
-        # 1. 按配置的 ID 查找嵌入提供商。
+        # 1. 按配置的 ID（或系列共享 ID）查找嵌入提供商。
         if provider_id:
             provider = self._find_provider_by_id(provider_id)
             if provider is not None:
@@ -139,7 +151,7 @@ class EmbeddingService:
                 else:
                     self._provider = provider
                     self._provider_dim = self._get_provider_dim(provider)
-                    if self._provider_not_found:
+                    if self._provider_not_found or self._faiss_available is False:
                         self._faiss_available = None
                     self._provider_not_found = False
                     logger.info(
@@ -149,14 +161,16 @@ class EmbeddingService:
 
         # 2. 取框架首个 Embedding Provider
         try:
-            providers = self.plugin.context.get_all_embedding_providers()
+            ctx = getattr(self.plugin, "context", None)
+            getter = getattr(ctx, "get_all_embedding_providers", None)
+            providers = getter() if callable(getter) else []
         except Exception:
             providers = []
 
         if providers:
             self._provider = providers[0]
             self._provider_dim = self._get_provider_dim(self._provider)
-            if self._provider_not_found:
+            if self._provider_not_found or self._faiss_available is False:
                 self._faiss_available = None
             self._provider_not_found = False
             pid = self._extract_provider_id(self._provider)
@@ -164,7 +178,7 @@ class EmbeddingService:
             return self._provider
 
         if not self._provider_not_found:
-            logger.info("[Embedding] 未找到 Embedding Provider，嵌入检索不可用")
+            logger.info("[Embedding] 未找到 Embedding Provider，嵌入检索暂未就绪，将在 Provider 就绪后自动重试")
         self._provider_not_found = True
         return None
 
@@ -380,14 +394,16 @@ class EmbeddingService:
     # ═══════════════════════════════════════════════════
 
     def _init_faiss(self) -> bool:
-        """初始化 FaissVecDB。"""
+        """初始化 FaissVecDB（Provider 冷启动尚未就绪时不永久置 False，允许后续自动恢复）。"""
         self._reset_provider_state_if_changed()
-        if self._faiss_available is not None:
-            return self._faiss_available
+        if self._faiss_available is True and self._faiss_db is not None:
+            return True
+        if self._faiss_available is False and self._provider is not None and not self._provider_not_found:
+            return False
 
         provider = self._get_provider()
         if provider is None:
-            self._faiss_available = False
+            # 冷启动阶段 Provider 尚未挂载：保持 _faiss_available=None 以便就绪后自动恢复
             return False
         if self._provider_identity(provider) != self._observed_identity or not self._observed_dim:
             return False
@@ -409,6 +425,7 @@ class EmbeddingService:
             needs_backfill = not Path(db_path).is_file() or not Path(index_path).is_file()
 
             self._faiss_db = FaissVecDB(db_path, index_path, EmbeddingProviderAdapter(self, provider))
+            self._initialized_faiss = None
             if needs_backfill:
                 db = getattr(self.plugin, "db_service", None)
                 if db is not None:
@@ -435,13 +452,109 @@ class EmbeddingService:
         identity = [self._provider_identity(provider), model, self._effective_dim(provider), EMBEDDING_TEXT_VERSION]
         return "fallback:" + hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _is_faiss_connection_error(exc: BaseException) -> bool:
+        """Detect dropped/closed SQLite connections inside FaissVecDB document storage."""
+        markers = (
+            "no active connection",
+            "connection closed",
+            "connection is closed",
+            "closed database",
+            "cannot operate on a closed",
+            "database is closed",
+            "not connected",
+        )
+        seen: set[int] = set()
+        current: BaseException | None = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            msg = str(current).lower()
+            if any(marker in msg for marker in markers):
+                return True
+            if isinstance(current, (sqlite3.OperationalError, sqlite3.ProgrammingError)) and (
+                "closed" in msg or "connection" in msg
+            ):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    @staticmethod
+    def _faiss_connection_looks_closed(client: Any) -> bool:
+        storage = getattr(client, "document_storage", None)
+        if storage is None:
+            return False
+        for attr in ("conn", "_conn", "connection"):
+            if hasattr(storage, attr) and getattr(storage, attr) is None:
+                return True
+        return False
+
     async def _ensure_faiss_initialized(self) -> None:
-        """Reuse SDK initialization for clients created after startup/config changes."""
+        """Reuse SDK initialization for clients created after startup/config changes,
+        and re-initialize automatically if the underlying SQLite connection was dropped.
+        """
         async with self._faiss_init_lock:
             client = self._faiss_db
-            if client is not None and self._initialized_faiss is not client:
+            if client is None:
+                return
+            needs_init = self._initialized_faiss is not client or self._faiss_connection_looks_closed(client)
+            if needs_init:
                 await client.initialize()
                 self._initialized_faiss = client
+
+    async def _rebuild_faiss_client(self, *, reason: str = "") -> bool:
+        """Retire a disconnected FaissVecDB client, recreate it, and re-run initialize()."""
+        async with self._faiss_init_lock:
+            old = self._faiss_db
+            self._faiss_db = None
+            self._initialized_faiss = None
+            self._faiss_available = None
+            if old is not None:
+                self._retired_faiss.append(old)
+            await self._close_retired_faiss()
+            if not self._init_faiss() or self._faiss_db is None:
+                return False
+            try:
+                await self._faiss_db.initialize()
+                self._initialized_faiss = self._faiss_db
+                logger.info(f"[Embedding] FaissVecDB 连接已自动重建恢复 ({reason or 'reconnect'})")
+                return True
+            except Exception as exc:
+                self.warning_rate_limited(
+                    "faiss_rebuild_failed",
+                    f"[Embedding] FaissVecDB 连接重建失败: {exc}",
+                )
+                self._retire_faiss()
+                return False
+
+    async def _run_faiss_op(self, op_name: str, operation):
+        """Run a FaissVecDB operation with automatic reconnect + single retry on closed SQLite connection."""
+        last_exc: BaseException | None = None
+        for attempt in range(2):
+            await self._ensure_faiss_initialized()
+            client = self._faiss_db
+            if client is None:
+                if attempt == 0 and await self._rebuild_faiss_client(reason=f"{op_name}:missing_client"):
+                    client = self._faiss_db
+                if client is None:
+                    raise RuntimeError("FaissVecDB client unavailable")
+            try:
+                async with self._faiss_operation_lock:
+                    if self._faiss_db is not client or self._faiss_db is None:
+                        continue
+                    return await operation(client)
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 0 and self._is_faiss_connection_error(exc):
+                    self.warning_rate_limited(
+                        f"faiss_reconnect:{op_name}",
+                        f"[Embedding] FaissVecDB 连接断开（{op_name}: {exc}），自动重建连接并重试",
+                    )
+                    if await self._rebuild_faiss_client(reason=f"{op_name}:{exc}"):
+                        continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"FaissVecDB operation '{op_name}' did not complete")
 
     # ═══════════════════════════════════════════════════
     #  numpy 降级（SQLite emoji_embedding 表）
@@ -544,11 +657,18 @@ class EmbeddingService:
         provider = self._get_provider()
         if provider is None:
             logger.info(
-                "[Embedding] 未就绪 — 请在 AstrBot 后台配置 Embedding 模型"
+                "[Embedding] 未就绪 — 请在 AstrBot 后台配置 Embedding 模型（或等待 Provider 加载完成后自动恢复）"
             )
             return
 
-        await self._ensure_provider_ready()
+        try:
+            await self._ensure_provider_ready()
+        except Exception as exc:
+            self.warning_rate_limited(
+                "init_provider_probe",
+                f"[Embedding] 冷启动 Provider 探测未就绪，将在后续调用时自动重试: {exc}",
+            )
+            return
 
         # 2. 尝试 FaissVecDB
         if self._init_faiss() and self._faiss_db is not None:
@@ -557,6 +677,7 @@ class EmbeddingService:
                 logger.info("[Embedding] FaissVecDB 初始化完成 ✅")
             except Exception as e:
                 logger.warning(f"[Embedding] FaissVecDB 初始化失败，降级: {e}")
+                self._retire_faiss()
                 self._faiss_available = False
 
         # 3. 降级 numpy
@@ -616,10 +737,9 @@ class EmbeddingService:
         if len(text) > 4000:
             text = text[:4000]
 
-        # FaissVecDB 路径（先在锁外完成远程嵌入与限流等待，仅在内存/SQLite 临界区持锁）
+        # FaissVecDB 路径（先在锁外完成远程嵌入与限流等待，仅在内存/SQLite 临界区持锁，断连自动重连）
         if self._init_faiss() and self._faiss_db is not None:
             try:
-                await self._ensure_faiss_initialized()
                 precomputed: dict[str, list[float]] | None = None
                 provider = self._get_provider()
                 if provider is not None:
@@ -628,12 +748,14 @@ class EmbeddingService:
                         return False
                     precomputed = {text: vec}
                 with precomputed_embeddings(precomputed):
-                    async with self._faiss_operation_lock:
-                        ids = await self._faiss_db.insert_batch(
+                    ids = await self._run_faiss_op(
+                        "insert_emoji",
+                        lambda client: client.insert_batch(
                             contents=[text],
                             metadatas=[{"path": path, "category": str(entry.get("category", ""))}],
                             tasks_limit=1,
-                        )
+                        ),
+                    )
                 return len(ids) == 1
             except Exception as e:
                 logger.debug(f"[Embedding] FaissVecDB 插入失败: {e}")
@@ -646,9 +768,10 @@ class EmbeddingService:
         """按 path 删除向量。"""
         await self._ensure_provider_ready()
         if self._init_faiss() and self._faiss_db is not None:
-            await self._ensure_faiss_initialized()
-            async with self._faiss_operation_lock:
-                await self._faiss_db.delete_documents(metadata_filters={"path": path})
+            await self._run_faiss_op(
+                "delete_by_path",
+                lambda client: client.delete_documents(metadata_filters={"path": path}),
+            )
             return True
 
         db = getattr(self.plugin, "db_service", None)
@@ -799,17 +922,18 @@ class EmbeddingService:
                         )
                         return []
                 try:
-                    await self._ensure_faiss_initialized()
                     precomputed = (
                         {processed: precomputed_query_vec}
                         if precomputed_query_vec is not None
                         else None
                     )
                     with precomputed_embeddings(precomputed):
-                        async with self._faiss_operation_lock:
-                            results = await self._faiss_db.retrieve(
+                        results = await self._run_faiss_op(
+                            "retrieve",
+                            lambda client: client.retrieve(
                                 query=processed, k=k, fetch_k=k * 2, rerank=False
-                            )
+                            ),
+                        )
                     out: list[tuple[str, float]] = []
                     for r in results:
                         data = getattr(r, "data", None)
@@ -951,8 +1075,12 @@ class EmbeddingService:
         batch_size = max(1, int(batch_size or self.BACKFILL_BATCH_SIZE))
         using_faiss = self._init_faiss() and self._faiss_db is not None
         if using_faiss:
-            await self._ensure_faiss_initialized()
-            docs = await self._faiss_db.document_storage.get_documents(metadata_filters={}, limit=None, offset=None)
+            docs = await self._run_faiss_op(
+                "backfill_list",
+                lambda client: client.document_storage.get_documents(
+                    metadata_filters={}, limit=None, offset=None
+                ),
+            )
             embedded = set()
             for doc in docs:
                 metadata = doc.get("metadata") or {}
@@ -996,12 +1124,14 @@ class EmbeddingService:
                         precomputed = dict(zip(contents, vectors))
                     insert_started = True
                     with precomputed_embeddings(precomputed):
-                        async with self._faiss_operation_lock:
-                            ids = await self._faiss_db.insert_batch(
+                        ids = await self._run_faiss_op(
+                            "backfill_insert",
+                            lambda client: client.insert_batch(
                                 contents=contents,
                                 metadatas=[{"path": path, "category": entry.get("category", "")} for path, entry, _ in items],
                                 batch_size=batch_size, tasks_limit=1,
-                            )
+                            ),
+                        )
                     if len(ids) != len(items):
                         raise RuntimeError("incomplete FaissVecDB batch")
                     successful = [path for path, _, _ in items]
@@ -1009,12 +1139,14 @@ class EmbeddingService:
                     failed_paths = [path for path, _, _ in items]
                     # Older SDK versions can leave partial documents after a failed batch.
                     if insert_started:
-                        async with self._faiss_operation_lock:
-                            for path in failed_paths:
-                                try:
-                                    await self._faiss_db.delete_documents(metadata_filters={"path": path})
-                                except Exception:
-                                    pass
+                        for path in failed_paths:
+                            try:
+                                await self._run_faiss_op(
+                                    "backfill_cleanup",
+                                    lambda client, p=path: client.delete_documents(metadata_filters={"path": p}),
+                                )
+                            except Exception:
+                                pass
                     await asyncio.to_thread(db.enqueue_search_refresh, failed_paths)
                     logger.warning(f"[Embedding] Batch backfill queued for retry: {exc}")
             else:

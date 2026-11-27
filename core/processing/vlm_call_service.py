@@ -78,10 +78,25 @@ class VLMCallService:
 
         优先级：
         1. 插件配置的 vision_provider_id
-        2. AstrBot 框架配置的 default_image_caption_provider_id
+        2. 群间系列共享配置的 vision_provider（series_panels.get_series_shared_config）
+        3. AstrBot 框架配置的 default_image_caption_provider_id
         """
         if self.vision_provider_id:
             return self.vision_provider_id
+
+        try:
+            from ..util.series_config import resolve_shared_provider
+
+            shared_vlm_id = resolve_shared_provider(
+                getattr(self.plugin, "context", None),
+                "",
+                keys=("vision_provider",),
+            )
+            if shared_vlm_id:
+                logger.debug(f"继承群间系列共享视觉模型: {shared_vlm_id}")
+                return shared_vlm_id
+        except Exception as e:
+            logger.debug(f"读取群间系列共享视觉模型失败: {e}")
 
         framework_vlm_id = ""
         try:
