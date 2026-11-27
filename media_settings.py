@@ -19,6 +19,9 @@ class MediaSettings:
     character_check_provider: str = ""
     character_check_timeout: int = 60
     character_check_max_images: int = 2
+    character_check_auto_redraw: bool = True
+    make_meme_daily_limit: int = 10
+    crowd_curation_threshold: int = 2
 
     @classmethod
     def parse(cls, raw):
@@ -33,6 +36,8 @@ class MediaSettings:
             "max_records": (100, 50000),
             "character_check_timeout": (5, 120),
             "character_check_max_images": (1, 4),
+            "make_meme_daily_limit": (1, 200),
+            "crowd_curation_threshold": (1, 20),
         }
         for field in fields(cls):
             key = field.name

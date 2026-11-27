@@ -106,6 +106,13 @@ class VisualMediaPlugin(Star):
             self.memes.media_behavior = self.behavior
             self.generation.media_behavior = self.behavior
             self.tasks = await asyncio.to_thread(MediaTasks, self)
+            from .core.commands.crowd_curation import CrowdCurationService
+            from .core.commands.make_meme_service import MakeMemeService
+            from .core.processing.character_pack_service import CharacterPackService
+
+            self.character_pack = CharacterPackService(self)
+            self.make_meme_service = MakeMemeService(self)
+            self.crowd_curation = CrowdCurationService(self)
             self.media_api = MediaAPI(self)
             self.media_api.register(self.engine_context)
             from importlib import reload
@@ -1256,6 +1263,8 @@ class VisualMediaPlugin(Star):
                 if not isinstance(meta, dict):
                     continue
                 scope_mode = str(meta.get("scope_mode") or "public").strip().lower()
+                if scope_mode == "reference" or bool(meta.get("is_reference_only")):
+                    continue
                 origin_target = str(meta.get("origin_target") or "").strip()
                 origin_matched = bool(
                     target_umo and self._origin_matches_scope(origin_target, target_umo)
@@ -1423,7 +1432,9 @@ class VisualMediaPlugin(Star):
                     return results
                 if not isinstance(meta, dict):
                     continue
-                scope_mode = str(meta.get("scope_mode") or "public")
+                scope_mode = str(meta.get("scope_mode") or "public").strip().lower()
+                if scope_mode == "reference" or bool(meta.get("is_reference_only")):
+                    continue
                 origin_target = str(meta.get("origin_target") or "")
                 if scope_mode != "public" and (
                     not target_scope
@@ -1639,10 +1650,145 @@ class VisualMediaPlugin(Star):
         """
         return await self.library.generate_character(character, prompt, event)
 
+    def _get_make_meme_service(self):
+        svc = getattr(self, "make_meme_service", None)
+        if svc is None:
+            from .core.commands.make_meme_service import MakeMemeService
+
+            svc = MakeMemeService(self)
+            self.make_meme_service = svc
+        return svc
+
+    def _get_crowd_curation_service(self):
+        svc = getattr(self, "crowd_curation", None)
+        if svc is None:
+            from .core.commands.crowd_curation import CrowdCurationService
+
+            svc = CrowdCurationService(self)
+            self.crowd_curation = svc
+        return svc
+
+    def _resolve_character_key(self, raw_query: str) -> tuple[str | None, list[dict[str, Any]]]:
+        profiles = self._safe_character_profiles()
+        needle = str(raw_query or "").strip()
+        if not needle:
+            return None, profiles
+        lower = needle.casefold()
+        for p in profiles:
+            if str(p.get("key") or "").strip().casefold() == lower:
+                return str(p["key"]), profiles
+        for p in profiles:
+            if str(p.get("name") or "").strip().casefold() == lower:
+                return str(p["key"]), profiles
+        partial = [
+            p
+            for p in profiles
+            if lower in str(p.get("name") or "").casefold()
+            or lower in str(p.get("key") or "").casefold()
+        ]
+        if len(partial) == 1:
+            return str(partial[0]["key"]), profiles
+        return None, profiles
+
+    @filter.command("角色生图")
+    async def character_generate_command(
+        self, event: AstrMessageEvent, character: str = "", prompt: str = ""
+    ):
+        """使用已保存的角色形象与参考图定向生图。用法：/角色生图 <角色名或标识> <画面描述>"""
+        if self._is_event_excluded_by_core(event):
+            return
+        full_text = str(getattr(event, "message_str", "") or "").strip()
+        # Preserve multi-word prompts beyond the first two whitespace tokens.
+        parts = full_text.split(None, 2)
+        if len(parts) >= 3 and parts[0].lstrip("/").startswith("角色生图"):
+            char_arg = parts[1].strip()
+            prompt_arg = parts[2].strip()
+        else:
+            char_arg = str(character or "").strip()
+            prompt_arg = str(prompt or "").strip()
+
+        matched_key, profiles = self._resolve_character_key(char_arg)
+        if not char_arg or matched_key is None:
+            if not profiles:
+                yield event.plain_result(
+                    "尚未配置任何角色档案。请先在「视觉工坊 → 角色形象」中添加角色与参考图。"
+                )
+                return
+            names = "、".join(
+                f"{p.get('name') or p.get('key')}({p.get('key')})" for p in profiles[:12]
+            )
+            tip = f"未找到角色「{char_arg}」。\n" if char_arg else ""
+            yield event.plain_result(
+                f"{tip}用法：/角色生图 <角色> <画面描述>\n当前可用角色：{names}"
+            )
+            return
+
+        if not prompt_arg:
+            yield event.plain_result(
+                f"请补充画面描述，例如：/角色生图 {char_arg} 在海边举着奶茶微笑"
+            )
+            return
+
+        lib = getattr(self, "library", None)
+        if lib is None:
+            yield event.plain_result("角色图库服务尚未就绪，请稍后再试。")
+            return
+        res = await lib.generate_character(matched_key, prompt_arg, event)
+        if isinstance(res, dict) and res.get("error"):
+            yield event.plain_result(f"角色生图失败：{res['error']}")
+            return
+        yield event.plain_result(
+            f"🎨 已提交角色「{char_arg}」生图任务，生成完成后将自动发送到本会话。"
+        )
+
+    @filter.command("做表情")
+    async def make_meme_command(self, event: AstrMessageEvent, prompt: str = ""):
+        """群聊一键造梗表情包（可回复群友消息再发送）。用法：/做表情 [情绪或文案]"""
+        if self._is_event_excluded_by_core(event):
+            return
+        full_text = str(getattr(event, "message_str", "") or "").strip()
+        parts = full_text.split(None, 1)
+        if len(parts) >= 2 and parts[0].lstrip("/").startswith("做表情"):
+            caption = parts[1].strip()
+        else:
+            caption = str(prompt or "").strip()
+
+        svc = self._get_make_meme_service()
+        res = await svc.create_meme(event, caption)
+        if not res.get("ok"):
+            yield event.plain_result(str(res.get("error") or "制作表情失败，请稍后重试。"))
+            return
+        from astrbot.api.message_components import Image as AstrImage
+        from astrbot.api.message_components import Plain
+
+        image_path = str(res.get("image_path") or "")
+        notice = str(res.get("notice") or "")
+        chain = []
+        if image_path:
+            chain.append(AstrImage.fromFileSystem(image_path))
+        if notice:
+            chain.append(Plain(notice))
+        yield event.chain_result(chain)
+
     @filter.command("视觉帮助")
     async def visual_help(self, event: AstrMessageEvent):
         yield event.plain_result(
-            "视觉工坊：/meme menu 管理表情；/meme pref [show|auto|less|off|more|reset] 设置个人表情偏好；/生图、/改图、/快速 表情包、/切图；管理面板可保存生成图为表情，并设置角色参考形象。"
+            "【视觉工坊 · 群友创作与表情指令】\n"
+            "• /生图 <描述> · /改图 <修改说明> · /换风格 <风格> [描述]\n"
+            "  （支持在提示词前使用 @provider:model 指定生图模型路由）\n"
+            "• /快速 头像|海报|壁纸|卡片|手机|手办化|表情包 [描述]\n"
+            "• /角色生图 <角色> <描述>：带入角色设定与标准参考图定向生图\n"
+            "• /做表情 [情绪/文案]：回复群友金句或直接造梗（每人每天默认 10 次；回复「收藏/入库」存入本群库）\n"
+            "• /切图 [行x列]：智能或按网格切分表情包大图\n"
+            "• /meme pref [show|auto|less|off|more|reset]：设置个人表情发送偏好\n"
+            "• /meme 审图 [通过|拒绝|跳过]：群聊众包审图投票，达标自动入本群库\n"
+            "• /meme random：随机试发本群可用表情\n\n"
+            "【管理员运维与工坊指令】\n"
+            "• /meme menu · /meme status · /meme on|off · /meme auto_on|auto_off\n"
+            "• /meme group <send|steal> <wl|bl> <add|del|clear|show>\n"
+            "• /meme 偷 · /meme list · /meme delete · /meme scope · /meme rebuild_index\n"
+            "• /生图帮助：查看生图详细参数与配额说明\n"
+            "• 网页端「视觉工坊」支持一键生成角色 9 宫格表情套图、相似图去重合并与待审核批量预打标。"
         )
 
     # Original command and event contracts are forwarded to the internal engines.
@@ -1740,6 +1886,41 @@ class VisualMediaPlugin(Star):
         yield event.plain_result(
             f"✅ 已更新你在本会话的表情频率偏好为：{freq_labels.get(updated['frequency'], cmd)}"
         )
+
+    @meme.command("审图")
+    async def meme_curation(self, event: AstrMessageEvent, action: str = ""):
+        """群聊众包审图：推送待审核表情并投票通过或拒绝。用法：/meme 审图 [通过|拒绝|跳过]"""
+        if self._is_event_excluded_by_core(event):
+            return
+        svc = self._get_crowd_curation_service()
+        clean = str(action or "").strip().lower()
+        if clean in {"通过", "赞成", "+1", "approve", "yes", "ok"}:
+            reply = await svc.cast_vote(event, "approve")
+            yield event.plain_result(reply or "当前没有进行中的审图，发送 /meme 审图 开始。")
+            return
+        if clean in {"拒绝", "反对", "-1", "reject", "no"}:
+            reply = await svc.cast_vote(event, "reject")
+            yield event.plain_result(reply or "当前没有进行中的审图，发送 /meme 审图 开始。")
+            return
+
+        skip = clean in {"跳过", "下一张", "skip", "next"}
+        sess, err = await svc.start_session(event, skip_current=skip)
+        if err or not sess:
+            yield event.plain_result(err or "当前没有待审表情。")
+            return
+
+        from astrbot.api.message_components import Image as AstrImage
+        from astrbot.api.message_components import Plain
+
+        desc_line = f"描述：{sess['desc']}\n" if sess.get("desc") else ""
+        text = (
+            f"🗳️ 群聊众包审图（待审 #{sess['pending_id']} · 分类：{sess['category']}）\n"
+            f"{desc_line}"
+            f"当前票数：通过 {len(sess['approve_voters'])}/{sess['threshold']} · "
+            f"拒绝 {len(sess['reject_voters'])}/{sess['threshold']}\n"
+            "直接回复「通过 / +1」或「拒绝 / -1」投票（每人 1 票，达标自动入本群库或丢弃；发 /meme 审图 跳过 换下一张）。"
+        )
+        yield event.chain_result([AstrImage.fromFileSystem(sess["path"]), Plain(text)])
 
     @filter.permission_type(PermissionType.ADMIN)
     @meme.command("on")
@@ -1953,9 +2134,19 @@ class VisualMediaPlugin(Star):
     @filter.event_message_type(EventMessageType.ALL)
     @filter.platform_adapter_type(PlatformAdapterType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        """消息监听：偷取消息中的图片并分类存储。"""
+        """消息监听：处理造梗收藏、众包审图投票以及自动偷取图片。"""
         if self._is_event_excluded_by_core(event):
             return None
+        make_svc = getattr(self, "make_meme_service", None)
+        if make_svc is not None:
+            saved_reply = await make_svc.try_handle_save_reply(event)
+            if saved_reply:
+                return event.plain_result(saved_reply)
+        curation_svc = getattr(self, "crowd_curation", None)
+        if curation_svc is not None:
+            vote_reply = await curation_svc.try_handle_vote_message(event)
+            if vote_reply:
+                return event.plain_result(vote_reply)
         return await self.memes.on_message(event)
 
     @filter.on_llm_tool_respond()

@@ -1589,34 +1589,50 @@ class GeminiImageGenerationPlugin(Component):
                         yield event.plain_result("⚠️ 压缩包发送失败，降级使用合并转发")
                         sent_success = False
 
-            # 合并转发发送
+            # 合并转发发送（不支持合并转发的平台自动降级为直接发送）
             if not sent_success:
-                node_content = []
-                node_content.append(Plain("原图预览："))
-                try:
-                    node_content.append(AstrImage.fromFileSystem(primary_image_path))
-                except Exception:
-                    pass
-                node_content.append(Plain("表情包切片："))
-                node_content.append(
-                    Plain('如果切图失败请尝试使用"切图 x x"手动指定行列')
-                )
-                for file_path in split_files:
-                    try:
-                        node_content.append(AstrImage.fromFileSystem(file_path))
-                    except Exception:
-                        node_content.append(Plain(f"[切片发送失败]: {file_path}"))
+                from .core.util.platform_capabilities import get_platform_capabilities
 
-                sender_id = "0"
-                try:
-                    if hasattr(event, "message_obj") and event.message_obj:
-                        sender_id = getattr(event.message_obj, "self_id", "0") or "0"
-                except Exception:
-                    pass
-                node = Node(
-                    uin=sender_id, name="Gemini表情包生成", content=node_content
-                )
-                yield event.chain_result([node])
+                caps = get_platform_capabilities(event)
+                if not caps.supports_forward_node:
+                    hint = caps.degradation_hint("forward_node")
+                    direct_chain: list[Any] = []
+                    if hint:
+                        direct_chain.append(Plain(hint + "\n"))
+                    direct_chain.append(Plain(f"共切分出 {len(split_files)} 张表情切片："))
+                    for file_path in split_files[:9]:
+                        try:
+                            direct_chain.append(AstrImage.fromFileSystem(file_path))
+                        except Exception:
+                            direct_chain.append(Plain(f"[切片发送失败]: {file_path}"))
+                    yield event.chain_result(direct_chain)
+                else:
+                    node_content = []
+                    node_content.append(Plain("原图预览："))
+                    try:
+                        node_content.append(AstrImage.fromFileSystem(primary_image_path))
+                    except Exception:
+                        pass
+                    node_content.append(Plain("表情包切片："))
+                    node_content.append(
+                        Plain('如果切图失败请尝试使用"切图 x x"手动指定行列')
+                    )
+                    for file_path in split_files:
+                        try:
+                            node_content.append(AstrImage.fromFileSystem(file_path))
+                        except Exception:
+                            node_content.append(Plain(f"[切片发送失败]: {file_path}"))
+
+                    sender_id = "0"
+                    try:
+                        if hasattr(event, "message_obj") and event.message_obj:
+                            sender_id = getattr(event.message_obj, "self_id", "0") or "0"
+                    except Exception:
+                        pass
+                    node = Node(
+                        uin=sender_id, name="Gemini表情包生成", content=node_content
+                    )
+                    yield event.chain_result([node])
         except Exception as e:
             logger.error(f"表情包生成失败: {redact_text(str(e))[:240]}", exc_info=True)
             yield event.plain_result(format_error_message(e))
@@ -1748,6 +1764,23 @@ class GeminiImageGenerationPlugin(Component):
 
         if split_duration is not None:
             yield event.plain_result(f"⏱️ 切割耗时 {split_duration:.1f}s")
+
+        from .core.util.platform_capabilities import get_platform_capabilities
+
+        caps = get_platform_capabilities(event)
+        if not caps.supports_forward_node:
+            direct_chain: list[Any] = []
+            hint = caps.degradation_hint("forward_node")
+            if hint:
+                direct_chain.append(Plain(hint + "\n"))
+            direct_chain.append(Plain("切片："))
+            for file_path in split_files[:9]:
+                try:
+                    direct_chain.append(AstrImage.fromFileSystem(file_path))
+                except Exception:
+                    direct_chain.append(Plain(f"[切片发送失败]: {file_path}"))
+            yield event.chain_result(direct_chain)
+            return
 
         node_content = [Plain("切片：")]
         for file_path in split_files:

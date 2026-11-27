@@ -121,8 +121,11 @@ function renderProfiles() {
       $("generate-form").elements.character.value = profile.key;
       $("generate-dialog").showModal();
     };
+    const packBtn = el("button", UI.msg("一键表情套图"));
+    packBtn.type = "button";
+    packBtn.onclick = () => openCharacterPackDialog(profile);
     const actions = el("div", "", "profile-actions");
-    actions.append(edit, create);
+    actions.append(edit, create, packBtn);
 
     card.append(frame, heading, body, actions);
     $("profiles").append(card);
@@ -274,6 +277,7 @@ async function refresh() {
     $("profile-count").textContent = profiles.length;
     $("generation-state").textContent = generation.ready ? UI.t("已就绪") : UI.t("待配置");
     $("queue-count").textContent = `${generation.active_requests || 0} / ${generation.queued_requests || 0}`;
+    renderEmptyLibraryOnboarding(data);
     renderProfiles();
     observer.disconnect();
     $("history").replaceChildren();
@@ -330,10 +334,26 @@ const observer = new IntersectionObserver((entries) => {
     }).catch(() => renderImageFailure(entry.target));
   }
 });
+function ensureIsolateCheckbox() {
+  const form = $("profile-form");
+  if (!form || form.elements.isolate_references) return;
+  const fieldset = form.querySelector(".vm-reference-field");
+  if (!fieldset) return;
+  const label = el("label", "", "check");
+  label.style.marginTop = "8px";
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.name = "isolate_references";
+  label.append(box, el("span", UI.t("参考图仅用于角色一致性，不参与群聊随机发表情")));
+  fieldset.append(label);
+}
+
 async function editProfile(profile = {}) {
   const form = $("profile-form"); form.reset();
+  ensureIsolateCheckbox();
   formError(form);
   for (const key of ["key", "name", "appearance", "style"]) form.elements[key].value = profile[key] || "";
+  if (form.elements.isolate_references) form.elements.isolate_references.checked = Boolean(profile.isolate_references);
   form.elements.key.readOnly = !!profile.key;
   $("profile-dialog").showModal();
   await picker.open(profile.references || []);
@@ -352,9 +372,242 @@ $("profile-form").onsubmit = async (event) => {
   event.preventDefault(); const form = event.currentTarget, button = form.querySelector('[type="submit"]'); button.disabled = true;
   try {
     const data = Object.fromEntries(new FormData(form)); data.references = [...form.elements.references.selectedOptions].map((o) => o.value);
+    data.isolate_references = Boolean(form.elements.isolate_references?.checked);
     await post("media/profiles", data); $("profile-dialog").close(); notice(UI.t("角色形象已保存")); await refresh();
   } catch(error) { formError(form, error.message); notice(error.message); } finally { button.disabled = false; }
 };
+
+let activePackProfile = null;
+let stagedPackResult = null;
+function ensureCharacterPackDialog() {
+  let dialog = $("character-pack-dialog");
+  if (dialog) return dialog;
+  dialog = document.createElement("dialog");
+  dialog.id = "character-pack-dialog";
+  dialog.style.maxWidth = "680px";
+  dialog.style.width = "92vw";
+  const form = document.createElement("form");
+  form.id = "character-pack-form";
+  const head = el("div", "", "dialog-head");
+  const title = el("h2", UI.t("一键生成角色表情套图"));
+  title.id = "character-pack-title";
+  const closeBtn = el("button", "×");
+  closeBtn.type = "button";
+  closeBtn.onclick = () => dialog.close();
+  head.append(title, closeBtn);
+
+  const hint = el("p", UI.t("将自动生成 3×3 九宫格角色表情，经自适应切分并由视觉模型打标后绑定角色入库（VLM 不可用时自动回退预设标签）。"), "hint");
+  const emotionsLabel = el("label");
+  emotionsLabel.append(el("span", UI.t("9 格情绪（逗号分隔，留空使用默认 9 种常用情绪）")));
+  const emotionsInput = document.createElement("input");
+  emotionsInput.name = "emotions";
+  emotionsInput.placeholder = "开心大笑,生气炸毛,委屈哭哭,震惊呆住,无语流汗,比心贴贴,疑惑问号,困倦摸鱼,点赞好耶";
+  emotionsLabel.append(emotionsInput);
+
+  const styleLabel = el("label");
+  styleLabel.append(el("span", UI.t("套图附加画风（可选）")));
+  const styleInput = document.createElement("input");
+  styleInput.name = "style";
+  styleInput.placeholder = "例如 Q 版粗描边贴纸、手绘涂鸦风";
+  styleLabel.append(styleInput);
+
+  const modeLabel = el("label", "", "check");
+  const previewCheck = document.createElement("input");
+  previewCheck.type = "checkbox";
+  previewCheck.name = "preview_only";
+  modeLabel.append(previewCheck, el("span", UI.t("先生成切片预览，人工确认后再入库（不勾选则一键直接入库）")));
+
+  const statusBox = el("div", "", "hint");
+  statusBox.id = "character-pack-status";
+  const previewGrid = el("div", "", "gallery");
+  previewGrid.id = "character-pack-preview";
+  previewGrid.style.gridTemplateColumns = "repeat(auto-fill, minmax(120px, 1fr))";
+  previewGrid.style.gap = "10px";
+  previewGrid.style.marginTop = "10px";
+
+  const footer = document.createElement("footer");
+  const cancelBtn = el("button", UI.t("关闭"));
+  cancelBtn.type = "button";
+  cancelBtn.onclick = () => dialog.close();
+  const commitBtn = el("button", UI.t("确认全部入库"), "primary");
+  commitBtn.type = "button";
+  commitBtn.id = "character-pack-commit";
+  commitBtn.hidden = true;
+  commitBtn.onclick = async () => {
+    if (!stagedPackResult?.pack_id) return;
+    commitBtn.disabled = true;
+    statusBox.textContent = UI.t("正在将切片批量入库…");
+    try {
+      const committed = await post("media/character-pack/commit", {
+        pack_id: stagedPackResult.pack_id,
+        scope_mode: stagedPackResult.scope_mode || "public",
+      });
+      stagedPackResult = null;
+      commitBtn.hidden = true;
+      statusBox.textContent = UI.t("入库完成：成功 {0} 张，失败 {1} 张。", { 0: committed.imported_count || 0, 1: committed.failed_count || 0 });
+      notice(statusBox.textContent);
+      await refresh();
+    } catch (error) {
+      statusBox.textContent = UI.t("入库失败：{0}", { 0: error.message });
+    } finally {
+      commitBtn.disabled = false;
+    }
+  };
+  const submitBtn = el("button", UI.t("开始生成套图"), "primary");
+  submitBtn.type = "submit";
+  footer.append(cancelBtn, commitBtn, submitBtn);
+
+  form.append(head, hint, emotionsLabel, styleLabel, modeLabel, statusBox, previewGrid, footer);
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    if (!activePackProfile) return;
+    submitBtn.disabled = true;
+    commitBtn.hidden = true;
+    stagedPackResult = null;
+    previewGrid.replaceChildren();
+    statusBox.textContent = UI.t("正在生成 9 宫格套图并自动切分打标，请稍候…");
+    try {
+      const fd = new FormData(form);
+      const res = await post("media/character-pack", {
+        character: activePackProfile.key,
+        emotions: String(fd.get("emotions") || "").trim(),
+        style: String(fd.get("style") || "").trim(),
+        preview_only: Boolean(previewCheck.checked),
+        scope_mode: "public",
+        umo: activeScope || "",
+      });
+      for (const item of res.items || []) {
+        const tile = el("div", "", "image-card");
+        tile.style.padding = "6px";
+        if (item.preview_url) {
+          const img = document.createElement("img");
+          img.src = item.preview_url;
+          img.alt = item.desc || item.emotion_label || "";
+          img.style.width = "100%";
+          img.style.aspectRatio = "1 / 1";
+          img.style.objectFit = "contain";
+          tile.append(img);
+        }
+        const meta = el("div", `${item.emotion_label || item.category}${item.imported ? " ✓" : item.error ? " ✗" : ""}`, "hint");
+        meta.style.marginTop = "4px";
+        tile.append(meta);
+        previewGrid.append(tile);
+      }
+      if (res.preview_only) {
+        stagedPackResult = res;
+        commitBtn.hidden = false;
+        statusBox.textContent = UI.t("已生成并切分 {0} 张切片，确认效果后点击「确认全部入库」。", { 0: res.total_slices || 0 });
+      } else {
+        statusBox.textContent = UI.t("一键套图完成：共切分 {0} 张，成功入库 {1} 张，失败 {2} 张。", { 0: res.total_slices || 0, 1: res.imported_count || 0, 2: res.failed_count || 0 });
+        notice(statusBox.textContent);
+        await refresh();
+      }
+    } catch (error) {
+      statusBox.textContent = UI.t("套图生成失败：{0}", { 0: error.message });
+      notice(statusBox.textContent);
+    } finally {
+      submitBtn.disabled = false;
+    }
+  };
+  dialog.append(form);
+  document.body.append(dialog);
+  return dialog;
+}
+
+function openCharacterPackDialog(profile) {
+  activePackProfile = profile;
+  stagedPackResult = null;
+  const dialog = ensureCharacterPackDialog();
+  const title = $("character-pack-title");
+  if (title) title.textContent = UI.t("一键生成角色表情套图 · {0}", { 0: profile.name || profile.key });
+  const statusBox = $("character-pack-status");
+  if (statusBox) statusBox.textContent = "";
+  const previewGrid = $("character-pack-preview");
+  if (previewGrid) previewGrid.replaceChildren();
+  const commitBtn = $("character-pack-commit");
+  if (commitBtn) commitBtn.hidden = true;
+  dialog.showModal();
+}
+
+function renderEmptyLibraryOnboarding(data) {
+  const existing = $("empty-library-onboarding");
+  if (charactersPage || Number(data?.memes || 0) > 0) {
+    if (existing) existing.remove();
+    return;
+  }
+  const statsSection = document.querySelector(".stats");
+  if (!statsSection) return;
+  const card = existing || el("section", "", "vm-onboarding-card");
+  card.id = "empty-library-onboarding";
+  card.style.margin = "16px 0";
+  card.style.padding = "18px 20px";
+  card.style.borderRadius = "14px";
+  card.style.border = "1px dashed var(--line, rgba(128,128,128,0.35))";
+  card.style.background = "var(--surface, rgba(128,128,128,0.06))";
+  card.replaceChildren();
+
+  const header = el("div");
+  header.append(
+    el("h2", UI.t("表情库还是空的 · 选一种方式 1 分钟冷启动")),
+    el("p", UI.t("从下面任选一种方式快速充实你的表情库，之后 Bot 就能在群聊中自然接梗斗图。"), "hint")
+  );
+  const grid = el("div");
+  grid.style.display = "grid";
+  grid.style.gridTemplateColumns = "repeat(auto-fit, minmax(200px, 1fr))";
+  grid.style.gap = "12px";
+  grid.style.marginTop = "12px";
+
+  // Option 1: Import external pack
+  const opt1 = el("article");
+  opt1.style.padding = "12px";
+  opt1.style.borderRadius = "10px";
+  opt1.style.border = "1px solid var(--line, rgba(128,128,128,0.2))";
+  opt1.append(el("h3", UI.t("① 导入外部表情包")), el("p", UI.t("支持 ZIP/文件夹批量导入，或接入外部开源表情仓库自动同步。"), "hint"));
+  const importLink = el("a", UI.t("前往导入外部包 →"), "primary");
+  importLink.href = "memes/index.html?open=sources";
+  opt1.append(importLink);
+
+  // Option 2: Enable auto-steal
+  const opt2 = el("article");
+  opt2.style.padding = "12px";
+  opt2.style.borderRadius = "10px";
+  opt2.style.border = "1px solid var(--line, rgba(128,128,128,0.2))";
+  const stealOn = Boolean(data?.steal_enabled);
+  opt2.append(el("h3", UI.t("② 开启自动偷图")), el("p", UI.t("自动收集群聊中大家爱发的表情进待审核池，或用 /meme 审图 一起众包筛选。"), "hint"));
+  const stealBtn = el("button", stealOn ? UI.t("✓ 已开启自动偷图") : UI.t("一键开启自动偷图"));
+  stealBtn.type = "button";
+  stealBtn.disabled = stealOn;
+  stealBtn.onclick = async () => {
+    stealBtn.disabled = true;
+    try {
+      await post("media/quick-steal", { enabled: true });
+      stealBtn.textContent = UI.t("✓ 已开启自动偷图");
+      notice(UI.t("已开启自动偷图，群聊新图将自动进入待审核池。"));
+    } catch (error) {
+      stealBtn.disabled = false;
+      notice(error.message);
+    }
+  };
+  opt2.append(stealBtn);
+
+  // Option 3: One-click character sticker pack
+  const opt3 = el("article");
+  opt3.style.padding = "12px";
+  opt3.style.borderRadius = "10px";
+  opt3.style.border = "1px solid var(--line, rgba(128,128,128,0.2))";
+  opt3.append(el("h3", UI.t("③ 一键生成角色套图")), el("p", UI.t("根据角色档案生成 9 宫格 Q 版表情，自动切分并打标入库。"), "hint"));
+  const packAction = el("button", profiles.length ? UI.t("生成首套角色表情") : UI.t("先创建角色档案"));
+  packAction.type = "button";
+  packAction.onclick = () => {
+    if (profiles.length) openCharacterPackDialog(profiles[0]);
+    else void editProfile();
+  };
+  opt3.append(packAction);
+
+  grid.append(opt1, opt2, opt3);
+  card.append(header, grid);
+  if (!existing) statsSection.after(card);
+}
 $("save-form").onsubmit = async (event) => {
   event.preventDefault(); const form = event.currentTarget, button = form.querySelector('[type="submit"]'); button.disabled = true;
   try {

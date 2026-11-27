@@ -33,10 +33,18 @@ class MemeScopeService:
     def _is_entry_allowed_for_event(
         self, data: dict | None, event: AstrMessageEvent | None
     ) -> bool:
-        if not isinstance(data, dict) or event is None:
+        if not isinstance(data, dict):
             return True
 
-        if normalize_scope_mode(data.get("scope_mode")) != "local":
+        scope_mode = normalize_scope_mode(data.get("scope_mode"))
+        # Character standard reference-only images are isolated from casual chat meme pools.
+        if scope_mode == "reference" or bool(data.get("is_reference_only")):
+            return False
+
+        if event is None:
+            return True
+
+        if scope_mode != "local":
             return True
 
         origin_target = str(data.get("origin_target", "") or "").strip()

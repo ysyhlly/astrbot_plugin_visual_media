@@ -89,3 +89,138 @@ class PHashDedupService:
             return xor.bit_count()
         except (ValueError, TypeError):
             return 999
+
+    @classmethod
+    def cluster_similar_images(
+        cls,
+        entries: list[dict[str, Any]],
+        *,
+        threshold: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Cluster visually similar entries by pHash Hamming distance using Union-Find.
+
+        Args:
+            entries: List of meme metadata dicts containing at least ``hash`` and ``phash``.
+            threshold: Max Hamming distance to consider two images similar.
+
+        Returns:
+            List of cluster dicts (size >= 2), sorted by cluster size descending.
+        """
+        limit = (
+            cls.PHASH_HAMMING_THRESHOLD
+            if threshold is None
+            else max(0, min(128, int(threshold)))
+        )
+        valid: list[dict[str, Any]] = []
+        valid_ints: list[tuple[int, int]] = []
+        seen_hashes: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            img_hash = str(entry.get("hash") or "").strip()
+            phash = str(entry.get("phash") or "").strip()
+            if not img_hash or not phash or img_hash in seen_hashes:
+                continue
+            try:
+                ph_int = int(phash, 16)
+            except (ValueError, TypeError):
+                continue
+            seen_hashes.add(img_hash)
+            valid.append(entry)
+            valid_ints.append((len(phash), ph_int))
+
+        n = len(valid)
+        if n < 2:
+            return []
+
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for i in range(n):
+            len_i, int_i = valid_ints[i]
+            for j in range(i + 1, n):
+                len_j, int_j = valid_ints[j]
+                if len_i != len_j:
+                    continue
+                if (int_i ^ int_j).bit_count() <= limit:
+                    union(i, j)
+
+        groups: dict[int, list[int]] = {}
+        for idx in range(n):
+            root = find(idx)
+            groups.setdefault(root, []).append(idx)
+
+        def _keeper_rank(item: dict[str, Any]) -> tuple[int, int, int, int]:
+            fav = 1 if item.get("is_favorite") else 0
+            try:
+                uses = int(item.get("use_count") or 0)
+            except (TypeError, ValueError):
+                uses = 0
+            try:
+                area = int(item.get("width") or 0) * int(item.get("height") or 0)
+            except (TypeError, ValueError):
+                area = 0
+            try:
+                created = int(item.get("created_at") or 0)
+            except (TypeError, ValueError):
+                created = 0
+            return (fav, uses, area, -created)
+
+        clusters: list[dict[str, Any]] = []
+        for member_indices in groups.values():
+            if len(member_indices) < 2:
+                continue
+            member_indices.sort(key=lambda idx: _keeper_rank(valid[idx]), reverse=True)
+            keeper_idx = member_indices[0]
+            keeper = valid[keeper_idx]
+            keeper_ph = str(keeper.get("phash") or "")
+            items_out: list[dict[str, Any]] = []
+            max_dist = 0
+            for idx in member_indices:
+                item = valid[idx]
+                dist = (
+                    0
+                    if idx == keeper_idx
+                    else cls.hamming_distance(keeper_ph, str(item.get("phash") or ""))
+                )
+                if dist < 999:
+                    max_dist = max(max_dist, dist)
+                items_out.append(
+                    {
+                        "hash": str(item.get("hash") or ""),
+                        "category": str(item.get("category") or ""),
+                        "desc": str(item.get("desc") or ""),
+                        "overlay_text": str(item.get("overlay_text") or ""),
+                        "character": str(item.get("character") or ""),
+                        "use_count": int(item.get("use_count") or 0),
+                        "is_favorite": bool(item.get("is_favorite")),
+                        "width": int(item.get("width") or 0),
+                        "height": int(item.get("height") or 0),
+                        "bytes": int(item.get("bytes") or 0),
+                        "scope_mode": str(item.get("scope_mode") or "public"),
+                        "distance": dist if dist < 999 else 0,
+                        "recommended": idx == keeper_idx,
+                    }
+                )
+            clusters.append(
+                {
+                    "cluster_id": str(keeper.get("hash") or "")[:16],
+                    "size": len(items_out),
+                    "recommended_keep": str(keeper.get("hash") or ""),
+                    "max_distance": max_dist,
+                    "items": items_out,
+                }
+            )
+
+        clusters.sort(key=lambda c: (-c["size"], c["max_distance"], c["cluster_id"]))
+        return clusters

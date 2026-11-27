@@ -15,6 +15,7 @@ from astrbot.api.event import AstrMessageEvent
 from ..events.emoji_delivery import send_qq_image_as_sticker
 from ..events.event_context import get_event_platform_name, unwrap_event
 from ..util.normalization import canonicalize_path
+from ..util.platform_capabilities import get_platform_capabilities
 from .embedding_service import EmbeddingService
 from .search_features import entry_category, parse_tags, prepare_entry_text_features
 from .text_similarity import (
@@ -709,13 +710,16 @@ class MemeSmartSelectService:
                 return False
 
         guard = {"before_dispatch": dispatch_allowed} if before_dispatch is not None else {}
-        sent = await self._try_send_telegram_sticker(event, emoji_path, **guard)
-        if sent is not False:
-            return "telegram_sticker" if sent else None
+        caps = get_platform_capabilities(event)
+        if caps.supports_telegram_sticker:
+            sent = await self._try_send_telegram_sticker(event, emoji_path, **guard)
+            if sent is not False:
+                return "telegram_sticker" if sent else None
 
-        sent = await send_qq_image_as_sticker(event, emoji_path, plugin=self.plugin, **guard)
-        if sent is not False:
-            return "qq_sticker" if sent else None
+        if caps.supports_qq_sticker:
+            sent = await send_qq_image_as_sticker(event, emoji_path, plugin=self.plugin, **guard)
+            if sent is not False:
+                return "qq_sticker" if sent else None
 
         sent = await self._send_emoji_file_directly(event, emoji_path, **guard)
         if sent is not False:

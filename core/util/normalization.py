@@ -18,6 +18,7 @@ _PLUGIN_RESERVED_CATEGORY_KEYS = frozenset({"other", "unknown"})
 
 _PUBLIC_SCOPE_ALIASES = frozenset({"public", "global", "all"})
 _LOCAL_SCOPE_ALIASES = frozenset({"local", "private", "scoped"})
+_REFERENCE_SCOPE_ALIASES = frozenset({"reference", "ref", "character_ref"})
 
 
 def canonicalize_path(path: object) -> str:
@@ -35,7 +36,7 @@ def normalize_scope_mode(
     *,
     default: str | None = "public",
 ) -> str | None:
-    """把作用域名称及其别名统一为 ``public`` / ``local``。
+    """把作用域名称及其别名统一为 ``public`` / ``local`` / ``reference``。
 
     无法识别的输入返回 default；默认返回 ``public``，传入 ``None`` 时返回 ``None``。
     """
@@ -44,6 +45,8 @@ def normalize_scope_mode(
         return "public"
     if raw in _LOCAL_SCOPE_ALIASES:
         return "local"
+    if raw in _REFERENCE_SCOPE_ALIASES:
+        return "reference"
     return default
 
 

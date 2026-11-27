@@ -291,3 +291,71 @@ class PendingRoutes:
         except Exception as e:
             logger.error(f"待审核更新失败: {e}", exc_info=True)
             return jsonify({"success": False, "error": str(e)})
+
+    async def handle_pending_batch_update(self):
+        """POST /pending/batch-update —— 批量预打标待审核池（分类/角色/作用域）。"""
+        try:
+            data = await request.get_json() or {}
+            ids = await self._resolve_pending_ids(data)
+            if not ids:
+                return jsonify({"success": False, "error": "缺少 ids"})
+
+            db = self._db
+            if not db or not hasattr(db, "update_pending"):
+                return jsonify({"success": False, "error": "db 不可用"})
+
+            fields: dict[str, Any] = {}
+            if "category" in data and str(data.get("category") or "").strip():
+                category = str(data.get("category") or "").strip()
+                known = set(self._cfg.categories or [])
+                if known and category not in known:
+                    return jsonify({"success": False, "error": f"分类无效: {category!r}"})
+                fields["category"] = category
+
+            if "character" in data:
+                char_raw = data.get("character")
+                if char_raw is not None:
+                    char_key = self._normalize_character_key(str(char_raw))
+                    known_chars = set(
+                        self._cfg.get_characters()
+                        if hasattr(self._cfg, "get_characters")
+                        else []
+                    )
+                    if char_key and known_chars and char_key not in known_chars:
+                        return jsonify({"success": False, "error": f"角色无效: {char_key!r}"})
+                    fields["character"] = char_key
+
+            if "scope_mode" in data and str(data.get("scope_mode") or "").strip():
+                scope = self._norm_scope(data.get("scope_mode"))
+                if scope not in ("public", "local"):
+                    return jsonify({"success": False, "error": "作用域无效"})
+                fields["scope_mode"] = scope
+
+            if not fields:
+                return jsonify({"success": False, "error": "未指定需要批量更新的字段"})
+
+            updated = 0
+            failed = 0
+            errors: list[str] = []
+            for pid in ids:
+                try:
+                    row = await db.update_pending(pid, dict(fields))
+                    if row is not None:
+                        updated += 1
+                    else:
+                        failed += 1
+                except Exception as exc:
+                    failed += 1
+                    errors.append(f"id={pid}: {exc}")
+
+            return jsonify(
+                {
+                    "success": updated > 0,
+                    "updated": updated,
+                    "failed": failed,
+                    "errors": errors,
+                }
+            )
+        except Exception as e:
+            logger.error(f"批量预打标待审核失败: {e}", exc_info=True)
+            return jsonify({"success": False, "error": str(e)})

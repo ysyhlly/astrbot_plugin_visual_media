@@ -352,6 +352,13 @@ export const TEMPLATE = `
                             </svg>
                             {{ t('pages.dashboard.actions.sources', 'Sources') }}
                         </button>
+                        <button @click="openDedupModal" class="codex-btn">
+                            <svg style="width:16px;height:16px" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2M8 7H6a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2v-2" />
+                            </svg>
+                            {{ t('pages.dashboard.actions.dedup', '相似图去重') }}
+                        </button>
                         <button @click="runStorageCleanup" class="codex-btn">
                             <svg style="width:16px;height:16px" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -533,6 +540,10 @@ export const TEMPLATE = `
                     <div v-if="pendingBatchMode" class="toolbar-group pending-batch-actions">
                         <button @click="toggleSelectAllPending" class="codex-btn select-all-btn">
                             {{ allPendingSelected ? t('pages.dashboard.actions.deselect_all', 'Deselect All') : t('pages.dashboard.actions.select_all', 'Select All') }}
+                        </button>
+                        <button @click="openPendingBatchTagModal" class="codex-btn">
+                            <svg style="width:14px;height:14px" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5a2 2 0 011.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A2 2 0 013 12V7a4 4 0 014-4z"/></svg>
+                            {{ t('pages.dashboard.actions.batch_pretag', '批量预打标') }}
                         </button>
                         <button @click="approvePendingBatch" class="codex-btn approve-batch-btn">
                             <svg style="width:14px;height:14px" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
@@ -1883,6 +1894,99 @@ export const TEMPLATE = `
             <button @click="savePendingEdit(true)" class="codex-btn primary" style="flex:1">
                 {{ t('pages.dashboard.actions.save_and_approve', 'Save & Approve') }}
             </button>
+        </div>
+    </div>
+</div>
+
+<div v-if="dedupOpen" class="modal-overlay" @click.self="closeDedupModal">
+    <div class="modal-panel" role="dialog" aria-modal="true" style="max-width:860px;width:92vw">
+        <div class="modal-header">
+            <h2>{{ t('pages.dashboard.modal.dedup', '相似图合并 / 去重') }}</h2>
+            <button @click="closeDedupModal" class="modal-close" :aria-label="t('pages.dashboard.actions.close', 'Close')">
+                <svg style="width:20px;height:20px" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+            </button>
+        </div>
+        <div class="modal-content">
+            <div class="modal-pad" style="width:100%">
+                <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:16px">
+                    <label style="display:flex;align-items:center;gap:6px;font-size:0.9rem">
+                        <span>汉明距离阈值</span>
+                        <input v-model.number="dedupThreshold" type="number" min="0" max="64" class="codex-input" style="width:84px">
+                    </label>
+                    <button @click="scanDedupClusters(true)" class="codex-btn primary" :disabled="dedupLoading">
+                        {{ dedupLoading ? '扫描中…' : '重新扫描相似图' }}
+                    </button>
+                    <button v-if="dedupData.clusters && dedupData.clusters.length" @click="mergeAllDedupClusters" class="codex-btn" :disabled="dedupMerging">
+                        {{ dedupMerging ? '合并中…' : '一键全部按推荐去重' }}
+                    </button>
+                    <span style="font-size:0.85rem;color:var(--text-muted)">
+                        已扫 {{ dedupData.total_scanned || 0 }} 张 · 发现 {{ dedupData.cluster_count || 0 }} 组相似（可清理 {{ dedupData.duplicate_count || 0 }} 张重复图）
+                    </span>
+                </div>
+                <div v-if="dedupLoading" style="padding:24px;text-align:center;color:var(--text-muted)">正在计算并聚类相似图片…</div>
+                <div v-else-if="!dedupData.clusters || !dedupData.clusters.length" style="padding:24px;text-align:center;color:var(--text-muted)">未发现相似重复表情，图库很干净！</div>
+                <div v-else style="display:flex;flex-direction:column;gap:14px;max-height:58vh;overflow:auto">
+                    <div v-for="cluster in dedupData.clusters" :key="cluster.cluster_id" style="border:1px solid var(--border-color,rgba(128,128,128,0.25));border-radius:8px;padding:12px">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:8px;flex-wrap:wrap">
+                            <span style="font-weight:600">相似组 #{{ cluster.cluster_id.slice(0, 8) }} · {{ cluster.size }} 张（最大距离 {{ cluster.max_distance }}）</span>
+                            <button @click="mergeDedupCluster(cluster)" class="codex-btn primary" :disabled="dedupMerging">合并保留选中主图</button>
+                        </div>
+                        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px">
+                            <label v-for="item in cluster.items" :key="item.hash" style="display:flex;flex-direction:column;gap:6px;padding:8px;border-radius:6px;cursor:pointer;border:1px solid" :style="{ borderColor: dedupSelectedKeep[cluster.cluster_id] === item.hash ? 'var(--accent,#3b82f6)' : 'rgba(128,128,128,0.2)' }">
+                                <div style="display:flex;align-items:center;gap:6px;font-size:0.8rem">
+                                    <input type="radio" :name="'dedup-' + cluster.cluster_id" :value="item.hash" v-model="dedupSelectedKeep[cluster.cluster_id]">
+                                    <span>{{ item.recommended ? '推荐保留' : '保留此图' }}</span>
+                                </div>
+                                <img v-if="imageDataUrls[item.hash]" :src="imageDataUrls[item.hash]" style="width:100%;height:92px;object-fit:contain;border-radius:4px;background:rgba(0,0,0,0.2)">
+                                <div v-else style="width:100%;height:92px;border-radius:4px;background:rgba(0,0,0,0.2);display:flex;align-items:center;justify-content:center;font-size:0.75rem;color:var(--text-muted)">加载中…</div>
+                                <div style="font-size:0.75rem;color:var(--text-muted)">{{ getCategoryName(item.category) }} · 用过 {{ item.use_count }} 次{{ item.is_favorite ? ' ★' : '' }}</div>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div v-if="pendingBatchTagOpen" class="modal-overlay" @click.self="closePendingBatchTagModal">
+    <div class="modal-panel modal-narrow" role="dialog" aria-modal="true">
+        <div class="modal-header">
+            <h2>批量预打标（已选 {{ pendingSelectedImages.size }} 项）</h2>
+            <button @click="closePendingBatchTagModal" class="modal-close" :aria-label="t('pages.dashboard.actions.close', 'Close')">
+                <svg style="width:20px;height:20px" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+            </button>
+        </div>
+        <div class="modal-pad">
+            <div style="margin-bottom:14px">
+                <label class="form-label sm">情绪分类（留空不修改）</label>
+                <select v-model="pendingBatchTagForm.category" class="codex-input">
+                    <option value="">— 不修改分类 —</option>
+                    <option v-for="cat in categories" :key="cat.key" :value="cat.key">{{ cat.name }}</option>
+                </select>
+            </div>
+            <div style="margin-bottom:14px">
+                <label class="form-label sm">绑定角色（留空不修改）</label>
+                <select v-model="pendingBatchTagForm.character" class="codex-input">
+                    <option value="__unchanged__">— 不修改角色 —</option>
+                    <option value="">清空角色（通用表情库）</option>
+                    <option v-for="item in characters" :key="item.key" :value="item.key">{{ item.name }}</option>
+                </select>
+            </div>
+            <div style="margin-bottom:18px">
+                <label class="form-label sm">作用域（留空不修改）</label>
+                <select v-model="pendingBatchTagForm.scope_mode" class="codex-input">
+                    <option value="">— 不修改作用域 —</option>
+                    <option value="public">公开 (Public)</option>
+                    <option value="local">仅来源群 (Local)</option>
+                </select>
+            </div>
+            <div style="display:flex;gap:12px">
+                <button @click="closePendingBatchTagModal" class="codex-btn" style="flex:1">取消</button>
+                <button @click="submitPendingBatchTag" class="codex-btn primary" style="flex:1" :disabled="pendingBatchTagSaving">
+                    {{ pendingBatchTagSaving ? '提交中…' : '应用到已选项' }}
+                </button>
+            </div>
         </div>
     </div>
 </div>

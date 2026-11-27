@@ -7,6 +7,10 @@ from typing import TYPE_CHECKING
 
 from astrbot.api import logger
 
+try:
+    from ..core.util.platform_capabilities import get_platform_capabilities
+except ImportError:
+    from core.util.platform_capabilities import get_platform_capabilities
 from .tl_utils import AvatarManager, download_qq_avatar
 
 if TYPE_CHECKING:
@@ -49,7 +53,20 @@ class AvatarHandler:
     async def download_user_avatar(
         self, user_id: str, event: AstrMessageEvent
     ) -> str | None:
-        """下载指定用户的头像。失败时返回空，不改变自动头像的旧入口。"""
+        """下载指定用户的头像。非支持平台优雅降级返回 None。"""
+        caps = get_platform_capabilities(event)
+        if not caps.supports_avatar_lookup:
+            logger.debug(
+                "[AvatarHandler] %s",
+                caps.degradation_hint("avatar_lookup") or f"skip avatar lookup on {caps.platform_family}",
+            )
+            return None
+        if caps.platform_family != "onebot" and not str(user_id).isdigit():
+            logger.debug(
+                "[AvatarHandler] non-OneBot platform (%s) does not support QQ avatar HTTP lookup",
+                caps.platform_family,
+            )
+            return None
 
         try:
             result = await download_qq_avatar(

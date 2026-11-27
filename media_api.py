@@ -20,6 +20,10 @@ class MediaAPI:
             ("/save", self.save, ["POST"]),
             ("/profiles", self.profiles, ["GET", "POST", "DELETE"]),
             ("/generate", self.generate, ["POST"]),
+            ("/character-pack", self.character_pack, ["POST"]),
+            ("/character-pack/commit", self.character_pack_commit, ["POST"]),
+            ("/quick-steal", self.quick_steal, ["POST"]),
+            ("/platform-matrix", self.platform_matrix, ["GET"]),
             ("/behavior", self.behavior, ["GET"]),
             ("/behavior/reset", self.reset_preference, ["POST"]),
             ("/references", self.references, ["GET"]),
@@ -83,6 +87,7 @@ class MediaAPI:
                 "status": "ok",
                 "data": {
                     "memes": self.owner.memes.db_service.count_total(),
+                    "steal_enabled": bool(getattr(self.owner.memes, "steal_meme", False)),
                     "generation": gen.get_service().get_status(),
                     "history": history,
                     "profiles": self.owner.library.profiles(),
@@ -107,7 +112,7 @@ class MediaAPI:
             items = []
             for path, meta in list(self.owner.memes.plugin_api._get_index().items()):
                 image_hash = str(meta.get("hash", ""))
-                if meta.get("scope_mode") != "public" or image_hash in seen:
+                if meta.get("scope_mode") not in {"public", "reference"} or image_hash in seen:
                     continue
                 from pathlib import Path
 
@@ -305,6 +310,11 @@ class MediaAPI:
         settings = store.settings.public()
         settings["exact_repeat_minutes"] = settings["repeat_window_seconds"] / 60
         settings["dropped_audit_records"] = store.dropped_records
+        joint_prefetch = (
+            store.joint_prefetch_summary()
+            if callable(getattr(store, "joint_prefetch_summary", None))
+            else {}
+        )
         return json_response(
             {
                 "status": "ok",
@@ -313,6 +323,7 @@ class MediaAPI:
                     "preferences": preferences,
                     "scopes": scopes,
                     "policy": settings,
+                    "joint_prefetch": joint_prefetch,
                 },
             }
         )
@@ -393,3 +404,99 @@ class MediaAPI:
             return json_response(
                 {"status": "error", "message": str(exc)}, status_code=400
             )
+
+    def _character_pack_service(self):
+        svc = getattr(self.owner, "character_pack", None)
+        if svc is None:
+            from .core.processing.character_pack_service import CharacterPackService
+
+            svc = CharacterPackService(self.owner)
+            self.owner.character_pack = svc
+        return svc
+
+    async def character_pack(self):
+        if (denied := await self.guard(check_csrf=True)) is not None:
+            return denied
+        try:
+            data = await request.json()
+            if not isinstance(data, dict):
+                raise ValueError("请求必须是对象")
+            svc = self._character_pack_service()
+            result = await svc.generate_pack(
+                character=str(data.get("character") or "").strip(),
+                emotions=data.get("emotions"),
+                style=str(data.get("style") or "").strip(),
+                preview_only=bool(data.get("preview_only", False)),
+                scope_mode=str(data.get("scope_mode") or "public").strip(),
+                origin_target=str(data.get("origin_target") or "").strip(),
+                umo=str(data.get("umo") or "").strip(),
+            )
+            return json_response({"status": "ok", "data": result})
+        except (ValueError, RuntimeError) as exc:
+            return json_response(
+                {"status": "error", "message": str(exc)}, status_code=400
+            )
+        except Exception as exc:
+            return json_response(
+                {"status": "error", "message": f"角色表情套图生成失败: {exc}"},
+                status_code=500,
+            )
+
+    async def character_pack_commit(self):
+        if (denied := await self.guard(check_csrf=True)) is not None:
+            return denied
+        try:
+            data = await request.json()
+            if not isinstance(data, dict):
+                raise ValueError("请求必须是对象")
+            svc = self._character_pack_service()
+            result = await svc.commit_pack(
+                pack_id=str(data.get("pack_id") or "").strip(),
+                indices=data.get("indices"),
+                scope_mode=data.get("scope_mode"),
+                origin_target=data.get("origin_target"),
+            )
+            return json_response({"status": "ok", "data": result})
+        except ValueError as exc:
+            return json_response(
+                {"status": "error", "message": str(exc)}, status_code=400
+            )
+
+    async def quick_steal(self):
+        if (denied := await self.guard(check_csrf=True)) is not None:
+            return denied
+        try:
+            data = await request.json()
+            enabled = True if not isinstance(data, dict) else bool(data.get("enabled", True))
+            memes = self.owner.memes
+            memes.steal_meme = enabled
+            cfg = getattr(memes, "plugin_config", None)
+            if cfg is not None:
+                cfg.steal_meme = enabled
+                if hasattr(cfg, "config") and isinstance(cfg.config, dict):
+                    cfg.config["steal_meme"] = enabled
+                    save = getattr(cfg.config, "save_config", None)
+                    if callable(save):
+                        save()
+            raw_cfg = getattr(self.owner, "raw_config", None)
+            if isinstance(raw_cfg, dict):
+                raw_cfg.setdefault("memes", {})["steal_meme"] = enabled
+                save_raw = getattr(raw_cfg, "save_config", None)
+                if callable(save_raw):
+                    save_raw()
+            return json_response(
+                {"status": "ok", "data": {"steal_enabled": enabled}}
+            )
+        except Exception as exc:
+            return json_response(
+                {"status": "error", "message": str(exc)}, status_code=400
+            )
+
+    async def platform_matrix(self):
+        if (denied := await self.guard(check_csrf=False)) is not None:
+            return denied
+        from .core.util.platform_capabilities import list_platform_capability_matrix
+
+        return json_response(
+            {"status": "ok", "data": {"platforms": list_platform_capability_matrix()}}
+        )

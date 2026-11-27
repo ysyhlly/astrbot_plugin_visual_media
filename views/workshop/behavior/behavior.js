@@ -3,8 +3,8 @@ const $=id=>document.getElementById(id);
 const api=(window.DynamicsPanelBridge || window.AstrBotPluginPage);
 let data={records:[],preferences:[],scopes:[]};
 let currentScope=getSharedScope();
-const names={image:'其他图片',text:'文字',meme:'表情',generate:'生图',preference:'偏好',character_check:'角色核对',selected:'已选择',filtered:'候选过滤',blocked:'已拦截',delivered:'已交付',submitted:'已提交',generated:'已生成',failed:'失败',saved:'已保存',pass:'核对通过',mismatch:'存在差异',unknown:'未能确认',skipped:'已关闭'};
-const reasons={plain_reply:'普通文字回复',model_selected_text:'模型选择文字',model_selected_candidate:'模型选择候选表情',native_generation_tool:'调用生图工具',confirmed_send:'表情发送已确认',confirmed_image_send:'图片发送已确认',candidate_filter:'根据成员偏好及近期发送记录筛选',member_blocked_image:'成员不想再看这张图片',member_prefers_text:'成员偏好文字',member_prefers_fewer_memes:'成员希望减少表情',recent_exact_repeat:'近期已经发送相同图片',concurrent_repeat:'同一图片正在发送',explicit_user_preference:'记住明确表达的偏好',command_member_preference:'通过 /meme pref 修改表达偏好',character_task_queued:'角色生图任务已提交',character_generation:'角色图片生成结果',reference_comparison:'与标准参考图比对',image_tool_receipt:'通用图片工具发送回执',platform_send_failed:'平台发送失败'};
+const names={image:'其他图片',text:'文字',meme:'表情',generate:'生图',preference:'偏好',character_check:'角色核对',joint_prefetch:'联合预取',selected:'已选择',filtered:'候选过滤',blocked:'已拦截',delivered:'已交付',submitted:'已提交',generated:'已生成',failed:'失败',saved:'已保存',pass:'核对通过',mismatch:'存在差异',unknown:'未能确认',skipped:'已关闭',timeout:'预取超时',degraded:'降级回退'};
+const reasons={plain_reply:'普通文字回复',model_selected_text:'模型选择文字',model_selected_candidate:'模型选择候选表情',native_generation_tool:'调用生图工具',confirmed_send:'表情发送已确认',confirmed_image_send:'图片发送已确认',candidate_filter:'根据成员偏好及近期发送记录筛选',member_blocked_image:'成员不想再看这张图片',member_prefers_text:'成员偏好文字',member_prefers_fewer_memes:'成员希望减少表情',recent_exact_repeat:'近期已经发送相同图片',concurrent_repeat:'同一图片正在发送',explicit_user_preference:'记住明确表达的偏好',command_member_preference:'通过 /meme pref 修改表达偏好',character_task_queued:'角色生图任务已提交',character_generation:'角色图片生成结果',character_check_auto_redraw:'角色核对发现偏差，已自动修正重画 1 次',reference_comparison:'与标准参考图比对',image_tool_receipt:'通用图片工具发送回执',platform_send_failed:'平台发送失败',joint_prefetch_timeout:'联合回复预取超时（已跳过附带表情）',joint_prefetch_local_fallback:'向量检索超时，已降级使用本地召回',joint_prefetch_error:'联合回复预取异常降级'};
 const frequencyLabels={auto:'自然选择',less:'少用表情',off:'不主动发',more:'合适时多用'};
 function node(tag,text,cls){const n=document.createElement(tag);setText(n,text||'');if(cls)n.className=cls;return n;}
 function unwrap(r){if(r?.status==='error'||r?.success===false)throw new Error(r.message||tr('请求失败'));return r?.status==='ok'?r.data:r;}
@@ -63,6 +63,17 @@ function render(){
   p.character_check_enabled===false?msg('关闭'):msg('开启（最多 {0} 张 / {1} 秒）',p.character_check_max_images??2,p.character_check_timeout??60),
   p.decision_records_enabled===false?msg('停止新增'):msg('{0} 天 / {1} 条',p.record_retention_days??30,p.max_records??5000),
   p.dropped_audit_records??0));
+ const jp=data.joint_prefetch||{};
+ let jpNode=$('joint-prefetch-metrics');
+ if(!jpNode&&$('policy')?.parentElement){
+  jpNode=node('p','','meta');
+  jpNode.id='joint-prefetch-metrics';
+  $('policy').after(jpNode);
+ }
+ if(jpNode){
+  setText(jpNode,msg('联合回复预取健康：总计 {0} 次 · 超时 {1} 次（{2}%）· 降级回退 {3} 次（{4}%，含本地回退 {5} / 异常 {6}）· 平均耗时 {7} ms',
+   jp.total??0,jp.timeout??0,jp.timeout_rate??0,jp.degraded??0,jp.degraded_rate??0,jp.local_fallback??0,jp.error??0,jp.avg_elapsed_ms??0));
+ }
 
  const activeFilter=$('scope').value||currentScope;
  const rows=(data.records||[]).filter(r=>(!$('kind').value||r.mode===$('kind').value)&&matchesActiveScope(r,activeFilter,maps));

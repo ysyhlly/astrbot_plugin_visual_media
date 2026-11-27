@@ -83,6 +83,19 @@ class MediaBehavior:
         self._context = context
         self._bot_names_source = bot_names_source
         self._last_cleanup = 0.0
+        self._prefetch_lock = RLock()
+        self._prefetch_stats = {
+            "total": 0,
+            "ok": 0,
+            "timeout": 0,
+            "local_fallback": 0,
+            "error": 0,
+            "filtered": 0,
+            "disabled": 0,
+            "total_elapsed_ms": 0.0,
+            "last_degraded_at": 0.0,
+            "last_degraded_reason": "",
+        }
         with self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=NORMAL")
@@ -970,3 +983,76 @@ class MediaBehavior:
             db.execute(
                 "DELETE FROM preferences WHERE scope=? AND member=?", (scope, member)
             )
+
+    def record_joint_prefetch(
+        self,
+        event,
+        *,
+        outcome: str,
+        elapsed_ms: float = 0.0,
+        join_wait_ms: float = 0.0,
+        cache_reason: str = "bypass",
+        candidates: int = 0,
+    ) -> None:
+        """Track joint_reply prefetch timeout and degradation stats for the behavior dashboard."""
+        clean_outcome = str(outcome or "unknown").strip().lower()
+        with self._prefetch_lock:
+            stats = self._prefetch_stats
+            stats["total"] += 1
+            stats["total_elapsed_ms"] += max(0.0, float(elapsed_ms or 0.0))
+            if clean_outcome == "timeout":
+                stats["timeout"] += 1
+                stats["last_degraded_at"] = time.time()
+                stats["last_degraded_reason"] = "timeout"
+            elif clean_outcome == "local_fallback":
+                stats["local_fallback"] += 1
+                stats["last_degraded_at"] = time.time()
+                stats["last_degraded_reason"] = "local_fallback"
+            elif clean_outcome == "error":
+                stats["error"] += 1
+                stats["last_degraded_at"] = time.time()
+                stats["last_degraded_reason"] = "error"
+            elif clean_outcome == "filtered":
+                stats["filtered"] += 1
+            elif clean_outcome == "disabled":
+                stats["disabled"] += 1
+            else:
+                stats["ok"] += 1
+
+        if clean_outcome in {"timeout", "local_fallback", "error"} and event is not None:
+            phase = "timeout" if clean_outcome == "timeout" else "degraded"
+            self.record(
+                event,
+                "joint_prefetch",
+                phase,
+                f"joint_prefetch_{clean_outcome}",
+                {
+                    "outcome": clean_outcome,
+                    "elapsed_ms": round(float(elapsed_ms or 0.0), 1),
+                    "join_wait_ms": round(float(join_wait_ms or 0.0), 1),
+                    "cache_reason": str(cache_reason or "bypass"),
+                    "candidates": int(candidates or 0),
+                },
+            )
+
+    def joint_prefetch_summary(self) -> dict:
+        """Return aggregated joint_reply prefetch timeout & degradation statistics."""
+        with self._prefetch_lock:
+            s = dict(self._prefetch_stats)
+        total = int(s["total"])
+        degraded = int(s["timeout"]) + int(s["local_fallback"]) + int(s["error"])
+        return {
+            "total": total,
+            "ok": int(s["ok"]),
+            "timeout": int(s["timeout"]),
+            "local_fallback": int(s["local_fallback"]),
+            "error": int(s["error"]),
+            "filtered": int(s["filtered"]),
+            "disabled": int(s["disabled"]),
+            "degraded": degraded,
+            "timeout_rate": round((s["timeout"] / total) * 100.0, 1) if total > 0 else 0.0,
+            "degraded_rate": round((degraded / total) * 100.0, 1) if total > 0 else 0.0,
+            "avg_elapsed_ms": round(s["total_elapsed_ms"] / total, 1) if total > 0 else 0.0,
+            "last_degraded_at": s["last_degraded_at"],
+            "last_degraded_reason": s["last_degraded_reason"],
+        }

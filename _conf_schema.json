@@ -3923,7 +3923,13 @@
         "type": "bool",
         "description": "角色生图后核对外观",
         "default": true,
-        "hint": "每次角色生图最多增加一次视觉模型调用；失败不会自动重画。"
+        "hint": "每次角色生图最多增加一次视觉模型调用；核对发现明显偏差时可按下方开关自动修正重画 1 次。"
+      },
+      "character_check_auto_redraw": {
+        "type": "bool",
+        "description": "角色外观偏差自动重画 1 次",
+        "default": true,
+        "hint": "开启后当角色核对返回 mismatch 时，自动带入偏差修正提示重画最多 1 次；关闭或重画后仍不符时仅发送提醒与手动重画命令。"
       },
       "character_check_provider": {
         "type": "string",
@@ -3943,6 +3949,28 @@
         "description": "每次最多核对图片数",
         "default": 2,
         "hint": "1–4；超过此数量不会宣称所有图片均通过。"
+      },
+      "make_meme_daily_limit": {
+        "type": "int",
+        "description": "/做表情 每人每日额度",
+        "default": 10,
+        "slider": {
+          "min": 1,
+          "max": 200,
+          "step": 1
+        },
+        "hint": "熟人小群宽松模式默认每人每天 10 次（1–200 可调）；生成失败自动退还额度。"
+      },
+      "crowd_curation_threshold": {
+        "type": "int",
+        "description": "群聊众包审图成票阈值",
+        "default": 2,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        },
+        "hint": "/meme 审图 达到指定票数后自动入本群表情库或从待审核池移除（默认 2 票）。"
       }
     }
   }

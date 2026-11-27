@@ -1459,7 +1459,19 @@ createApp({
             confirmOpen.value || promptOpen.value || uploadOpen.value || batchUploadOpen.value
             || emotionsOpen.value || batchMoveOpen.value || batchScopeOpen.value || pendingEditOpen.value
             || batchCharacterOpen.value || charactersOpen.value
+            || dedupOpen.value || pendingBatchTagOpen.value
         );
+
+        const advancePendingFocus = (actedId) => {
+            const list = pendingImages.value || [];
+            const idx = list.findIndex((i) => i.id === actedId);
+            if (idx < 0 || list.length <= 1) {
+                focusedPendingId.value = null;
+                return;
+            }
+            const nextItem = list[idx + 1] || list[idx - 1];
+            focusedPendingId.value = nextItem ? nextItem.id : null;
+        };
 
         const handleKeydown = (e) => {
             if (isTypingTarget(e)) return;
@@ -1468,6 +1480,8 @@ createApp({
                 // 只关最上层弹窗，按堆叠顺序判断，避免一次 Esc 关掉好几层
                 if (confirmOpen.value) { onConfirmNo(); return; }
                 if (promptOpen.value) { onPromptCancel(); return; }
+                if (pendingBatchTagOpen.value) { closePendingBatchTagModal(); return; }
+                if (dedupOpen.value) { closeDedupModal(); return; }
                 if (pendingEditOpen.value) { closePendingEdit(); return; }
                 if (uploadOpen.value) { closeUploadModal(); return; }
                 if (batchUploadOpen.value) { closeBatchUploadModal(); return; }
@@ -1493,9 +1507,13 @@ createApp({
             if (activeSection.value !== 'pending' || !pendingImages.value.length) return;
             switch (e.key) {
                 case 'ArrowRight':
-                case 'ArrowDown': e.preventDefault(); movePendingFocus(1); break;
+                case 'ArrowDown':
+                case 'j':
+                case 'J': e.preventDefault(); movePendingFocus(1); break;
                 case 'ArrowLeft':
-                case 'ArrowUp': e.preventDefault(); movePendingFocus(-1); break;
+                case 'ArrowUp':
+                case 'k':
+                case 'K': e.preventDefault(); movePendingFocus(-1); break;
                 case 'Escape': focusedPendingId.value = null; break;
                 case 'Enter': {
                     const item = pendingImages.value.find((i) => i.id === focusedPendingId.value);
@@ -1504,15 +1522,27 @@ createApp({
                 }
                 case 'a':
                 case 'A':
-                    if (focusedPendingId.value != null) { approvePending(focusedPendingId.value); focusedPendingId.value = null; }
+                    if (focusedPendingId.value != null) {
+                        const targetId = focusedPendingId.value;
+                        advancePendingFocus(targetId);
+                        approvePending(targetId);
+                    }
                     break;
                 case 'r':
                 case 'R':
-                    if (focusedPendingId.value != null) { rejectPending(focusedPendingId.value, e.shiftKey); focusedPendingId.value = null; }
+                    if (focusedPendingId.value != null) {
+                        const targetId = focusedPendingId.value;
+                        advancePendingFocus(targetId);
+                        rejectPending(targetId, e.shiftKey);
+                    }
                     break;
                 case 'b':
                 case 'B':
-                    if (focusedPendingId.value != null) { rejectPending(focusedPendingId.value, true); focusedPendingId.value = null; }
+                    if (focusedPendingId.value != null) {
+                        const targetId = focusedPendingId.value;
+                        advancePendingFocus(targetId);
+                        rejectPending(targetId, true);
+                    }
                     break;
                 case 'e':
                 case 'E': {
@@ -2571,7 +2601,147 @@ createApp({
             checkHealth();
             loadDashboardPrefs();
             loadAll();
+            const openParam = new URLSearchParams(window.location.search).get('open');
+            if (openParam === 'sources') {
+                setTimeout(() => { openSourceModal(); }, 250);
+            } else if (openParam === 'dedup') {
+                setTimeout(() => { openDedupModal(); }, 250);
+            }
         });
+
+        // ── 相似图 pHash 聚类去重 ───────────────────────────────
+        const dedupOpen = ref(false);
+        const dedupLoading = ref(false);
+        const dedupMerging = ref(false);
+        const dedupThreshold = ref(20);
+        const dedupData = reactive({ total_scanned: 0, cluster_count: 0, duplicate_count: 0, clusters: [] });
+        const dedupSelectedKeep = reactive({});
+
+        const scanDedupClusters = async (computeMissing = false) => {
+            dedupLoading.value = true;
+            try {
+                const res = await apiFetch(`api/dedup/clusters?threshold=${encodeURIComponent(dedupThreshold.value)}&compute_missing=${computeMissing ? 1 : 0}`);
+                const data = await res.json();
+                if (!data?.success) throw new Error(data?.error || '扫描失败');
+                dedupData.total_scanned = data.total_scanned || 0;
+                dedupData.cluster_count = data.cluster_count || 0;
+                dedupData.duplicate_count = data.duplicate_count || 0;
+                dedupData.clusters = Array.isArray(data.clusters) ? data.clusters : [];
+                for (const cluster of dedupData.clusters) {
+                    dedupSelectedKeep[cluster.cluster_id] = cluster.recommended_keep || cluster.items?.[0]?.hash || '';
+                    for (const item of cluster.items || []) {
+                        if (item.hash && !imageDataUrls[item.hash]) {
+                            loadImageData(item.hash);
+                        }
+                    }
+                }
+            } catch (e) {
+                showAlert(e.message || '相似图扫描失败', 'error');
+            } finally {
+                dedupLoading.value = false;
+            }
+        };
+
+        const openDedupModal = () => {
+            dedupOpen.value = true;
+            void scanDedupClusters(true);
+        };
+        const closeDedupModal = () => { dedupOpen.value = false; };
+
+        const mergeDedupCluster = async (cluster) => {
+            if (!cluster || dedupMerging.value) return;
+            const keepHash = dedupSelectedKeep[cluster.cluster_id] || cluster.recommended_keep;
+            const deleteHashes = (cluster.items || []).map((i) => i.hash).filter((h) => h && h !== keepHash);
+            if (!keepHash || !deleteHashes.length) return;
+            dedupMerging.value = true;
+            try {
+                const res = await apiFetch('api/dedup/merge', {
+                    method: 'POST',
+                    body: JSON.stringify({ keep_hash: keepHash, delete_hashes: deleteHashes, merge_metadata: true }),
+                });
+                const data = await res.json();
+                if (!data?.success) throw new Error(data?.error || '合并失败');
+                showAlert(`已合并去重：删除 ${data.deleted || 0} 张重复图`, 'success');
+                await scanDedupClusters(false);
+                await refreshView();
+            } catch (e) {
+                showAlert(e.message || '合并失败', 'error');
+            } finally {
+                dedupMerging.value = false;
+            }
+        };
+
+        const mergeAllDedupClusters = async () => {
+            if (!dedupData.clusters.length || dedupMerging.value) return;
+            dedupMerging.value = true;
+            let totalDeleted = 0;
+            try {
+                for (const cluster of [...dedupData.clusters]) {
+                    const keepHash = dedupSelectedKeep[cluster.cluster_id] || cluster.recommended_keep;
+                    const deleteHashes = (cluster.items || []).map((i) => i.hash).filter((h) => h && h !== keepHash);
+                    if (!keepHash || !deleteHashes.length) continue;
+                    const res = await apiFetch('api/dedup/merge', {
+                        method: 'POST',
+                        body: JSON.stringify({ keep_hash: keepHash, delete_hashes: deleteHashes, merge_metadata: true }),
+                    });
+                    const data = await res.json();
+                    if (data?.success) totalDeleted += Number(data.deleted || 0);
+                }
+                showAlert(`批量去重完成：共清理 ${totalDeleted} 张重复图`, 'success');
+                await scanDedupClusters(false);
+                await refreshView();
+            } catch (e) {
+                showAlert(e.message || '批量去重失败', 'error');
+            } finally {
+                dedupMerging.value = false;
+            }
+        };
+
+        // ── 待审核池批量预打标 ──────────────────────────────────
+        const pendingBatchTagOpen = ref(false);
+        const pendingBatchTagSaving = ref(false);
+        const pendingBatchTagForm = reactive({ category: '', character: '__unchanged__', scope_mode: '' });
+
+        const openPendingBatchTagModal = () => {
+            if (!pendingSelectedImages.value.size) {
+                showAlert('请先选择需要预打标的待审核图片', 'error');
+                return;
+            }
+            pendingBatchTagForm.category = '';
+            pendingBatchTagForm.character = '__unchanged__';
+            pendingBatchTagForm.scope_mode = '';
+            pendingBatchTagOpen.value = true;
+        };
+        const closePendingBatchTagModal = () => { pendingBatchTagOpen.value = false; };
+
+        const submitPendingBatchTag = async () => {
+            const ids = Array.from(pendingSelectedImages.value);
+            if (!ids.length) return;
+            const payload = { ids };
+            if (pendingBatchTagForm.category) payload.category = pendingBatchTagForm.category;
+            if (pendingBatchTagForm.character !== '__unchanged__') payload.character = pendingBatchTagForm.character;
+            if (pendingBatchTagForm.scope_mode) payload.scope_mode = pendingBatchTagForm.scope_mode;
+            if (!payload.category && payload.character === undefined && !payload.scope_mode) {
+                showAlert('请至少选择一项需要批量修改的字段', 'error');
+                return;
+            }
+            pendingBatchTagSaving.value = true;
+            try {
+                const res = await apiFetch('api/pending/batch-update', {
+                    method: 'POST',
+                    body: JSON.stringify(payload),
+                });
+                const data = await res.json();
+                if (!data?.success) throw new Error(data?.error || '批量预打标失败');
+                pendingBatchTagOpen.value = false;
+                showAlert(`已批量预打标 ${data.updated || 0} 条待审核表情`, 'success');
+                await fetchPendingImages(pendingCurrentPage.value);
+            } catch (e) {
+                showAlert(e.message || '批量预打标失败', 'error');
+            } finally {
+                pendingBatchTagSaving.value = false;
+            }
+        };
 
         onUnmounted(() => {
             window.removeEventListener('series-languagechange', refreshLocale);
@@ -2867,6 +3037,25 @@ createApp({
 
             // 审核区键盘焦点
             focusedPendingId,
+
+            // 相似图去重 & 批量预打标
+            dedupOpen,
+            dedupLoading,
+            dedupMerging,
+            dedupThreshold,
+            dedupData,
+            dedupSelectedKeep,
+            openDedupModal,
+            closeDedupModal,
+            scanDedupClusters,
+            mergeDedupCluster,
+            mergeAllDedupClusters,
+            pendingBatchTagOpen,
+            pendingBatchTagSaving,
+            pendingBatchTagForm,
+            openPendingBatchTagModal,
+            closePendingBatchTagModal,
+            submitPendingBatchTag,
         };
     },
     template: TEMPLATE,

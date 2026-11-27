@@ -782,7 +782,7 @@ def test_plugin_api_all_39_routes_enforce_series_admin_and_csrf(monkeypatch) -> 
             monkeypatch.setattr(api, attr, _ok_handler)
 
     api.register(ctx)
-    assert len(ctx.registered_web_apis) == 39
+    assert len(ctx.registered_web_apis) == 42
 
     same_origin_headers = {
         "Host": "dashboard.local",

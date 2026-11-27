@@ -57,13 +57,15 @@ class MediaLibrary:
                 for row in db.execute("SELECT data FROM profiles ORDER BY key")
             ]
 
+    _ALLOWED_REF_SCOPES = frozenset({"public", "reference"})
+
     def _rebuild_public_ref_cache(self, index: dict) -> None:
         self._public_ref_cache = {
             m.get("hash"): p
             for p, m in index.items()
             if isinstance(m, dict)
             and m.get("hash")
-            and m.get("scope_mode") == "public"
+            and m.get("scope_mode") in self._ALLOWED_REF_SCOPES
         }
         self._public_ref_index_sig = (id(index), len(index))
 
@@ -77,7 +79,7 @@ class MediaLibrary:
         if not (
             isinstance(meta, dict)
             and meta.get("hash") == image_hash
-            and meta.get("scope_mode") == "public"
+            and meta.get("scope_mode") in self._ALLOWED_REF_SCOPES
         ):
             self._rebuild_public_ref_cache(index)
             raw_path = self._public_ref_cache.get(image_hash)
@@ -85,9 +87,9 @@ class MediaLibrary:
             if not (
                 isinstance(meta, dict)
                 and meta.get("hash") == image_hash
-                and meta.get("scope_mode") == "public"
+                and meta.get("scope_mode") in self._ALLOWED_REF_SCOPES
             ):
-                raise ValueError("角色共用参考图必须是公开表情，请先在表情库确认可见范围")
+                raise ValueError("角色共用参考图必须是公开表情或专用参考图，请先在表情库确认可见范围")
         path = Path(raw_path).resolve()
         if (
             not path.is_relative_to(self.owner.memes.base_dir.resolve())
@@ -95,6 +97,28 @@ class MediaLibrary:
         ):
             raise ValueError("角色参考图不存在")
         return path
+
+    async def isolate_references(self, ref_hashes: list[str], character: str = "") -> int:
+        """Mark character standard reference images as scope_mode='reference' to isolate them from random meme sends."""
+        api = getattr(getattr(self.owner, "memes", None), "plugin_api", None)
+        if api is None or not ref_hashes:
+            return 0
+        updated = 0
+        index = api._get_index()
+        target_hashes = {str(h).strip() for h in ref_hashes if str(h or "").strip()}
+        for path, meta in list(index.items()):
+            if not isinstance(meta, dict):
+                continue
+            if str(meta.get("hash") or "") not in target_hashes:
+                continue
+            changes: dict = {}
+            if meta.get("scope_mode") != "reference":
+                changes["scope_mode"] = "reference"
+            if character and not str(meta.get("character") or "").strip():
+                changes["character"] = character
+            if changes and await api._update_index_path(path, changes):
+                updated += 1
+        return updated
 
     async def save_profile(self, data):
         key = str(data.get("key", "")).strip()
@@ -109,12 +133,14 @@ class MediaLibrary:
             raise ValueError("最多选择 8 张角色参考图")
         for ref in refs:
             self.reference_path(ref)
+        isolate_refs = bool(data.get("isolate_references", False))
         profile = {
             "key": key,
             "name": str(data.get("name") or key)[:80],
             "appearance": str(data.get("appearance") or "")[:4000],
             "style": str(data.get("style") or "")[:2000],
             "references": list(dict.fromkeys(refs)),
+            "isolate_references": isolate_refs,
         }
         async with self.lock:
             with self._connect() as db:
@@ -131,6 +157,8 @@ class MediaLibrary:
             }
             cfg.save_characters()
             cfg.save_character_info()
+        if isolate_refs and profile["references"]:
+            await self.isolate_references(profile["references"], character=key)
         return profile
 
     async def delete_profile(self, key):
@@ -250,7 +278,9 @@ class MediaLibrary:
                 )
         return saved
 
-    async def generate_character(self, character, prompt, event=None, *, _recovery=None):
+    async def generate_character(
+        self, character, prompt, event=None, *, _recovery=None, _redraw_attempt: int = 0
+    ):
         from .tl.background_dispatch import dispatch_generation_result
         from .tl.generation_tracker import requester_from_event
 
@@ -291,7 +321,7 @@ class MediaLibrary:
                 self._check_tasks = pending
             return pending
 
-        async def _notify_mismatch(check):
+        async def _send_group_notice(notice_text: str):
             if event is None or getattr(self.owner, "_closed", False):
                 return
             if getattr(getattr(self.owner, "behavior", None), "stop_sends", False):
@@ -301,20 +331,35 @@ class MediaLibrary:
             send_fn = getattr(context, "send_message", None)
             if not target or not callable(send_fn):
                 return
-            issues = [str(x).strip() for x in (check.get("issues") or []) if str(x).strip()]
-            detail = "；".join(issues) if issues else str(check.get("reason") or "部分细节不一致")
-            notice = f"角色形象核对提醒：{detail}。已发送的图片保留供查看，尚未自动重画。"
             try:
                 from astrbot.api.event import MessageChain
                 from astrbot.core.platform.message_session import MessageSession
 
                 session = MessageSession.from_str(target)
                 await asyncio.wait_for(
-                    send_fn(session, MessageChain().message(notice)),
+                    send_fn(session, MessageChain().message(notice_text)),
                     timeout=15,
                 )
             except Exception as exc:
-                logger.debug(f"[VisualMedia] 角色核对差异提醒发送失败: {exc}")
+                logger.debug(f"[VisualMedia] 角色核对提醒发送失败: {exc}")
+
+        async def _notify_mismatch(check, *, auto_redrawn: bool = False):
+            issues = [str(x).strip() for x in (check.get("issues") or []) if str(x).strip()]
+            detail = "；".join(issues) if issues else str(check.get("reason") or "部分细节不一致")
+            char_label = str(profile.get("name") or character).strip()
+            short_prompt = prompt.strip().splitlines()[0][:50]
+            redraw_hint = f"/角色生图 {char_label} {short_prompt}"
+            if auto_redrawn:
+                notice = (
+                    f"角色形象核对提醒（自动修正重画后仍存在差异）：{detail}。"
+                    f"如需继续手动调整，可发送：{redraw_hint}"
+                )
+            else:
+                notice = (
+                    f"角色形象核对提醒：{detail}。已发送的图片保留供查看。"
+                    f"如需手动重画，可发送：{redraw_hint}"
+                )
+            await _send_group_notice(notice)
 
         async def _run_post_delivery_check(result):
             from .character_check import check_character
@@ -348,11 +393,54 @@ class MediaLibrary:
                     {
                         "character": character,
                         "task_id": result.get("task_id", ""),
+                        "redraw_attempt": _redraw_attempt,
                         **check,
                     },
                 )
             if check.get("status") == "mismatch":
-                await _notify_mismatch(check)
+                auto_redraw = bool(
+                    getattr(
+                        getattr(behavior, "settings", None),
+                        "character_check_auto_redraw",
+                        True,
+                    )
+                )
+                if auto_redraw and _redraw_attempt == 0 and not getattr(self.owner, "_closed", False):
+                    issues = [
+                        str(x).strip() for x in (check.get("issues") or []) if str(x).strip()
+                    ]
+                    detail = "；".join(issues) if issues else str(check.get("reason") or "外观细节存在偏差")
+                    await _send_group_notice(
+                        f"角色形象核对发现偏差（{detail}），正在自动修正并重画 1 次…"
+                    )
+                    corrective_prompt = (
+                        f"{prompt.strip()}\n"
+                        f"【外观核对修正要求：上一版存在「{detail}」，请严格依照角色参考图与设定修正以上偏差】"
+                    )
+                    try:
+                        redraw_res = await self.generate_character(
+                            character,
+                            corrective_prompt,
+                            event,
+                            _redraw_attempt=1,
+                        )
+                        if behavior:
+                            await behavior.arecord(
+                                audit_event,
+                                "character_check",
+                                "submitted" if not redraw_res.get("error") else "failed",
+                                "character_check_auto_redraw",
+                                {
+                                    "character": character,
+                                    "source_task_id": result.get("task_id", ""),
+                                    "redraw_task_id": redraw_res.get("task_id", ""),
+                                    "detail": detail,
+                                },
+                            )
+                        return
+                    except Exception as exc:
+                        logger.warning(f"[VisualMedia] 角色核对自动重画触发失败: {exc}")
+                await _notify_mismatch(check, auto_redrawn=_redraw_attempt > 0)
 
         async def completed(result):
             success = result.get("status") in {"succeeded", "partial_success"}

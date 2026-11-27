@@ -907,6 +907,18 @@ async def prepare_joint_reply(plugin, event, request):
             outcome,
             cache_reason,
         )
+        if behavior is not None and callable(getattr(behavior, "record_joint_prefetch", None)):
+            try:
+                behavior.record_joint_prefetch(
+                    event,
+                    outcome=outcome,
+                    elapsed_ms=elapsed_ms,
+                    join_wait_ms=join_wait_ms,
+                    cache_reason=cache_reason,
+                    candidates=len(candidates),
+                )
+            except Exception:
+                pass
         plan = JointMemePlan(
             plugin,
             event,
