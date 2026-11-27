@@ -20,11 +20,8 @@ from typing import Any
 from urllib.parse import urljoin
 
 import aiohttp
-import cv2
-import numpy as np
-from PIL import Image, ImageOps, UnidentifiedImageError
-
 from astrbot.api import logger
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .core.errors import (
     CoreError,
@@ -1047,8 +1044,11 @@ class WebStudioService:
         try:
             with Image.open(io.BytesIO(data)) as header:
                 width, height = header.size
+                if width <= 0 or height <= 0:
+                    raise StudioServiceError("图片内容无法解码")
                 if width > 8000 or height > 8000:
                     raise StudioServiceError("图片像素尺寸不能超过 8000×8000")
+                header.load()
         except StudioServiceError:
             raise
         except (
@@ -1058,12 +1058,6 @@ class WebStudioService:
             Image.DecompressionBombError,
         ) as exc:
             raise StudioServiceError("图片内容无法解码或像素尺寸超限") from exc
-        image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
-        if image is None or image.size == 0:
-            raise StudioServiceError("图片内容无法解码")
-        height, width = image.shape[:2]
-        if width > 8000 or height > 8000:
-            raise StudioServiceError("图片像素尺寸不能超过 8000×8000")
         return extension
 
     @staticmethod
@@ -1489,37 +1483,55 @@ class WebStudioService:
             source_bytes = source.read_bytes()
         except OSError as exc:
             raise StudioServiceError("图片读取失败", status_code=500) from exc
-        image = cv2.imdecode(
-            np.frombuffer(source_bytes, dtype=np.uint8),
-            cv2.IMREAD_UNCHANGED,
-        )
-        if image is None or image.size == 0:
-            raise StudioServiceError("图片内容无法生成缩略图", status_code=422)
-        if image.ndim == 3 and image.shape[2] == 4:
-            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-        height, width = image.shape[:2]
-        longest = max(height, width)
-        if longest > _THUMBNAIL_MAX_EDGE:
-            scale = _THUMBNAIL_MAX_EDGE / longest
-            image = cv2.resize(
-                image,
-                (max(round(width * scale), 1), max(round(height * scale), 1)),
-                interpolation=cv2.INTER_AREA,
-            )
         try:
-            encoded_ok, encoded = cv2.imencode(
-                ".jpg",
-                image,
-                [cv2.IMWRITE_JPEG_QUALITY, _THUMBNAIL_JPEG_QUALITY],
-            )
-        except cv2.error as exc:
+            with Image.open(io.BytesIO(source_bytes)) as img:
+                try:
+                    if getattr(img, "is_animated", False):
+                        img.seek(0)
+                except EOFError:
+                    pass
+                orig_width, orig_height = img.size
+                if orig_width <= 0 or orig_height <= 0:
+                    raise StudioServiceError("图片内容无法生成缩略图", status_code=422)
+                longest = max(orig_height, orig_width)
+                if longest > _THUMBNAIL_MAX_EDGE:
+                    scale = _THUMBNAIL_MAX_EDGE / longest
+                    target_w = max(round(orig_width * scale), 1)
+                    target_h = max(round(orig_height * scale), 1)
+                else:
+                    target_w, target_h = orig_width, orig_height
+                if img.format == "JPEG" and longest > _THUMBNAIL_MAX_EDGE:
+                    try:
+                        img.draft("RGB", (target_w, target_h))
+                    except Exception:
+                        pass
+                if img.size != (target_w, target_h):
+                    img = img.resize(
+                        (target_w, target_h), Image.Resampling.LANCZOS
+                    )
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                buf = io.BytesIO()
+                img.save(
+                    buf,
+                    format="JPEG",
+                    quality=_THUMBNAIL_JPEG_QUALITY,
+                )
+                data = buf.getvalue()
+        except StudioServiceError:
+            raise
+        except (
+            UnidentifiedImageError,
+            OSError,
+            ValueError,
+            Image.DecompressionBombError,
+        ) as exc:
             raise StudioServiceError(
                 "图片内容无法生成缩略图",
                 status_code=422,
             ) from exc
-        if not encoded_ok:
+        if not data:
             raise StudioServiceError("图片内容无法生成缩略图", status_code=422)
-        data = encoded.tobytes()
 
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)

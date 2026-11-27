@@ -18,6 +18,14 @@ from astrbot.api import logger
 
 from ..core.maintenance.retention import library_counts, library_group
 
+try:
+    from .. import series_panels as _series_panels
+except Exception:  # pragma: no cover - standalone fallback
+    try:
+        import series_panels as _series_panels  # type: ignore[no-redef]
+    except Exception:
+        _series_panels = None  # type: ignore[assignment]
+
 
 class LibraryRoutes:
     # ── Image serving ─────────────────────────────────────────
@@ -73,8 +81,24 @@ class LibraryRoutes:
             return jsonify({"success": False, "error": self._SERVE_IMAGE_ERROR}), 404
         return await send_file(str(resolved))
 
+    def _max_base64_image_bytes(self) -> int:
+        if _series_panels is not None:
+            getter = getattr(_series_panels, "get_series_resource_limits", None)
+            if callable(getter):
+                try:
+                    ctx = getattr(getattr(self, "plugin", None), "context", None)
+                    limits = getter(ctx)
+                    if isinstance(limits, dict):
+                        return max(
+                            2 * 1024 * 1024,
+                            int(limits.get("visual_max_image_bytes", 16 * 1024 * 1024)),
+                        )
+                except Exception:
+                    pass
+        return 16 * 1024 * 1024
+
     async def handle_image_data(self):
-        """返回图片的 base64 data URL。"""
+        """返回图片的 base64 data URL；当客户端请求 raw=1/binary=1 时直接二进制流式返回。"""
         image_hash = request.args.get("hash", "").strip()
         if not image_hash:
             return jsonify({"success": False, "error": "缺少 hash"})
@@ -94,7 +118,26 @@ class LibraryRoutes:
                     file_path = pending_row.get("path")
 
         if file_path and await asyncio.to_thread(os.path.isfile, file_path):
+            prefer_binary = str(
+                request.args.get("raw") or request.args.get("binary") or ""
+            ).strip().lower() in ("1", "true", "yes")
+            if prefer_binary and send_file is not None:
+                resolved = self._resolve_serve_image_path(file_path)
+                if resolved is not None:
+                    return await send_file(str(resolved))
             try:
+                max_bytes = self._max_base64_image_bytes()
+                file_size = await asyncio.to_thread(os.path.getsize, file_path)
+                if file_size > max_bytes:
+                    return (
+                        jsonify(
+                            {
+                                "success": False,
+                                "error": "原图过大，请改用二进制流接口读取",
+                            }
+                        ),
+                        413,
+                    )
                 data_url = await asyncio.to_thread(self._file_base64, file_path)
                 return jsonify({"success": True, "hash": image_hash, "url": data_url})
             except Exception as e:
@@ -121,6 +164,11 @@ class LibraryRoutes:
                     img.seek(0)
                 except EOFError:
                     pass
+                if getattr(img, "format", "") == "JPEG":
+                    try:
+                        img.draft("RGB", (max_size, max_size))
+                    except Exception:
+                        pass
                 img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
                 if img.mode in ("RGBA", "LA"):
                     canvas = Image.new("RGB", img.size, (16, 16, 16))

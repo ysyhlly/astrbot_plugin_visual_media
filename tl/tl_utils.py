@@ -15,9 +15,8 @@ from pathlib import Path
 from uuid import uuid4
 
 import aiohttp
-import cv2
-
 from astrbot.api import logger
+from PIL import Image, UnidentifiedImageError
 
 from .api_types import APIError
 from .file_uri import file_uri_to_path
@@ -59,10 +58,14 @@ def _decode_base64_to_temp_file(
         tmp_path = temp_dir / f"cut_{int(time.time() * 1000)}_{os.getpid()}.png"
         tmp_path.write_bytes(raw_bytes)
 
-        if verify_image and cv2.imread(str(tmp_path)) is None:
-            logger_obj.debug("base64 解码后图片不可读")
-            tmp_path.unlink(missing_ok=True)
-            return None
+        if verify_image:
+            try:
+                with Image.open(tmp_path) as img:
+                    img.verify()
+            except (UnidentifiedImageError, OSError, ValueError):
+                logger_obj.debug("base64 解码后图片不可读")
+                tmp_path.unlink(missing_ok=True)
+                return None
 
         return str(tmp_path)
     except Exception as e:

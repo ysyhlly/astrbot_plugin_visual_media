@@ -6,27 +6,37 @@ import asyncio
 import json
 import re
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PIL import Image as PILImage
-
 from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest
+from PIL import Image as PILImage
 
 from .enhanced_prompts import (
     get_grid_detect_prompt,
     get_sticker_bbox_prompt,
     get_vision_crop_system_prompt,
 )
-from .image_splitter import split_image
 
 try:
     if __package__ and "." in __package__:
-        from ..series_panels import series_llm_call
+        from ..series_panels import heavy_subprocess_slot, series_llm_call
     else:
-        from series_panels import series_llm_call
+        from series_panels import heavy_subprocess_slot, series_llm_call
 except Exception:  # pragma: no cover - standalone fallback
+    @asynccontextmanager
+    async def heavy_subprocess_slot(
+        _context: Any,
+        _purpose: str,
+        *,
+        plugin_id: str = "",
+        timeout: float | None = None,
+    ):
+        _ = (plugin_id, timeout)
+        yield {}
+
     async def series_llm_call(
         _context: Any,
         _provider_id: str,
@@ -271,14 +281,22 @@ class VisionHandler:
                     f"[LLM_CROP] 已将 {len(clean_boxes)} 个边界框坐标还原到原始尺寸 (scale_ratio={scale_ratio:.2f})"
                 )
 
-            # 调用裁剪工具
-            return await asyncio.to_thread(
-                split_image,
-                image_path,
-                rows=6,
-                cols=4,
-                bboxes=clean_boxes,
-            )
+            # 调用裁剪工具（惰性导入 cv2/image_splitter 并经过重型任务并发门控）
+            from .image_splitter import split_image
+
+            async with heavy_subprocess_slot(
+                self.context,
+                "sticker_split",
+                plugin_id="astrbot_plugin_visual_media",
+            ):
+                return await asyncio.to_thread(
+                    split_image,
+                    image_path,
+                    rows=6,
+                    cols=4,
+                    bboxes=clean_boxes,
+                    context=self.context,
+                )
         except Exception as e:
             logger.debug(f"视觉识别裁剪失败: {e}")
             return []

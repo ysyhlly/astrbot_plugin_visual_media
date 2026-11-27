@@ -232,9 +232,14 @@ class VLMCallService:
                 with PILImage.open(fp) as im:
                     for frame_idx in dict.fromkeys(frame_indices):
                         im.seek(frame_idx)
-                        frame = im.convert("RGBA")
-                        if frame.size != (frame_width, frame_height):
-                            frame = frame.resize((frame_width, frame_height), resampling)
+                        frame_src = im.copy()
+                        if frame_src.size != (frame_width, frame_height):
+                            frame_src.thumbnail((frame_width, frame_height), resampling)
+                            if frame_src.size != (frame_width, frame_height):
+                                frame_src = frame_src.resize(
+                                    (frame_width, frame_height), resampling
+                                )
+                        frame = frame_src.convert("RGBA")
 
                         # GIF 透明像素由中性灰底承接，兼顾黑色与白色线条的可读性。
                         backdrop = PILImage.new(

@@ -11,6 +11,40 @@ from difflib import SequenceMatcher
 from functools import lru_cache
 
 try:
+    if __package__ and __package__.count(".") >= 2:
+        from ... import series_panels as _series_panels
+    else:
+        import series_panels as _series_panels
+except Exception:  # pragma: no cover - standalone fallback
+    _series_panels = None  # type: ignore[assignment]
+
+
+def _resolve_lru_scale() -> float:
+    if _series_panels is not None:
+        getter = getattr(_series_panels, "get_series_resource_limits", None)
+        if callable(getter):
+            try:
+                limits = getter()
+                if isinstance(limits, dict):
+                    return max(0.05, float(limits.get("visual_lru_scale", 0.5)))
+            except Exception:
+                pass
+    return 0.5
+
+
+def _scaled_lru_maxsize(base_standard: int, *, min_size: int = 256) -> int:
+    scale = _resolve_lru_scale()
+    if scale <= 0.08:
+        return max(min_size, base_standard // 4)
+    if scale <= 0.25:
+        return max(min_size, base_standard // 2)
+    return max(min_size, int(base_standard))
+
+
+_LRU_LARGE = _scaled_lru_maxsize(2048, min_size=256)
+_LRU_MEDIUM = _scaled_lru_maxsize(1024, min_size=128)
+
+try:
     from rank_bm25 import BM25Plus
 except ImportError:  # pragma: no cover - fallback when optional/uninstalled in bare env
     class BM25Plus:  # type: ignore[no-redef]
@@ -143,7 +177,7 @@ class BM25:
         return heapq.nlargest(max(0, k), scores, key=lambda item: item[1])
 
 
-@lru_cache(maxsize=8192)
+@lru_cache(maxsize=_LRU_LARGE)
 def tokenize_for_bm25(text: str) -> tuple[str, ...]:
     tokens: list[str] = []
     cleaned = _PUNCT_RE.sub(" ", text.lower())
@@ -189,7 +223,7 @@ def tokenize_for_bm25(text: str) -> tuple[str, ...]:
     return tuple(tokens)
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=_LRU_MEDIUM)
 def _normalize_text(text: str) -> str:
     normalized = str(text or "").lower().strip()
     if not normalized:
@@ -368,7 +402,7 @@ def _has_negation_prefix(text: str, keyword: str) -> bool:
     return prev_char in _NEGATION_WORDS
 
 
-@lru_cache(maxsize=8192)
+@lru_cache(maxsize=_LRU_LARGE)
 def _calculate_hybrid_similarity_cached(t1: str, t2: str) -> float:
     if not t1 or not t2:
         return 0.0
@@ -440,7 +474,7 @@ def _calculate_hybrid_similarity_cached(t1: str, t2: str) -> float:
 # ──────────────────────────────────────────────────────────────
 
 
-@lru_cache(maxsize=8192)
+@lru_cache(maxsize=_LRU_LARGE)
 def _extract_words(text: str) -> frozenset[str]:
     """从文本中提取特征词汇集合。
 
@@ -570,6 +604,49 @@ def _chinese_char_similarity(text1: str, text2: str) -> float:
 # ──────────────────────────────────────────────────────────────
 
 
-@lru_cache(maxsize=8192)
+@lru_cache(maxsize=_LRU_LARGE)
 def _extract_chinese_chars(text: str) -> frozenset[str]:
     return frozenset(c for c in text if _CJK_RE.match(c))
+
+
+def clear_text_similarity_caches() -> None:
+    """Clear all bounded text similarity and search feature LRU caches."""
+    for fn in (
+        tokenize_for_bm25,
+        _normalize_text,
+        _calculate_hybrid_similarity_cached,
+        _extract_words,
+        _extract_chinese_chars,
+    ):
+        try:
+            fn.cache_clear()
+        except Exception:
+            pass
+    try:
+        from . import search_features as _sf
+
+        clear_sf = getattr(_sf, "clear_search_feature_caches", None)
+        if callable(clear_sf):
+            clear_sf()
+    except Exception:
+        pass
+
+
+def maybe_clear_caches_on_memory_pressure(context=None) -> bool:
+    """If shared process memory watermark reaches 'hard', clear text caches & trim allocator."""
+    if _series_panels is None:
+        return False
+    wm_fn = getattr(_series_panels, "get_series_memory_watermark", None)
+    if not callable(wm_fn):
+        return False
+    try:
+        wm = wm_fn(context)
+        if isinstance(wm, dict) and wm.get("state") == "hard":
+            clear_text_similarity_caches()
+            trim_fn = getattr(_series_panels, "try_malloc_trim", None)
+            if callable(trim_fn):
+                trim_fn()
+            return True
+    except Exception:
+        pass
+    return False

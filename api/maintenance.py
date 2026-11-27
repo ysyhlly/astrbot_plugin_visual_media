@@ -3,9 +3,8 @@
 import os
 from pathlib import Path
 
-from quart import jsonify, request
-
 from astrbot.api import logger
+from quart import jsonify, request
 
 from ..core.db.index_manager import delete_index_paths
 from ..core.processing.phash_dedup_service import PHashDedupService

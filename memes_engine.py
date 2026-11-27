@@ -4,12 +4,11 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
-
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Image as MessageImage
 from astrbot.api.star import Context
+from PIL import Image
 
 from .core.commands.command_handler import CommandHandler
 from .core.commands.image_mgmt_command import ImageManagementCommand
@@ -79,7 +78,9 @@ class Main(MemeSearchToolWorkflow, MemeStealToolWorkflow, Component):
         # 配置统一通过 self.plugin_config 读取（pydantic 模型）。
 
         # 初始化核心服务类
-        self.db_service = DatabaseService(self.cache_dir / "emoji.db")
+        self.db_service = DatabaseService(
+            self.cache_dir / "emoji.db", context=context
+        )
         self.source_service = SourceService(self)
         self.command_handler = CommandHandler(self)
         self.image_commands = ImageManagementCommand(self)

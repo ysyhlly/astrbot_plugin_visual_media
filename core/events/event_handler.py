@@ -47,16 +47,34 @@ class EventHandler:
         self._platform_detector = PlatformDetector(plugin_instance)
         self._image_download_service = ImageDownloadService(plugin_instance)
         self._background_queue: BackgroundStealQueue | None = None
+        self._lazy_queue_enabled: bool = False
 
-    async def start_background_workers(self) -> None:
-        """Start the bounded passive-steal pipeline."""
+    async def start_background_workers(self, *, force: bool = False) -> None:
+        """Start the bounded passive-steal pipeline (lazily when stealing is enabled or forced)."""
+        self._lazy_queue_enabled = True
+        if not force and not bool(getattr(self.plugin, "steal_meme", False)):
+            logger.debug(
+                "[Stealer] 自动偷图未开启，延迟启动 BackgroundStealQueue（待开启或入队时按需启动）"
+            )
+            return
         if self._background_queue is None:
             self._background_queue = BackgroundStealQueue(
                 self.plugin, capacity=32, worker_count=2
             )
         await self._background_queue.start()
 
+    async def ensure_background_workers_started(self) -> BackgroundStealQueue:
+        """Ensure BackgroundStealQueue workers are running before submitting a job."""
+        if self._background_queue is None:
+            self._background_queue = BackgroundStealQueue(
+                self.plugin, capacity=32, worker_count=2
+            )
+        if not getattr(self._background_queue, "_accepting", False):
+            await self._background_queue.start()
+        return self._background_queue
+
     async def stop_background_workers(self) -> None:
+        self._lazy_queue_enabled = False
         queue = self._background_queue
         self._background_queue = None
         if queue is not None:
@@ -527,7 +545,7 @@ class EventHandler:
         to_pending: bool,
         origin_target: str,
     ) -> bool:
-        if self._background_queue is None:
+        if self._background_queue is None and not getattr(self, "_lazy_queue_enabled", False):
             return False
 
         descriptors: list[dict[str, Any]] = []
@@ -558,7 +576,8 @@ class EventHandler:
                 }
             )
         if descriptors:
-            await self._background_queue.submit_capture_async(descriptors)
+            queue = await self.ensure_background_workers_started()
+            await queue.submit_capture_async(descriptors)
         return True
 
     async def _process_image_candidates(

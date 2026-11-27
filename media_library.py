@@ -12,11 +12,18 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
+from astrbot.api import logger
 from PIL import Image
 
-from astrbot.api import logger
-
 from .core.events.event_context import unwrap_event
+
+try:
+    from . import series_panels as _series_panels
+except Exception:  # pragma: no cover - standalone fallback
+    try:
+        import series_panels as _series_panels  # type: ignore[no-redef]
+    except Exception:
+        _series_panels = None  # type: ignore[assignment]
 
 
 class MediaLibrary:
@@ -44,11 +51,38 @@ class MediaLibrary:
     def _connect(self):
         db = sqlite3.connect(self.path, timeout=5)
         db.execute("PRAGMA busy_timeout=5000")
+        if _series_panels is not None:
+            apply_fn = getattr(_series_panels, "apply_series_sqlite_pragmas", None)
+            if callable(apply_fn):
+                try:
+                    ctx = getattr(self.owner, "context", None)
+                    apply_fn(db, ctx, readonly=False)
+                except Exception:
+                    pass
         try:
             with db:
                 yield db
         finally:
             db.close()
+
+    def _max_image_bytes(self) -> int:
+        if _series_panels is not None:
+            getter = getattr(_series_panels, "get_series_resource_limits", None)
+            if callable(getter):
+                try:
+                    ctx = getattr(self.owner, "context", None)
+                    limits = getter(ctx)
+                    if isinstance(limits, dict):
+                        return max(
+                            1024 * 1024,
+                            min(
+                                32 * 1024 * 1024,
+                                int(limits.get("visual_max_image_bytes", 20 * 1024 * 1024)),
+                            ),
+                        )
+                except Exception:
+                    pass
+        return 20 * 1024 * 1024
 
     def profiles(self):
         with self._connect() as db:
@@ -70,18 +104,21 @@ class MediaLibrary:
         self._public_ref_index_sig = (id(index), len(index))
 
     def reference_path(self, image_hash):
-        index = self.owner.memes.plugin_api._get_index()
-        sig = (id(index), len(index))
-        if self._public_ref_index_sig != sig:
-            self._rebuild_public_ref_cache(index)
-        raw_path = self._public_ref_cache.get(image_hash)
-        meta = index.get(raw_path) if raw_path else None
-        if not (
-            isinstance(meta, dict)
-            and meta.get("hash") == image_hash
-            and meta.get("scope_mode") in self._ALLOWED_REF_SCOPES
-        ):
-            self._rebuild_public_ref_cache(index)
+        api = self.owner.memes.plugin_api
+        db = getattr(api, "_db", None)
+        raw_path = None
+        if db is not None and callable(getattr(db, "get_emoji_by_hash_and_scope", None)):
+            found = db.get_emoji_by_hash_and_scope(
+                image_hash, scope_modes=tuple(self._ALLOWED_REF_SCOPES)
+            )
+            if found is None:
+                raise ValueError("角色共用参考图必须是公开表情或专用参考图，请先在表情库确认可见范围")
+            raw_path = found[0]
+        else:
+            index = api._get_index()
+            sig = (id(index), len(index))
+            if self._public_ref_index_sig != sig:
+                self._rebuild_public_ref_cache(index)
             raw_path = self._public_ref_cache.get(image_hash)
             meta = index.get(raw_path) if raw_path else None
             if not (
@@ -89,7 +126,15 @@ class MediaLibrary:
                 and meta.get("hash") == image_hash
                 and meta.get("scope_mode") in self._ALLOWED_REF_SCOPES
             ):
-                raise ValueError("角色共用参考图必须是公开表情或专用参考图，请先在表情库确认可见范围")
+                self._rebuild_public_ref_cache(index)
+                raw_path = self._public_ref_cache.get(image_hash)
+                meta = index.get(raw_path) if raw_path else None
+                if not (
+                    isinstance(meta, dict)
+                    and meta.get("hash") == image_hash
+                    and meta.get("scope_mode") in self._ALLOWED_REF_SCOPES
+                ):
+                    raise ValueError("角色共用参考图必须是公开表情或专用参考图，请先在表情库确认可见范围")
         path = Path(raw_path).resolve()
         if (
             not path.is_relative_to(self.owner.memes.base_dir.resolve())
@@ -104,13 +149,20 @@ class MediaLibrary:
         if api is None or not ref_hashes:
             return 0
         updated = 0
-        index = api._get_index()
-        target_hashes = {str(h).strip() for h in ref_hashes if str(h or "").strip()}
-        for path, meta in list(index.items()):
-            if not isinstance(meta, dict):
-                continue
-            if str(meta.get("hash") or "") not in target_hashes:
-                continue
+        target_hashes = [str(h).strip() for h in ref_hashes if str(h or "").strip()]
+        if not target_hashes:
+            return 0
+        db = getattr(api, "_db", None)
+        if db is not None and callable(getattr(db, "get_emojis_by_hashes", None)):
+            matches = await asyncio.to_thread(db.get_emojis_by_hashes, target_hashes)
+        else:
+            target_set = set(target_hashes)
+            matches = [
+                (p, m)
+                for p, m in api._get_index().items()
+                if isinstance(m, dict) and str(m.get("hash") or "") in target_set
+            ]
+        for path, meta in matches:
             changes: dict = {}
             if meta.get("scope_mode") != "reference":
                 changes["scope_mode"] = "reference"
@@ -207,38 +259,55 @@ class MediaLibrary:
             and character not in self.owner.memes.plugin_config.get_characters()
         ):
             raise ValueError("角色不存在，请先创建角色")
-        if path.stat().st_size > 32 * 1024 * 1024:
-            raise ValueError("图片超过表情入库大小上限")
-        raw = path.read_bytes()
-        with Image.open(io.BytesIO(raw)) as img:
-            if img.width * img.height > 40_000_000:
-                raise ValueError("图片像素数过大")
-            image_format = str(img.format).lower()
-            img.verify()
-        suffix = {"jpeg": ".jpg", "png": ".png", "gif": ".gif", "webp": ".webp"}.get(
-            image_format
-        )
-        if not suffix:
-            raise ValueError("图片格式不支持收藏")
+        max_bytes = self._max_image_bytes()
+
+        def _read_verify_and_hash() -> tuple[bytes, str, str]:
+            if path.stat().st_size > max_bytes:
+                raise ValueError("图片超过表情入库大小上限")
+            data = path.read_bytes()
+            with Image.open(io.BytesIO(data)) as img:
+                if img.width * img.height > 40_000_000:
+                    raise ValueError("图片像素数过大")
+                image_format = str(img.format).lower()
+                img.verify()
+            ext = {"jpeg": ".jpg", "png": ".png", "gif": ".gif", "webp": ".webp"}.get(
+                image_format
+            )
+            if not ext:
+                raise ValueError("图片格式不支持收藏")
+            return data, ext, hashlib.sha256(data).hexdigest()
+
+        raw, suffix, digest = await asyncio.to_thread(_read_verify_and_hash)
         scope = "public" if public else "umo:" + umo
-        digest = hashlib.sha256(raw).hexdigest()
         api = self.owner.memes.plugin_api
+        db = getattr(api, "_db", None)
+        has_scoped_sql = db is not None and callable(
+            getattr(db, "get_emoji_by_hash_and_scope", None)
+        )
         async with self.lock:
             # Content deduplication is scoped: never broaden an existing private item.
-            found = next(
-                (
-                    (p, m)
-                    for p, m in api._get_index().items()
-                    if m.get("hash") == digest
-                    and (
-                        m.get("scope_mode") == "public"
-                        if public
-                        else m.get("scope_mode") == "local"
-                        and m.get("origin_target") == scope
-                    )
-                ),
-                None,
-            )
+            if has_scoped_sql:
+                found = await asyncio.to_thread(
+                    db.get_emoji_by_hash_and_scope,
+                    digest,
+                    scope_modes=("public",) if public else ("local",),
+                    origin_target=None if public else scope,
+                )
+            else:
+                found = next(
+                    (
+                        (p, m)
+                        for p, m in api._get_index().items()
+                        if m.get("hash") == digest
+                        and (
+                            m.get("scope_mode") == "public"
+                            if public
+                            else m.get("scope_mode") == "local"
+                            and m.get("origin_target") == scope
+                        )
+                    ),
+                    None,
+                )
             if found and Path(found[0]).is_file():
                 saved = {
                     "hash": digest,
@@ -258,12 +327,20 @@ class MediaLibrary:
                     origin_target="" if public else scope,
                     is_favorite=True,
                 )
-                target = next(
-                    p
-                    for p, m in api._get_index().items()
-                    if m.get("hash") == digest
-                    and m.get("origin_target", "") == ("" if public else scope)
-                )
+                if has_scoped_sql:
+                    found_new = await asyncio.to_thread(
+                        db.get_emoji_by_hash_and_scope,
+                        digest,
+                        origin_target="" if public else scope,
+                    )
+                    target = found_new[0] if found_new else ""
+                else:
+                    target = next(
+                        p
+                        for p, m in api._get_index().items()
+                        if m.get("hash") == digest
+                        and m.get("origin_target", "") == ("" if public else scope)
+                    )
                 # Share storage where supported; each library retains its own lifetime.
                 link = Path(target).with_suffix(".link-tmp")
                 try:

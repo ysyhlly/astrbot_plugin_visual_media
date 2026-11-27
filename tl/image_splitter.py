@@ -5,7 +5,20 @@ from typing import Any
 import cv2
 import numpy as np
 
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+
 from astrbot.api import logger
+
+try:
+    if __package__ and "." in __package__:
+        from .. import series_panels as _series_panels
+    else:
+        import series_panels as _series_panels
+except Exception:  # pragma: no cover - standalone fallback
+    _series_panels = None  # type: ignore[assignment]
 
 from .tl_utils import (
     get_temp_dir,
@@ -1339,6 +1352,8 @@ def split_image(
     use_sticker_cutter: bool = False,
     ai_rows: int | None = None,
     ai_cols: int | None = None,
+    debug: bool = False,
+    context: Any = None,
 ) -> list[str]:
     """
     智能切分图片。
@@ -1438,30 +1453,51 @@ def split_image(
         grid_col_lines: list[int] = []
 
         def estimate_global_background_color(source_img: np.ndarray) -> np.ndarray:
-            """从整张源图估计统一背景色，供所有切片共用。"""
+            """从整张源图四条边框像素估计统一背景色（先切片再转 float32，避免整图内存峰值）。"""
             if source_img.ndim == 2:
-                gray_val = float(np.median(source_img))
+                h_g, w_g = source_img.shape
+                if h_g <= 2 or w_g <= 2:
+                    border_g = source_img.reshape(-1)
+                else:
+                    border_g = np.concatenate(
+                        (
+                            source_img[0, :],
+                            source_img[-1, :],
+                            source_img[1:-1, 0],
+                            source_img[1:-1, -1],
+                        )
+                    )
+                gray_val = float(np.median(border_g)) if len(border_g) > 0 else 255.0
                 return np.array([gray_val, gray_val, gray_val], dtype=np.float32)
 
-            bgr = source_img[:, :, :3].astype(np.float32)
-            gray = cv2.cvtColor(source_img[:, :, :3], cv2.COLOR_BGR2GRAY)
-            h, w = gray.shape
+            h, w = source_img.shape[:2]
+            if h == 0 or w == 0:
+                return np.array([255.0, 255.0, 255.0], dtype=np.float32)
+            if h <= 2 or w <= 2:
+                border_u8 = source_img[:, :, :3].reshape(-1, 3)
+            else:
+                border_u8 = np.concatenate(
+                    (
+                        source_img[0, :, :3],
+                        source_img[-1, :, :3],
+                        source_img[1:-1, 0, :3],
+                        source_img[1:-1, -1, :3],
+                    ),
+                    axis=0,
+                )
 
-            border = np.zeros((h, w), dtype=bool)
-            border[0, :] = True
-            border[-1, :] = True
-            border[:, 0] = True
-            border[:, -1] = True
+            if len(border_u8) == 0:
+                return np.array([255.0, 255.0, 255.0], dtype=np.float32)
 
-            border_pixels = bgr[border]
-            border_gray = gray[border]
+            border_pixels = border_u8.astype(np.float32)
+            border_gray = cv2.cvtColor(
+                border_u8.reshape(1, -1, 3), cv2.COLOR_BGR2GRAY
+            ).reshape(-1)
             near_white = border_pixels[border_gray >= 245]
             if len(near_white) > 0:
                 return np.median(near_white, axis=0)
 
-            if len(border_pixels) > 0:
-                return np.median(border_pixels, axis=0)
-            return np.array([255.0, 255.0, 255.0], dtype=np.float32)
+            return np.median(border_pixels, axis=0)
 
         global_bg_color = estimate_global_background_color(img)
 
@@ -1586,7 +1622,7 @@ def split_image(
         precomputed_grid_boxes: list[tuple[int, int, int, int]] = []
         if not boxes and not (manual_rows and manual_cols):
             grid_splitter = SmartMemeSplitter()
-            precomputed_grid_boxes = grid_splitter.detect_grid(img, debug=True)
+            precomputed_grid_boxes = grid_splitter.detect_grid(img, debug=debug)
             if looks_like_explicit_grid_sheet(
                 img,
                 precomputed_grid_boxes,
@@ -1638,14 +1674,30 @@ def split_image(
             if ai_files:
                 return ai_files
 
-        def run_sticker_cutter(debug: bool = True):
+        def _resolve_sticker_max_dim() -> int:
+            if _series_panels is not None:
+                getter = getattr(_series_panels, "get_series_resource_limits", None)
+                if callable(getter):
+                    try:
+                        limits = getter(context)
+                        if isinstance(limits, dict):
+                            return max(512, int(limits.get("visual_sticker_max_dim", 2048)))
+                    except Exception:
+                        pass
+            return 2048
+
+        def run_sticker_cutter(debug: bool = False):
             """执行自适应贴纸分割"""
             nonlocal sticker_crops, sticker_debug
             try:
                 from .sticker_cutter import StickerCutter
 
                 cutter = StickerCutter()
-                sticker_crops, sticker_debug = cutter.process_image(img, debug=debug)
+                sticker_crops, sticker_debug = cutter.process_image(
+                    img,
+                    debug=debug,
+                    max_dim=_resolve_sticker_max_dim(),
+                )
                 if sticker_crops:
                     logger.debug(
                         f"使用自适应贴纸分割，共 {len(sticker_crops)} 个裁剪结果"
@@ -1657,7 +1709,7 @@ def split_image(
 
         # 默认优先使用黑描边自适应切分，网格切分仅作为兜底
         if not boxes:
-            run_sticker_cutter(debug=True)
+            run_sticker_cutter(debug=debug)
 
         # 如果没有外部裁剪框或手动网格，则使用 SmartMemeSplitter 进行智能切分
         if not boxes and not sticker_crops:
@@ -1665,12 +1717,12 @@ def split_image(
                 boxes = precomputed_grid_boxes
             else:
                 splitter = SmartMemeSplitter()
-                boxes = splitter.detect_grid(img, debug=True)
+                boxes = splitter.detect_grid(img, debug=debug)
 
         # 网格切分仍失败时，再次尝试黑描边自适应切分
         if not boxes and not sticker_crops:
             logger.debug("网格切分未检测到有效区域，再次尝试自适应贴纸分割")
-            run_sticker_cutter(debug=True)
+            run_sticker_cutter(debug=debug)
 
         if not boxes and not sticker_crops:
             logger.warning("智能切分未检测到网格")

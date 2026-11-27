@@ -14,7 +14,6 @@ from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import aiohttp
-
 from astrbot.api import logger
 
 from .core.errors import PathPolicyError, redact_text, redact_url

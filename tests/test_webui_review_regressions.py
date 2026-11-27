@@ -126,7 +126,7 @@ async def test_upload_rejects_large_dimensions_before_decoding(tmp_path, monkeyp
     def fail_decode(*args):
         pytest.fail("oversized image reached pixel decoder")
 
-    monkeypatch.setattr(module.cv2, "imdecode", fail_decode)
+    monkeypatch.setattr(module.Image.Image, "load", fail_decode)
     with pytest.raises(StudioServiceError, match="8000"):
         WebStudioService._validate_image_bytes(bytes(data))
 

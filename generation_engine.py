@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Image as AstrImage
@@ -34,14 +33,19 @@ from .tl import (
     MessageSender,
     RateLimiter,
     VisionHandler,
-    create_zip,
     ensure_font_downloaded,
     get_template_path,
     render_local_pillow,
     render_text,
-    resolve_split_source_to_path,
-    split_image,
 )
+
+try:
+    from . import series_panels as _series_panels
+except Exception:  # pragma: no cover - standalone fallback
+    try:
+        import series_panels as _series_panels  # type: ignore[no-redef]
+    except Exception:
+        _series_panels = None  # type: ignore[assignment]
 from .tl.background_tasks import BackgroundTaskManager
 from .tl.core.errors import (
     CoreError,
@@ -1508,23 +1512,31 @@ class GeminiImageGenerationPlugin(Component):
             yield event.plain_result("✂️ 正在切割图片...")
             split_start_time = time.perf_counter()
             try:
-                split_files: list[str] = []
-                if self.cfg.enable_llm_crop:
-                    split_files = await self.vision_handler.llm_detect_and_split(
-                        primary_image_path
+                from .tl.image_splitter import split_image
+
+                async def _run_split() -> list[str]:
+                    slot_fn = (
+                        getattr(_series_panels, "heavy_subprocess_slot", None)
+                        if _series_panels is not None
+                        else None
                     )
-                    if not split_files:
-                        split_files = await asyncio.to_thread(
-                            split_image,
-                            primary_image_path,
-                            rows=6,
-                            cols=4,
-                            use_sticker_cutter=True,
-                            ai_rows=ai_rows,
-                            ai_cols=ai_cols,
-                        )
-                else:
-                    split_files = await asyncio.to_thread(
+                    if callable(slot_fn):
+                        async with slot_fn(
+                            self.context,
+                            "sticker_split",
+                            plugin_id="astrbot_plugin_visual_media",
+                        ):
+                            return await asyncio.to_thread(
+                                split_image,
+                                primary_image_path,
+                                rows=6,
+                                cols=4,
+                                use_sticker_cutter=True,
+                                ai_rows=ai_rows,
+                                ai_cols=ai_cols,
+                                context=self.context,
+                            )
+                    return await asyncio.to_thread(
                         split_image,
                         primary_image_path,
                         rows=6,
@@ -1532,7 +1544,18 @@ class GeminiImageGenerationPlugin(Component):
                         use_sticker_cutter=True,
                         ai_rows=ai_rows,
                         ai_cols=ai_cols,
+                        context=self.context,
                     )
+
+                split_files: list[str] = []
+                if self.cfg.enable_llm_crop:
+                    split_files = await self.vision_handler.llm_detect_and_split(
+                        primary_image_path
+                    )
+                    if not split_files:
+                        split_files = await _run_split()
+                else:
+                    split_files = await _run_split()
                 split_duration = time.perf_counter() - split_start_time
             except Exception as e:
                 logger.error(f"切割图片时发生异常: {redact_text(e)[:240]}")
@@ -1569,6 +1592,8 @@ class GeminiImageGenerationPlugin(Component):
             # 发送结果
             sent_success = False
             if self.cfg.enable_sticker_zip:
+                from .tl.image_splitter import create_zip
+
                 zip_path = await asyncio.to_thread(create_zip, split_files)
                 if zip_path:
                     try:
@@ -1695,6 +1720,8 @@ class GeminiImageGenerationPlugin(Component):
             yield event.plain_result("❌ 未找到可切割的图片。")
             return
 
+        from .tl.image_splitter import resolve_split_source_to_path, split_image
+
         src = ref_images[0]
         local_path = await resolve_split_source_to_path(
             src,
@@ -1741,17 +1768,42 @@ class GeminiImageGenerationPlugin(Component):
         split_files: list[str] = []
         try:
             split_start_time = time.perf_counter()
-            split_files = await asyncio.to_thread(
-                split_image,
-                local_path,
-                rows=6,
-                cols=4,
-                manual_rows=manual_rows,
-                manual_cols=manual_cols,
-                use_sticker_cutter=use_sticker_cutter,
-                ai_rows=ai_rows,
-                ai_cols=ai_cols,
+            slot_fn = (
+                getattr(_series_panels, "heavy_subprocess_slot", None)
+                if _series_panels is not None
+                else None
             )
+            if callable(slot_fn):
+                async with slot_fn(
+                    self.context,
+                    "sticker_split",
+                    plugin_id="astrbot_plugin_visual_media",
+                ):
+                    split_files = await asyncio.to_thread(
+                        split_image,
+                        local_path,
+                        rows=6,
+                        cols=4,
+                        manual_rows=manual_rows,
+                        manual_cols=manual_cols,
+                        use_sticker_cutter=use_sticker_cutter,
+                        ai_rows=ai_rows,
+                        ai_cols=ai_cols,
+                        context=self.context,
+                    )
+            else:
+                split_files = await asyncio.to_thread(
+                    split_image,
+                    local_path,
+                    rows=6,
+                    cols=4,
+                    manual_rows=manual_rows,
+                    manual_cols=manual_cols,
+                    use_sticker_cutter=use_sticker_cutter,
+                    ai_rows=ai_rows,
+                    ai_cols=ai_cols,
+                    context=self.context,
+                )
             split_duration = time.perf_counter() - split_start_time
         except Exception as e:
             logger.error(f"切割图片时发生异常: {redact_text(e)[:240]}")

@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import os
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-import cv2
 import numpy as np
 import pytest
+from PIL import Image
 
 from tl.api_types import ApiRequestConfig
 from tl.core.stack import build_generation_stack
@@ -49,7 +50,7 @@ def _config(**overrides):
 
 def _png(path: Path, value: int = 0) -> Path:
     image = np.full((4, 4, 3), value, dtype=np.uint8)
-    assert cv2.imwrite(str(path), image)
+    Image.fromarray(image, mode="RGB").save(path, format="PNG")
     return path
 
 
@@ -294,13 +295,16 @@ async def test_batch_budget_is_validated_before_start(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_archive_supports_local_and_remote_sources(tmp_path, monkeypatch) -> None:
     local = _png(tmp_path / "local.png", 1)
-    ok, encoded = cv2.imencode(".png", np.ones((3, 3, 3), dtype=np.uint8))
-    assert ok
+    buf = io.BytesIO()
+    Image.fromarray(np.ones((3, 3, 3), dtype=np.uint8), mode="RGB").save(
+        buf, format="PNG"
+    )
+    encoded_bytes = buf.getvalue()
     tracker = GenerationTracker(tmp_path, 20)
     service = WebStudioService(None, tracker, _config(), tmp_path)
 
     async def fake_download(url: str, *, candidate_id=None) -> bytes:
-        return encoded.tobytes()
+        return encoded_bytes
 
     monkeypatch.setattr(service, "_download_remote_image", fake_download)
     names = await service.archive_images(
@@ -637,7 +641,7 @@ async def test_gallery_image_base64_builds_and_invalidates_thumbnail_cache(
     gallery_dir.mkdir()
     source = gallery_dir / "wide.png"
     image = np.zeros((320, 960, 3), dtype=np.uint8)
-    assert cv2.imwrite(str(source), image)
+    Image.fromarray(image, mode="RGB").save(source, format="PNG")
     service = WebStudioService(
         None,
         GenerationTracker(tmp_path, 20),
@@ -646,21 +650,19 @@ async def test_gallery_image_base64_builds_and_invalidates_thumbnail_cache(
     )
 
     first = await service.gallery_image_base64("wide.png", thumbnail=True)
-    decoded = cv2.imdecode(
-        np.frombuffer(base64.b64decode(first["b64"]), dtype=np.uint8),
-        cv2.IMREAD_COLOR,
-    )
+    with Image.open(io.BytesIO(base64.b64decode(first["b64"]))) as decoded_img:
+        decoded_size = (decoded_img.height, decoded_img.width)
     cache_path = gallery_dir / ".thumbs" / "wide.png.jpg"
 
     assert first["mime"] == "image/jpeg"
-    assert max(decoded.shape[:2]) <= 512
+    assert max(decoded_size) <= 512
     assert len(first["b64"]) <= 2 * 1024 * 1024
     assert cache_path.is_file()
     assert cache_path.stat().st_mtime_ns == source.stat().st_mtime_ns
 
     old_mtime = source.stat().st_mtime_ns
     image[:] = 255
-    assert cv2.imwrite(str(source), image)
+    Image.fromarray(image, mode="RGB").save(source, format="PNG")
     os.utime(source, ns=(old_mtime + 1_000_000_000, old_mtime + 1_000_000_000))
     second = await service.gallery_image_base64("wide.png", thumbnail=True)
 
@@ -699,7 +701,7 @@ async def test_gallery_image_base64_compresses_large_preview_keeps_original(
     source = gallery_dir / "large.png"
     rng = np.random.default_rng(102)
     pixels = rng.integers(0, 256, size=(1800, 2400, 3), dtype=np.uint8)
-    assert cv2.imwrite(str(source), pixels)
+    Image.fromarray(pixels, mode="RGB").save(source, format="PNG")
     original = source.read_bytes()
     assert len(original) > 6 * 1024 * 1024
     service = WebStudioService(
@@ -711,11 +713,8 @@ async def test_gallery_image_base64_compresses_large_preview_keeps_original(
     assert payload["preview"] is True
     assert payload["mime"] == "image/jpeg"
     assert len(payload["b64"]) <= 8 * 1024 * 1024
-    preview = cv2.imdecode(
-        np.frombuffer(base64.b64decode(payload["b64"]), dtype=np.uint8),
-        cv2.IMREAD_COLOR,
-    )
-    assert preview.shape[:2] == (1536, 2048)
+    with Image.open(io.BytesIO(base64.b64decode(payload["b64"]))) as preview_img:
+        assert (preview_img.height, preview_img.width) == (1536, 2048)
     assert service.gallery_file(source.name).read_bytes() == original
     assert sorted(path.name for path in gallery_dir.iterdir()) == [source.name]
 

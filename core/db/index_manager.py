@@ -9,6 +9,14 @@ from typing import Any
 
 from astrbot.api import logger
 
+try:
+    if __package__ and __package__.count(".") >= 2:
+        from ... import series_panels as _series_panels
+    else:
+        import series_panels as _series_panels
+except Exception:  # pragma: no cover - standalone fallback
+    _series_panels = None  # type: ignore[assignment]
+
 
 def invalidate_search(plugin) -> None:
     """统一失效所有检索缓存，避免各入口分别维护索引状态。"""
@@ -148,6 +156,31 @@ class IndexManager:
             await asyncio.to_thread(self.db_service.finish_search_refresh, path, job["generation"], error)
         return len(jobs)
 
+    IDLE_REFRESH_TIMEOUT_STANDARD = 60.0
+    IDLE_REFRESH_TIMEOUT_LOW_MEMORY = 120.0
+    DISABLED_EMBEDDING_TIMEOUT = 120.0
+
+    def _idle_refresh_timeout(self) -> float:
+        if time.monotonic() < getattr(self, "_provider_backoff_until", 0.0):
+            return 60.0
+        cfg = getattr(self.plugin, "plugin_config", None)
+        emb_enabled = bool(
+            getattr(cfg, "enable_embedding_search", None)
+            if cfg is not None
+            else getattr(self.plugin, "enable_embedding_search", False)
+        )
+        if not emb_enabled:
+            return self.DISABLED_EMBEDDING_TIMEOUT
+        if _series_panels is not None:
+            resolver = getattr(_series_panels, "resolve_series_resource_profile", None)
+            if callable(resolver):
+                try:
+                    if resolver(getattr(self.plugin, "context", None)) != "standard":
+                        return self.IDLE_REFRESH_TIMEOUT_LOW_MEMORY
+                except Exception:
+                    pass
+        return self.IDLE_REFRESH_TIMEOUT_STANDARD
+
     async def _search_refresh_loop(self) -> None:
         while True:
             self._search_wakeup.clear()
@@ -156,10 +189,20 @@ class IndexManager:
             except Exception as exc:
                 count = 0
                 logger.warning(f"[Embedding] 后台刷新异常: {exc}")
+            try:
+                from ..search.text_similarity import (
+                    maybe_clear_caches_on_memory_pressure,
+                )
+
+                maybe_clear_caches_on_memory_pressure(
+                    getattr(self.plugin, "context", None)
+                )
+            except Exception:
+                pass
             if count >= 20:
                 await asyncio.sleep(0)
                 continue
-            timeout = 60.0 if time.monotonic() < getattr(self, "_provider_backoff_until", 0.0) else 5
+            timeout = self._idle_refresh_timeout()
             try:
                 await asyncio.wait_for(self._search_wakeup.wait(), timeout=timeout)
             except asyncio.TimeoutError:

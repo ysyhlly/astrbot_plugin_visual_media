@@ -16,13 +16,12 @@ import re
 from typing import Any, NamedTuple
 
 import mcp.types
-from pydantic import Field
-from pydantic.dataclasses import dataclass
-
 from astrbot.api import logger
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
+from pydantic import Field
+from pydantic.dataclasses import dataclass
 
 from .background_dispatch import generation_reference_note
 from .core.errors import (

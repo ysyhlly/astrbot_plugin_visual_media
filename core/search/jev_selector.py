@@ -6,7 +6,6 @@ import time
 from typing import Any
 
 import aiohttp
-
 from astrbot.api import logger
 
 from .search_features import parse_tags

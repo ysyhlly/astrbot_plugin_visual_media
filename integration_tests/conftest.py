@@ -7,10 +7,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import pytest
 import pytest_asyncio
+from astrbot.api.star import StarTools
 from astrbot_plugin_visual_media import generation_engine
 from astrbot_plugin_visual_media.main import VisualMediaPlugin
-
-from astrbot.api.star import StarTools
 
 
 @pytest.fixture

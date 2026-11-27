@@ -13,6 +13,14 @@ from astrbot.api import logger
 from ..util.meme_presentation import image_display_title, image_source_label
 
 try:
+    if __package__ and __package__.count(".") >= 2:
+        from ... import series_panels as _series_panels
+    else:
+        import series_panels as _series_panels
+except Exception:  # pragma: no cover - standalone fallback
+    _series_panels = None  # type: ignore[assignment]
+
+try:
     from PIL import Image as PILImage
     from PIL import ImageDraw as PILImageDraw
     from PIL import ImageFont as PILImageFont
@@ -31,8 +39,8 @@ except Exception:
 class ImageRenderService:
     """负责图片渲染、缩略图生成、列表页绘制和 base64 编码。"""
 
-    GIF_CACHE_MAX_SIZE = 50
-    GIF_CACHE_MAX_SIZE_BYTES = 10 * 1024 * 1024
+    GIF_CACHE_MAX_SIZE = 20
+    GIF_CACHE_MAX_SIZE_BYTES = 8 * 1024 * 1024
     CACHE_EXPIRE_TIME = 3600
 
     def __init__(self, plugin_instance: Any = None) -> None:
@@ -41,6 +49,48 @@ class ImageRenderService:
         self._gif_base64_cache: dict[str, tuple[float, str]] = {}
         self._gif_base64_cache_max_size = self.GIF_CACHE_MAX_SIZE
         self._gif_base64_cache_expire_time = self.CACHE_EXPIRE_TIME
+
+    def _resource_limits(self) -> dict[str, Any]:
+        if _series_panels is not None:
+            getter = getattr(_series_panels, "get_series_resource_limits", None)
+            if callable(getter):
+                try:
+                    ctx = getattr(self.plugin, "context", None) if self.plugin is not None else None
+                    res = getter(ctx)
+                    if isinstance(res, dict):
+                        return res
+                except Exception:
+                    pass
+        return {
+            "visual_gif_cache_max_size": self.GIF_CACHE_MAX_SIZE,
+            "visual_gif_cache_max_bytes": self.GIF_CACHE_MAX_SIZE_BYTES,
+            "visual_gif_max_frames": 24,
+            "visual_gif_max_dim": 720,
+        }
+
+    def _effective_gif_cache_limits(self) -> tuple[int, int, int]:
+        limits = self._resource_limits()
+        profile_max_size = max(1, int(limits.get("visual_gif_cache_max_size", self.GIF_CACHE_MAX_SIZE)))
+        max_size = min(max(1, int(self._gif_base64_cache_max_size)), profile_max_size)
+        max_bytes = max(
+            256 * 1024,
+            min(
+                int(self.GIF_CACHE_MAX_SIZE_BYTES),
+                int(limits.get("visual_gif_cache_max_bytes", self.GIF_CACHE_MAX_SIZE_BYTES)),
+            ),
+        )
+        single_item_cap = min(2 * 1024 * 1024, max(1, max_bytes // 2))
+        return max_size, max_bytes, single_item_cap
+
+    def _store_gif_base64_cache(self, cache_key: str, result: str) -> None:
+        if not result:
+            return
+        _max_size, _max_bytes, single_item_cap = self._effective_gif_cache_limits()
+        if len(result) > single_item_cap:
+            return
+        with self._gif_cache_lock:
+            self._gif_base64_cache[cache_key] = (time.time(), result)
+            self._evict_gif_base64_cache()
 
     # ── base64 编码 ──────────────────────────────────────────
 
@@ -82,16 +132,15 @@ class ImageRenderService:
             if self._is_gif_file(file_path):
                 result = await self.file_to_base64(file_path)
                 if result:
-                    with self._gif_cache_lock:
-                        self._gif_base64_cache[cache_key] = (time.time(), result)
-                        self._evict_gif_base64_cache()
+                    self._store_gif_base64_cache(cache_key, result)
                 return result
 
             if PILImage is None:
                 return await self.file_to_base64(file_path)
 
-            # 非 GIF 动图转换为 GIF 时最多抽取 30 帧。
-            MAX_FRAMES = 30
+            limits = self._resource_limits()
+            max_frames = max(2, int(limits.get("visual_gif_max_frames", 24)))
+            max_dim = max(128, int(limits.get("visual_gif_max_dim", 720)))
 
             def _sync_convert_to_gif(fp: str) -> str:
                 with PILImage.open(fp) as im:
@@ -100,7 +149,7 @@ class ImageRenderService:
                     n_frames = int(getattr(im, "n_frames", 1) or 1)
 
                     if is_animated and n_frames > 1:
-                        selected_indices = self._uniform_frame_indices(n_frames, MAX_FRAMES)
+                        selected_indices = self._uniform_frame_indices(n_frames, max_frames)
                         selected_set = set(selected_indices)
                         frames = []
                         frame_durations = []
@@ -111,8 +160,12 @@ class ImageRenderService:
                                 max(1, int(im.info.get("duration", 100) or 100))
                             )
                             if frame_idx in selected_set:
-                                frame = im.convert("RGBA")
-                                # 保留帧原始尺寸，避免二次缩放。
+                                frame_src = im.copy()
+                                if max(frame_src.size) > max_dim:
+                                    frame_src.thumbnail(
+                                        (max_dim, max_dim), LANCZOS or PILImage.BICUBIC
+                                    )
+                                frame = frame_src.convert("RGBA")
                                 frames.append(frame)
                                 fingerprints.append(self._frame_fingerprint(frame))
 
@@ -125,7 +178,12 @@ class ImageRenderService:
                                 if frame_idx in selected_set:
                                     continue
                                 im.seek(frame_idx)
-                                candidate = im.convert("RGBA")
+                                cand_src = im.copy()
+                                if max(cand_src.size) > max_dim:
+                                    cand_src.thumbnail(
+                                        (max_dim, max_dim), LANCZOS or PILImage.BICUBIC
+                                    )
+                                candidate = cand_src.convert("RGBA")
                                 if self._frame_fingerprint(candidate) != baseline:
                                     selected_indices[-1] = frame_idx
                                     frames[-1] = candidate
@@ -161,13 +219,18 @@ class ImageRenderService:
                                 disposal=2,
                             )
                     else:
-                        # 保留原图尺寸，禁用 optimize，避免二次压缩
+                        # 静态图转 GIF：仅在超大尺寸时按 max_dim 等比缩小避免爆内存
+                        if getattr(im, "format", "") == "JPEG" and max(im.size) > max_dim:
+                            try:
+                                im.draft("RGB", (max_dim, max_dim))
+                            except Exception:
+                                pass
+                        if max(im.size) > max_dim:
+                            im.thumbnail((max_dim, max_dim), LANCZOS or PILImage.BICUBIC)
                         im.save(buf, format="GIF", optimize=False)
 
                     result = base64.b64encode(buf.getvalue()).decode("utf-8")
-                    with self._gif_cache_lock:
-                        self._gif_base64_cache[cache_key] = (time.time(), result)
-                        self._evict_gif_base64_cache()
+                    self._store_gif_base64_cache(cache_key, result)
                     return result
 
             return await asyncio.to_thread(_sync_convert_to_gif, file_path)
@@ -204,28 +267,39 @@ class ImageRenderService:
         return sample.tobytes()
 
     def _evict_gif_base64_cache(self) -> None:
-        """淘汰 _gif_base64_cache 中最旧的条目。"""
+        """淘汰 _gif_base64_cache 中超限或最旧的条目，防止大文件长期钉死在内存中。"""
+        max_size, max_bytes, single_item_cap = self._effective_gif_cache_limits()
         with self._gif_cache_lock:
+            # 先剔除超过单条大小上限的大对象
+            oversized = [
+                k for k, v in self._gif_base64_cache.items() if len(v[1]) > single_item_cap
+            ]
+            for k in oversized:
+                self._gif_base64_cache.pop(k, None)
+
             total_bytes = sum(len(v[1]) for v in self._gif_base64_cache.values())
             if (
-                len(self._gif_base64_cache) <= self._gif_base64_cache_max_size
-                and total_bytes <= self.GIF_CACHE_MAX_SIZE_BYTES
+                len(self._gif_base64_cache) <= max_size
+                and total_bytes <= max_bytes
             ):
                 return
 
             sorted_items = sorted(
                 self._gif_base64_cache.items(), key=lambda kv: kv[1][0]
             )
-            target_count = max(1, self._gif_base64_cache_max_size // 2)
-            target_bytes = max(1024 * 1024, self.GIF_CACHE_MAX_SIZE_BYTES // 2)
+            target_count = max(1, max_size // 2)
+            target_bytes = max(256 * 1024, max_bytes // 2)
 
             keep_items = []
             current_bytes = 0
             for key, value in reversed(sorted_items):
-                if len(keep_items) >= target_count or current_bytes >= target_bytes:
+                item_len = len(value[1])
+                if item_len > single_item_cap:
+                    continue
+                if len(keep_items) >= target_count or (current_bytes + item_len) > target_bytes:
                     break
                 keep_items.append((key, value))
-                current_bytes += len(value[1])
+                current_bytes += item_len
 
             self._gif_base64_cache.clear()
             self._gif_base64_cache.update(keep_items)
@@ -248,8 +322,13 @@ class ImageRenderService:
                         im.seek(0)
                 except Exception:
                     pass
-                im = im.convert("RGBA")
+                if getattr(im, "format", "") == "JPEG":
+                    try:
+                        im.draft("RGB", (size, size))
+                    except Exception:
+                        pass
                 im.thumbnail((size, size), LANCZOS or PILImage.BICUBIC)
+                im = im.convert("RGBA")
                 canvas = PILImage.new("RGBA", (size, size), (255, 255, 255, 0))
                 x = (size - im.size[0]) // 2
                 y = (size - im.size[1]) // 2
@@ -329,8 +408,11 @@ class ImageRenderService:
             return ""
 
         tmpl = _LIST_PAGE_FILE_TEMPLATE
+        rendered_items = await asyncio.to_thread(
+            self._prepare_emoji_list_render_items, items
+        )
         data = {
-            "items": self._prepare_emoji_list_render_items(items),
+            "items": rendered_items,
             "page": int(page),
             "total_pages": int(total_pages),
             "total_filtered": int(total_filtered),
@@ -376,8 +458,11 @@ class ImageRenderService:
             return ""
 
         tmpl = _LIST_PAGE_URL_TEMPLATE
+        rendered_items = await asyncio.to_thread(
+            self._prepare_emoji_list_render_items, items
+        )
         data = {
-            "items": self._prepare_emoji_list_render_items(items),
+            "items": rendered_items,
             "page": int(page),
             "total_pages": int(total_pages),
             "total_filtered": int(total_filtered),
@@ -479,8 +564,13 @@ class ImageRenderService:
                             im.seek(0)
                     except Exception:
                         pass
-                    im = im.convert("RGBA")
+                    if getattr(im, "format", "") == "JPEG":
+                        try:
+                            im.draft("RGB", (size, size))
+                        except Exception:
+                            pass
                     im.thumbnail((size, size), LANCZOS or PILImage.BICUBIC)
+                    im = im.convert("RGBA")
                     canvas = PILImage.new("RGBA", (size, size), (255, 255, 255, 0))
                     x = (size - im.size[0]) // 2
                     y = (size - im.size[1]) // 2

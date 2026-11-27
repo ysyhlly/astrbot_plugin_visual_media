@@ -3,9 +3,8 @@
 import os
 from typing import Any
 
-from quart import jsonify, request
-
 from astrbot.api import logger
+from quart import jsonify, request
 
 from ..core.db.index_manager import refresh_search_entry
 from ..core.util.blacklist import add_blacklist_hash

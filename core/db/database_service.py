@@ -20,6 +20,14 @@ from .pending_repository import PendingRepository
 from .schema import DatabaseSchema
 from .source_repository import SourceRepository
 
+try:
+    if __package__ and __package__.count(".") >= 2:
+        from ... import series_panels as _series_panels
+    else:
+        import series_panels as _series_panels
+except Exception:  # pragma: no cover - standalone fallback
+    _series_panels = None  # type: ignore[assignment]
+
 
 class DatabaseService(
     DatabaseSchema,
@@ -36,11 +44,12 @@ class DatabaseService(
     SCHEMA_VERSION = 8
     EXTERNAL_SCHEMA_VERSION = 1
 
-    def __init__(self, db_path: str | Path | None = None):
+    def __init__(self, db_path: str | Path | None = None, *, context: Any = None):
         """初始化数据库服务。
 
         Args:
             db_path: 数据库文件路径，默认为插件数据目录下的 emoji.db
+            context: 可选 AstrBot Context，用于解析资源档位
         """
         if db_path is None:
             from astrbot.api.star import StarTools
@@ -48,6 +57,7 @@ class DatabaseService(
             db_path = Path(StarTools.get_data_dir("astrbot_plugin_visual_media")) / "emoji.db"
 
         self._db_path = Path(db_path)
+        self._context = context
         self._ensure_db_dir()
 
         # 初始化数据库表结构
@@ -71,7 +81,7 @@ class DatabaseService(
     def _get_connection(self):
         """获取数据库连接的上下文管理器。
 
-        使用 WAL 模式支持并发读写。
+        使用 WAL 模式支持并发读写，并应用系列统一 2GB 内存安全 PRAGMA。
         """
         conn = sqlite3.connect(
             self._db_path,
@@ -81,7 +91,20 @@ class DatabaseService(
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA cache_size=-8000")  # 8MB cache
+        applied = False
+        if _series_panels is not None:
+            apply_fn = getattr(_series_panels, "apply_series_sqlite_pragmas", None)
+            if callable(apply_fn):
+                try:
+                    apply_fn(conn, getattr(self, "_context", None), readonly=False)
+                    applied = True
+                except Exception:
+                    pass
+        if not applied:
+            conn.execute("PRAGMA cache_size=-2000")
+            conn.execute("PRAGMA temp_store=FILE")
+            conn.execute("PRAGMA mmap_size=0")
+            conn.execute("PRAGMA journal_size_limit=16777216")
         conn.execute("PRAGMA foreign_keys=ON")  # 启用外键约束，支持 CASCADE
         conn.row_factory = sqlite3.Row
         try:
@@ -417,6 +440,81 @@ class DatabaseService(
             result["scenes"] = [r["scene"] for r in scenes]
             return path, self._hydrate_entry(result)
 
+    def get_emoji_by_hash_and_scope(
+        self,
+        hash_val: str,
+        *,
+        scope_modes: tuple[str, ...] | None = None,
+        origin_target: str | None = None,
+    ) -> tuple[str, dict[str, Any]] | None:
+        """按 hash 与可见范围直查 SQLite，避免拷贝整张表情库快照。"""
+        if not hash_val:
+            return None
+        clauses = ["hash = ?"]
+        params: list[Any] = [hash_val]
+        if scope_modes:
+            placeholders = ",".join("?" for _ in scope_modes)
+            clauses.append(f"scope_mode IN ({placeholders})")
+            params.extend(scope_modes)
+        if origin_target is not None:
+            clauses.append("COALESCE(origin_target, '') = ?")
+            params.append(origin_target)
+        where_sql = " AND ".join(clauses)
+        with self._get_connection() as conn:
+            row = conn.execute(
+                f"""
+                SELECT * FROM emoji
+                WHERE {where_sql}
+                ORDER BY created_at ASC, path ASC
+                LIMIT 1
+                """,
+                tuple(params),
+            ).fetchone()
+            if not row:
+                return None
+            path = row["path"]
+            result = dict(row)
+            tags = conn.execute(
+                "SELECT tag FROM emoji_tag WHERE path = ? ORDER BY rowid", (path,)
+            ).fetchall()
+            result["tags"] = [r["tag"] for r in tags]
+            scenes = conn.execute(
+                "SELECT scene FROM emoji_scene WHERE path = ? ORDER BY rowid", (path,)
+            ).fetchall()
+            result["scenes"] = [r["scene"] for r in scenes]
+            return path, self._hydrate_entry(result)
+
+    def get_emojis_by_hashes(
+        self, hashes: list[str]
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """按一组 hash 批量直查 SQLite，避免全库快照深拷贝。"""
+        clean = list(dict.fromkeys(str(h).strip() for h in hashes if str(h or "").strip()))
+        if not clean:
+            return []
+        out: list[tuple[str, dict[str, Any]]] = []
+        with self._get_connection() as conn:
+            for start in range(0, len(clean), self._RELATED_FETCH_CHUNK_SIZE):
+                batch = clean[start : start + self._RELATED_FETCH_CHUNK_SIZE]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"SELECT * FROM emoji WHERE hash IN ({placeholders})",
+                    tuple(batch),
+                ).fetchall()
+                paths = [r["path"] for r in rows]
+                tags_map = self._load_related_map(
+                    conn, table="emoji_tag", value_column="tag", paths=paths
+                )
+                scenes_map = self._load_related_map(
+                    conn, table="emoji_scene", value_column="scene", paths=paths
+                )
+                for row in rows:
+                    p = row["path"]
+                    entry = dict(row)
+                    entry["tags"] = tags_map.get(p, [])
+                    entry["scenes"] = scenes_map.get(p, [])
+                    out.append((p, self._hydrate_entry(entry)))
+        return out
+
     def get_all_paths(self) -> list[str]:
         """获取所有表情包路径。"""
         with self._get_connection() as conn:
@@ -444,6 +542,16 @@ class DatabaseService(
                 "SELECT path, phash FROM emoji WHERE phash IS NOT NULL AND phash != ''"
             ).fetchall()
             return {r["path"]: r["phash"] for r in rows}
+
+    def get_phash_map_with_revision(self) -> tuple[dict[str, str], tuple[str, str]]:
+        """在单个只读事务内返回 path→phash 映射及其 library_revision。"""
+        with self._get_connection() as conn:
+            conn.execute("BEGIN")
+            version = self._read_library_version(conn)
+            rows = conn.execute(
+                "SELECT path, phash FROM emoji WHERE phash IS NOT NULL AND phash != ''"
+            ).fetchall()
+            return {r["path"]: r["phash"] for r in rows}, version[:2]
 
     def count_total(self) -> int:
         """统计表情包总数。"""

@@ -11,6 +11,8 @@ from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
 
 import pytest
+from astrbot.core.agent.message import ImageURLPart, TextPart
+from astrbot.core.provider.entites import ProviderRequest
 from astrbot_plugin_visual_media import character_check
 from astrbot_plugin_visual_media.core.events.meme_sender_engine import MemeSenderEngine
 from astrbot_plugin_visual_media.core.processing.natural_emotion_analyzer import (
@@ -35,9 +37,6 @@ from PIL import Image
 from test_media_behavior import event as make_event
 from test_media_policy import plugin as make_plugin
 from test_media_policy import tools as make_tools
-
-from astrbot.core.agent.message import ImageURLPart, TextPart
-from astrbot.core.provider.entites import ProviderRequest
 
 
 def _save_test_image(path: Path, size=(640, 640), color=(40, 120, 220, 200)) -> str:

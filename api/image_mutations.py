@@ -7,9 +7,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from quart import jsonify, request
-
 from astrbot.api import logger
+from quart import jsonify, request
 
 from ..core.db.index_manager import delete_index_paths
 from ..core.util.safe_io import safe_remove_file

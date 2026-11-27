@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Any
 
-from .text_similarity import _extract_words
+from .text_similarity import _LRU_MEDIUM, _extract_words
 
 
 def entry_category(data: dict | None) -> str:
@@ -29,7 +29,7 @@ def parse_tags(raw_tags: Any) -> list[str]:
     return []
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=_LRU_MEDIUM)
 def collect_phrase_words(items: tuple[str, ...]) -> frozenset[str]:
     words = set()
     for item in items:
@@ -37,7 +37,7 @@ def collect_phrase_words(items: tuple[str, ...]) -> frozenset[str]:
     return frozenset(words)
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=_LRU_MEDIUM)
 def prepare_entry_text_features(
     category: str,
     desc: str,
@@ -77,3 +77,9 @@ def normalize_category(plugin, category: str) -> str:
         return result or ""
     except Exception:
         return ""
+
+
+def clear_search_feature_caches() -> None:
+    """Clear search feature LRU caches."""
+    collect_phrase_words.cache_clear()
+    prepare_entry_text_features.cache_clear()

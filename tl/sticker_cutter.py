@@ -13,6 +13,11 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+
 from astrbot.api import logger
 
 # (x1, y1, x2, y2)
@@ -429,13 +434,21 @@ class StickerCutter:
         bgra[edge_region, 3] = alpha_edge[edge_region]
         return bgra
 
-    def process_image(self, img: np.ndarray, debug: bool = False):
+    def process_image(
+        self,
+        img: np.ndarray,
+        debug: bool = False,
+        *,
+        max_dim: int | None = None,
+    ):
         """处理单张图片，返回裁剪结果与调试图"""
         try:
             from .adaptive_sticker_splitter import AdaptiveStickerSplitter
 
             adaptive = AdaptiveStickerSplitter()
-            adaptive_crops, adaptive_debug = adaptive.process_image(img, debug=debug)
+            adaptive_crops, adaptive_debug = adaptive.process_image(
+                img, debug=debug, max_dim=max_dim
+            )
             if adaptive_crops:
                 logger.debug(
                     f"使用自适应黑描边分割，共 {len(adaptive_crops)} 个裁剪结果"

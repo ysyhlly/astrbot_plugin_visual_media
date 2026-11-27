@@ -20,6 +20,14 @@ from .core.events.event_context import unwrap_event
 from .core.util.series_config import get_series_bot_names
 from .media_settings import MediaSettings
 
+try:
+    from . import series_panels as _series_panels
+except Exception:  # pragma: no cover - standalone fallback
+    try:
+        import series_panels as _series_panels  # type: ignore[no-redef]
+    except Exception:
+        _series_panels = None  # type: ignore[assignment]
+
 VALID_FREQUENCIES = frozenset({"auto", "less", "off", "more"})
 _HEX24_RE = re.compile(r"^[0-9a-f]{24}$")
 _FALLBACK_SCOPE_PREFIXES = ("群聊 ", "私聊 ", "会话 ")
@@ -129,6 +137,13 @@ class MediaBehavior:
     def connect(self):
         db = sqlite3.connect(self.path, timeout=5)
         db.execute("PRAGMA busy_timeout=5000")
+        if _series_panels is not None:
+            apply_fn = getattr(_series_panels, "apply_series_sqlite_pragmas", None)
+            if callable(apply_fn):
+                try:
+                    apply_fn(db, self._context, readonly=False)
+                except Exception:
+                    pass
         db.row_factory = sqlite3.Row
         try:
             with db:

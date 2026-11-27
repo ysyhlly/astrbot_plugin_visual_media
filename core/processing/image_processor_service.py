@@ -30,11 +30,6 @@ except Exception:
     PILImageFont = None
     LANCZOS = None
 
-try:
-    import numpy as np
-except Exception:
-    np = None
-
 
 class ImageProcessorService:
     """图片处理服务类，负责处理所有与图片相关的操作。"""
@@ -67,6 +62,9 @@ class ImageProcessorService:
         # 图片分类结果缓存，key为图片哈希，value为分类结果元组
         self._image_cache: dict[str, dict] = {}
         self._cache_expire_time = self.CACHE_EXPIRE_TIME
+        # 感知哈希映射缓存（按 library_revision 失效，避免每张入库图全表扫描 SQLite）
+        self._phash_map_cache: dict[str, str] = {}
+        self._phash_map_revision: tuple[str, str] | None = None
 
         # 图片处理锁，防止并发去重竞态
         self._process_lock = asyncio.Lock()
@@ -531,6 +529,27 @@ class ImageProcessorService:
 
     # ── process_image 的辅助方法 ──
 
+    def _get_cached_phash_map(self, db: Any) -> dict[str, str]:
+        """按 library_revision 缓存 path -> phash 映射，仅在索引变更时重新查询。"""
+        version_fn = getattr(db, "get_library_version", None)
+        if callable(version_fn):
+            try:
+                rev = tuple(version_fn()[:2])
+                if rev == self._phash_map_revision:
+                    return self._phash_map_cache
+                with_rev = getattr(db, "get_phash_map_with_revision", None)
+                if callable(with_rev):
+                    phash_map, fresh_rev = with_rev()
+                    self._phash_map_cache = phash_map
+                    self._phash_map_revision = tuple(fresh_rev)
+                    return self._phash_map_cache
+                self._phash_map_cache = db.get_phash_map()
+                self._phash_map_revision = rev
+                return self._phash_map_cache
+            except Exception:
+                pass
+        return db.get_phash_map()
+
     async def _is_duplicate_or_blacklisted(
         self,
         hash_val: str,
@@ -557,7 +576,8 @@ class ImageProcessorService:
                 return True
             image_phash = phash_val or await self._phash_service.compute_phash(file_path)
             if image_phash:
-                for existing_path, existing_phash in db.get_phash_map().items():
+                phash_map = await asyncio.to_thread(self._get_cached_phash_map, db)
+                for existing_path, existing_phash in phash_map.items():
                     distance = self._phash_service.hamming_distance(image_phash, existing_phash)
                     if distance <= self._phash_service.PHASH_HAMMING_THRESHOLD:
                         # Older databases can contain first-frame hashes for animations.

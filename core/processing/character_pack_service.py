@@ -12,10 +12,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from PIL import Image as PILImage
-
 from astrbot.api import logger
-
+from PIL import Image as PILImage
 
 DEFAULT_PACK_EMOTIONS: tuple[tuple[str, str], ...] = (
     ("happy", "开心大笑"),
@@ -451,7 +449,7 @@ class CharacterPackService:
         if not staged:
             raise ValueError("套图预览不存在或已过期，请重新生成")
 
-        chosen = set(int(i) for i in indices) if isinstance(indices, list) and indices else None
+        chosen = {int(i) for i in indices} if isinstance(indices, list) and indices else None
         final_scope = (
             "local"
             if str(scope_mode or staged.get("scope_mode") or "public").strip().lower() == "local"

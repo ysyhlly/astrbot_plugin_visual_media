@@ -4,11 +4,10 @@ import re
 from pathlib import Path
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict
-
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.star import Context, StarTools
+from pydantic import BaseModel, ConfigDict
 
 from ..util.normalization import (
     normalize_category_key,

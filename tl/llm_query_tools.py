@@ -5,13 +5,12 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from pydantic import Field
-from pydantic.dataclasses import dataclass
-
 from astrbot.api import logger
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
+from pydantic import Field
+from pydantic.dataclasses import dataclass
 
 from .core.errors import redact_text
 from .generation_tracker import requester_from_event

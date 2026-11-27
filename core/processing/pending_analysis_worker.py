@@ -6,11 +6,34 @@ from pathlib import Path
 
 from astrbot.api import logger
 
+try:
+    if __package__ and __package__.count(".") >= 2:
+        from ... import series_panels as _series_panels
+    else:
+        import series_panels as _series_panels
+except Exception:  # pragma: no cover - standalone fallback
+    _series_panels = None  # type: ignore[assignment]
+
 
 class PendingAnalysisWorker:
+    IDLE_POLL_TIMEOUT_STANDARD = 60.0
+    IDLE_POLL_TIMEOUT_LOW_MEMORY = 120.0
+
     def __init__(self, plugin):
         self.plugin = plugin
         self.wakeup = asyncio.Event()
+
+    def _idle_poll_timeout(self) -> float:
+        if _series_panels is not None:
+            resolver = getattr(_series_panels, "resolve_series_resource_profile", None)
+            if callable(resolver):
+                try:
+                    profile = resolver(getattr(self.plugin, "context", None))
+                    if profile != "standard":
+                        return self.IDLE_POLL_TIMEOUT_LOW_MEMORY
+                except Exception:
+                    pass
+        return self.IDLE_POLL_TIMEOUT_STANDARD
 
     async def start(self):
         existing = self.plugin.task_scheduler._tasks.get("pending_analysis")
@@ -70,6 +93,8 @@ class PendingAnalysisWorker:
             except Exception as exc:
                 logger.warning(f"审核图片后台队列异常: {exc}")
             try:
-                await asyncio.wait_for(self.wakeup.wait(), timeout=5)
+                await asyncio.wait_for(
+                    self.wakeup.wait(), timeout=self._idle_poll_timeout()
+                )
             except asyncio.TimeoutError:
                 pass

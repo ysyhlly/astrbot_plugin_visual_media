@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
-import textwrap
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -250,7 +248,7 @@ def render_fallback_artwork_card(
     out_root.mkdir(parents=True, exist_ok=True)
 
     digest = hashlib.sha256(
-        f"{style_key}|{prompt}|{persona_name}|{source_plugin}".encode("utf-8")
+        f"{style_key}|{prompt}|{persona_name}|{source_plugin}".encode()
     ).hexdigest()[:16]
     dest = out_root / f"{style_key}_{digest}.png"
 
@@ -415,7 +413,7 @@ def ensure_meme_thumbnail(
         tdir.mkdir(parents=True, exist_ok=True)
         stat = src.stat()
         key = hashlib.sha256(
-            f"{src.resolve()}|{stat.st_mtime_ns}|{stat.st_size}|{max_size}".encode("utf-8")
+            f"{src.resolve()}|{stat.st_mtime_ns}|{stat.st_size}|{max_size}".encode()
         ).hexdigest()[:20]
         dest = tdir / f"thumb_{key}.png"
         if dest.is_file():

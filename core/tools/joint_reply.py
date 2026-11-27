@@ -898,13 +898,23 @@ async def prepare_joint_reply(plugin, event, request):
             prefetch = joint_prefetch.start_joint_prefetch(plugin, event)
         if prefetch is not None:
             joined = time.monotonic()
+            if explicit_media:
+                wait_seconds = None
+            else:
+                try:
+                    already_elapsed = max(
+                        0.0, joined - float(getattr(prefetch, "started", joined))
+                    )
+                except (TypeError, ValueError):
+                    already_elapsed = 0.0
+                wait_seconds = min(0.35, max(0.08, 0.35 - already_elapsed))
             try:
                 candidates = (
                     await prefetch.result(
                         plugin,
                         event,
                         query,
-                        wait_seconds=None if explicit_media else 0.35,
+                        wait_seconds=wait_seconds,
                     )
                     or []
                 )

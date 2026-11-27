@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
 from astrbot.api import logger
 from astrbot.api.star import StarTools
 
@@ -56,7 +55,7 @@ class EmbeddingService:
     # 供应商故障时同一类 WARN 的抑制窗口（秒），避免欠费/额度不足时刷屏
     DEGRADED_LOG_INTERVAL_SECONDS = 300.0
     # 实时查询向量内存 LRU/TTL 缓存参数
-    QUERY_CACHE_MAX_ENTRIES = 512
+    QUERY_CACHE_MAX_ENTRIES = 64
     QUERY_CACHE_TTL_SECONDS = 600.0
 
     def __init__(self, plugin: Any) -> None:
@@ -89,7 +88,7 @@ class EmbeddingService:
         self._warning_log_at: dict[str, float] = {}
         self._initialized: bool = False
         self._bg_tasks: set[asyncio.Task[Any]] = set()
-        self._query_embedding_cache: OrderedDict[tuple[str, str], tuple[float, list[float]]] = OrderedDict()
+        self._query_embedding_cache: OrderedDict[tuple[str, str], tuple[float, np.ndarray]] = OrderedDict()
 
     # ═══════════════════════════════════════════════════
     #  嵌入提供商查找
@@ -410,7 +409,6 @@ class EmbeddingService:
 
         try:
             import faiss  # noqa: F401
-
             from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
         except ImportError:
             logger.info("[Embedding] faiss 未安装，降级 numpy")
@@ -611,11 +609,15 @@ class EmbeddingService:
                 continue
 
         if vectors:
-            mat = np.stack(vectors, axis=0)
-            # 对向量执行 L2 归一化，以点积计算余弦相似度。
+            mat = np.empty((len(vectors), dim), dtype=np.float32)
+            for idx, vec in enumerate(vectors):
+                mat[idx] = vec
+            vectors.clear()
+            # 原地 L2 归一化，避免 mat / norms 产生额外整矩阵拷贝。
             norms = np.linalg.norm(mat, axis=1, keepdims=True)
-            norms = np.where(norms == 0, 1.0, norms)
-            self._fallback_matrix = mat / norms
+            norms[norms == 0] = 1.0
+            mat /= norms
+            self._fallback_matrix = mat
             self._fallback_paths = paths
             self._fallback_dim = dim
             logger.info(f"[Embedding] numpy 降级矩阵已加载: {len(paths)} 条 (dim={dim})")
@@ -857,6 +859,24 @@ class EmbeddingService:
             return None
         return (self._fallback_signature(provider), normalized)
 
+    def _effective_query_cache_max_entries(self) -> int:
+        configured = max(1, int(self.QUERY_CACHE_MAX_ENTRIES))
+        sp = _load_series_panels()
+        if sp is not None:
+            getter = getattr(sp, "get_series_resource_limits", None)
+            if callable(getter):
+                try:
+                    ctx = getattr(self.plugin, "context", None)
+                    limits = getter(ctx)
+                    if isinstance(limits, dict):
+                        profile_cap = max(
+                            1, int(limits.get("visual_embedding_query_cache", configured))
+                        )
+                        return min(configured, profile_cap)
+                except Exception:
+                    pass
+        return configured
+
     def get_cached_query_embedding(self, provider: Any, query: str) -> list[float] | None:
         """读取未过期的查询向量缓存并刷新 LRU 顺序。"""
         key = self._query_cache_key(provider, query)
@@ -870,20 +890,21 @@ class EmbeddingService:
             self._query_embedding_cache.pop(key, None)
             return None
         self._query_embedding_cache.move_to_end(key)
-        return list(vector)
+        return vector.tolist() if isinstance(vector, np.ndarray) else list(vector)
 
     def set_cached_query_embedding(
         self, provider: Any, query: str, vector: list[float]
     ) -> None:
-        """写入查询向量 LRU/TTL 缓存。"""
+        """写入查询向量 LRU/TTL 缓存（以紧凑 float32 数组存储）。"""
         key = self._query_cache_key(provider, query)
-        if key is None or not vector:
+        if key is None or vector is None or len(vector) == 0:
             return
-        max_entries = max(1, int(self.QUERY_CACHE_MAX_ENTRIES))
+        max_entries = self._effective_query_cache_max_entries()
         ttl = max(0.0, float(self.QUERY_CACHE_TTL_SECONDS))
         if ttl <= 0:
             return
-        self._query_embedding_cache[key] = (time.monotonic() + ttl, list(vector))
+        compact = np.asarray(vector, dtype=np.float32)
+        self._query_embedding_cache[key] = (time.monotonic() + ttl, compact)
         self._query_embedding_cache.move_to_end(key)
         while len(self._query_embedding_cache) > max_entries:
             self._query_embedding_cache.popitem(last=False)

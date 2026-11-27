@@ -39,6 +39,14 @@ from .requests import GenerationRequest
 from .results import GenerationResult
 from .states import TERMINAL_STATES, JobState, can_transition, coerce_state
 
+try:
+    if __package__ and __package__.count(".") >= 2:
+        from ... import series_panels as _series_panels
+    else:
+        import series_panels as _series_panels
+except Exception:  # pragma: no cover - standalone fallback
+    _series_panels = None  # type: ignore[assignment]
+
 _WriteResult = TypeVar("_WriteResult")
 
 _SCHEMA_VERSION = 6
@@ -253,6 +261,7 @@ class SQLiteJobStore:
         self._stale_owner_ids: set[str] = set()
         self._recover_ownerless = False
         self.fencing_token = 0
+        self._hardened_paths: set[Path] = set()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._harden_permissions()
         self._connection = sqlite3.connect(
@@ -283,17 +292,25 @@ class SQLiteJobStore:
         if self._closed:
             raise ServiceClosedError("JobStore 已关闭")
 
-    def _harden_permissions(self) -> None:
+    def _harden_permissions(self, *, only_new: bool = False) -> None:
         """Keep the database and SQLite sidecars private to this account."""
+        hardened = getattr(self, "_hardened_paths", None)
         try:
-            os.chmod(self.data_dir, 0o700)
+            if not only_new or hardened is None or self.data_dir not in hardened:
+                os.chmod(self.data_dir, 0o700)
+                if hardened is not None:
+                    hardened.add(self.data_dir)
             for path in (
                 self.path,
                 Path(f"{self.path}-wal"),
                 Path(f"{self.path}-shm"),
             ):
+                if only_new and hardened is not None and path in hardened:
+                    continue
                 if path.exists():
                     os.chmod(path, 0o600)
+                    if hardened is not None:
+                        hardened.add(path)
         except OSError as exc:
             raise ServiceClosedError("JobStore 数据文件权限设置失败") from exc
 
@@ -371,6 +388,13 @@ class SQLiteJobStore:
             self._connection.execute("PRAGMA synchronous=FULL")
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.execute("PRAGMA busy_timeout=30000")
+            if _series_panels is not None:
+                apply_fn = getattr(_series_panels, "apply_series_sqlite_pragmas", None)
+                if callable(apply_fn):
+                    try:
+                        apply_fn(self._connection, readonly=False)
+                    except Exception:
+                        pass
 
     def _transaction(self):
         class Transaction:
@@ -394,7 +418,8 @@ class SQLiteJobStore:
                     if exc_type is None:
                         try:
                             self.store._connection.execute("COMMIT")
-                            self.store._harden_permissions()
+                            if len(self.store._hardened_paths) < 4:
+                                self.store._harden_permissions(only_new=True)
                         except BaseException:
                             self.store._rollback_best_effort()
                             self.store._mark_broken()

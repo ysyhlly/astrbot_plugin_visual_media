@@ -176,7 +176,7 @@ class JointReplyPrefetch:
 
     async def _local_fallback_candidates(self, plugin, event, wait_seconds: float | None):
         """Return local-recall candidates (overlay/character/scene/BM25) when embedding wait expires."""
-        fallback_timeout = max(0.25, float(wait_seconds or 0.35))
+        fallback_timeout = min(0.18, max(0.12, float(wait_seconds or 0.25) * 0.6))
         try:
             _outcome, local_rows, _version = await asyncio.wait_for(
                 self._search(local_only=True), timeout=fallback_timeout

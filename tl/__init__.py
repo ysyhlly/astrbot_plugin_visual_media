@@ -6,9 +6,6 @@ from .help_renderer import render_local_pillow as render_local_pillow
 from .help_renderer import render_text as render_text
 from .image_generator import ImageGenerator as ImageGenerator
 from .image_handler import ImageHandler as ImageHandler
-from .image_splitter import create_zip as create_zip
-from .image_splitter import resolve_split_source_to_path as resolve_split_source_to_path
-from .image_splitter import split_image as split_image
 from .key_manager import KeyManager as KeyManager
 from .llm_tools import GeminiImageGenerationTool as GeminiImageGenerationTool
 from .message_sender import MessageSender as MessageSender
@@ -18,3 +15,17 @@ from .plugin_config import PluginConfig as PluginConfig
 from .rate_limiter import RateLimiter as RateLimiter
 from .tl_utils import get_temp_dir as get_temp_dir
 from .vision_handler import VisionHandler as VisionHandler
+
+_LAZY_SPLITTER_EXPORTS = frozenset(
+    {"create_zip", "resolve_split_source_to_path", "split_image"}
+)
+
+
+def __getattr__(name: str):
+    if name in _LAZY_SPLITTER_EXPORTS:
+        from . import image_splitter
+
+        value = getattr(image_splitter, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

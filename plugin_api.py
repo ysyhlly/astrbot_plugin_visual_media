@@ -266,7 +266,11 @@ class PluginAPI(
         return result
 
 
-    def _file_base64(self, file_path: str) -> str:
+    def _file_base64(self, file_path: str, *, max_bytes: int | None = None) -> str:
+        if max_bytes is not None and max_bytes > 0:
+            size = Path(file_path).stat().st_size
+            if size > max_bytes:
+                raise ValueError(f"file exceeds base64 limit ({size} > {max_bytes})")
         with open(file_path, "rb") as f:
             raw = f.read()
         ext = Path(file_path).suffix.lower()

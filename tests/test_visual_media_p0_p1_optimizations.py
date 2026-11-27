@@ -565,6 +565,142 @@ async def test_joint_prefetch_returns_local_fallback_when_wait_seconds_expires()
     assert prefetch.outcome == "local_fallback"
 
 
+@pytest.mark.asyncio
+async def test_joint_prefetch_local_fallback_timeout_is_capped():
+    from core.tools.joint_prefetch import JointReplyPrefetch
+
+    class _TurnState:
+        def __init__(self):
+            self.candidates = []
+
+        def get_candidates(self):
+            return list(self.candidates)
+
+    class _Event:
+        unified_msg_origin = "g:2"
+
+        def __init__(self):
+            self._extras = {}
+            self._emoji_turn_state = {}
+
+        def get_platform_id(self):
+            return "qq"
+
+        def get_self_id(self):
+            return "bot1"
+
+        def get_sender_id(self):
+            return "u1"
+
+    class _SlowPlugin:
+        def __init__(self):
+            self.plugin_config = SimpleNamespace(
+                llm_joint_reply=True,
+                auto_send_meme=True,
+                get_event_target=lambda _e: ("group", "2"),
+            )
+            self.db_service = SimpleNamespace(get_library_version=lambda: 1)
+            self.meme_selector = SimpleNamespace(
+                is_path_allowed_for_event=lambda _p, _e: True
+            )
+            self._emoji_sender_engine = SimpleNamespace(
+                emoji_turn_state=lambda ev: ev._emoji_turn_state.setdefault(
+                    "state", _TurnState()
+                )
+            )
+
+        def is_send_enabled_for_event(self, _ev):
+            return True
+
+        async def _search_meme_impl(self, ev, query, *, on_outcome=None):
+            await asyncio.sleep(2.0)
+            yield "never"
+
+    plugin = _SlowPlugin()
+    event = _Event()
+    prefetch = JointReplyPrefetch(plugin, event, "早安")
+    t0 = time.monotonic()
+    try:
+        # 0.08s join wait + capped 0.12s local fallback = ~0.20s (well below old 0.35+0.35s)
+        candidates = await prefetch.result(plugin, event, "早安", wait_seconds=0.08)
+    finally:
+        await prefetch.close()
+    elapsed = time.monotonic() - t0
+
+    assert candidates == []
+    assert prefetch.outcome == "timeout"
+    assert elapsed < 0.35, f"Expected capped join+fallback wait <0.35s, took {elapsed:.3f}s"
+
+
+@pytest.mark.asyncio
+async def test_prepare_joint_reply_bounds_non_explicit_wait_by_prefetch_elapsed(
+    monkeypatch,
+):
+    from core.tools import joint_prefetch, joint_reply
+
+    observed_waits: list[float | None] = []
+    now = [100.0]
+    monkeypatch.setattr(joint_reply.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        joint_reply, "attach_temporary_candidates", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(
+        joint_reply, "is_vibe_serious_for_event", lambda _p, _e: (False, "")
+    )
+
+    class _FakePrefetch:
+        def __init__(self, started: float):
+            self.started = started
+            self.outcome = "candidates"
+            self.cache_reason = "bypass"
+
+        async def result(self, _plugin, _event, _query, *, wait_seconds=None):
+            observed_waits.append(wait_seconds)
+            return []
+
+        async def close(self):
+            return None
+
+    plugin = SimpleNamespace(
+        plugin_config=SimpleNamespace(llm_joint_reply=True, auto_send_meme=True),
+        _emoji_sender_engine=SimpleNamespace(is_command_event=lambda _e: False),
+        media_behavior=None,
+    )
+
+    cases = [
+        ("哈哈哈哈", 99.50, 0.08),   # elapsed 0.50s > 0.35s -> floor 0.08s
+        ("哈哈哈哈", 99.80, 0.15),   # elapsed 0.20s -> remaining 0.15s
+        ("哈哈哈哈", 100.0, 0.35),   # elapsed 0.00s -> cap 0.35s
+        ("发个表情包", 99.50, None),  # explicit media -> unbounded (None)
+    ]
+    for query, started, expected_wait in cases:
+        fake_prefetch = _FakePrefetch(started=started)
+        monkeypatch.setattr(
+            joint_prefetch,
+            "start_joint_prefetch",
+            lambda _p, _e, fp=fake_prefetch: fp,
+        )
+        extras = {}
+        ev = SimpleNamespace(
+            _cd_joint_meme_supported_v1=True,
+            _cd_original_user_text_v1=query,
+            get_extra=lambda k, d=None, ex=extras: ex.get(k, d),
+            set_extra=lambda k, v, ex=extras: ex.__setitem__(k, v),
+        )
+        req = SimpleNamespace(
+            system_prompt="base",
+            extra_user_content_parts=[],
+            func_tool=None,
+        )
+        assert await joint_reply.prepare_joint_reply(plugin, ev, req) is True
+
+        actual = observed_waits[-1]
+        if expected_wait is None:
+            assert actual is None
+        else:
+            assert actual == pytest.approx(expected_wait, abs=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # P1-1: OpenAI compat parallel ref prep, dead assignment removed, refusal fail-fast & retry cap
 # ---------------------------------------------------------------------------

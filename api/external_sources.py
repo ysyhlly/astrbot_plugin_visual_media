@@ -5,9 +5,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from quart import jsonify, request
-
 from astrbot.api import logger
+from quart import jsonify, request
 
 from ..core.sources.models import ExternalSourceError, ExternalSourceSecurityError
 from ..core.util.safe_io import safe_remove_file

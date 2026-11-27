@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any, Final
 
 import aiohttp
-
 from astrbot.api import logger
 
 from ..api_types import APIError, ApiRequestConfig

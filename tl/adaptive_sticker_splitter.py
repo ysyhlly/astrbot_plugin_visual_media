@@ -17,6 +17,19 @@ from scipy.ndimage import distance_transform_edt, maximum_filter
 from skimage import filters, graph
 from skimage.segmentation import slic, watershed
 
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+
+try:
+    if __package__ and "." in __package__:
+        from .. import series_panels as _series_panels
+    else:
+        import series_panels as _series_panels
+except Exception:  # pragma: no cover - standalone fallback
+    _series_panels = None  # type: ignore[assignment]
+
 
 class AdaptiveStickerSplitter:
     """针对白底动漫表情包的自适应分割器。"""
@@ -24,6 +37,7 @@ class AdaptiveStickerSplitter:
     def __init__(self) -> None:
         self.last_panel_labels: np.ndarray | None = None
         self.last_expanded_labels: np.ndarray | None = None
+        self.last_panel_boxes: list[tuple[int, int, int, int]] = []
 
     @staticmethod
     def _ensure_bgr(image: np.ndarray) -> np.ndarray:
@@ -1566,10 +1580,16 @@ class AdaptiveStickerSplitter:
         expanded_labels: np.ndarray,
         fg_raw: np.ndarray,
         fg_detail: np.ndarray,
+        *,
+        orig_image: np.ndarray | None = None,
     ) -> list[np.ndarray]:
-        h, w = image.shape[:2]
+        work_h, work_w = image.shape[:2]
+        target_image = orig_image if orig_image is not None else image
+        orig_h, orig_w = target_image.shape[:2]
+        scaled = (orig_h != work_h) or (orig_w != work_w)
         n_panels = int(expanded_labels.max())
         crops: list[np.ndarray] = []
+        boxes_out: list[tuple[int, int, int, int]] = []
 
         for li in range(1, n_panels + 1):
             panel_mask = expanded_labels == li
@@ -1585,19 +1605,47 @@ class AdaptiveStickerSplitter:
 
             pad = int(min(rw, rh) * 0.05)
             rx0, ry0 = max(0, rx - pad), max(0, ry - pad)
-            rx1, ry1 = min(w, rx + rw + pad), min(h, ry + rh + pad)
+            rx1, ry1 = min(work_w, rx + rw + pad), min(work_h, ry + rh + pad)
 
-            crop_img = image[ry0:ry1, rx0:rx1]
-            local_labels = expanded_labels[ry0:ry1, rx0:rx1]
+            if scaled:
+                ox0 = max(0, int(round(rx0 * orig_w / work_w)))
+                oy0 = max(0, int(round(ry0 * orig_h / work_h)))
+                ox1 = min(orig_w, max(ox0 + 1, int(round(rx1 * orig_w / work_w))))
+                oy1 = min(orig_h, max(oy0 + 1, int(round(ry1 * orig_h / work_h))))
+                boxes_out.append((ox0, oy0, ox1 - ox0, oy1 - oy0))
+                crop_img = target_image[oy0:oy1, ox0:ox1]
+                out_size = (ox1 - ox0, oy1 - oy0)
+                local_labels = cv2.resize(
+                    expanded_labels[ry0:ry1, rx0:rx1].astype(np.int32),
+                    out_size,
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                local_fg_raw = cv2.resize(
+                    fg_raw[ry0:ry1, rx0:rx1],
+                    out_size,
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                local_fg_detail = cv2.resize(
+                    fg_detail[ry0:ry1, rx0:rx1],
+                    out_size,
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            else:
+                boxes_out.append((rx0, ry0, rx1 - rx0, ry1 - ry0))
+                crop_img = image[ry0:ry1, rx0:rx1]
+                local_labels = expanded_labels[ry0:ry1, rx0:rx1]
+                local_fg_raw = fg_raw[ry0:ry1, rx0:rx1]
+                local_fg_detail = fg_detail[ry0:ry1, rx0:rx1]
+
             panel_crop = (local_labels == li).astype(np.uint8) * 255
-            crop_alpha = cv2.bitwise_and(fg_raw[ry0:ry1, rx0:rx1], panel_crop)
+            crop_alpha = cv2.bitwise_and(local_fg_raw, panel_crop)
             crop_alpha = self._refine_crop_alpha(crop_alpha)
             crop_rgba = self._restore_soft_edge_rgba(
                 crop_img,
                 local_labels,
                 li,
                 crop_alpha,
-                fg_detail[ry0:ry1, rx0:rx1],
+                local_fg_detail,
             )
 
             ys_a, xs_a = np.where(crop_rgba[:, :, 3] > 0)
@@ -1644,14 +1692,44 @@ class AdaptiveStickerSplitter:
                 )
             crops.append(crop_rgba)
 
+        self.last_panel_boxes = boxes_out
         return crops
+
+    @staticmethod
+    def _resolve_default_max_dim() -> int:
+        if _series_panels is not None:
+            getter = getattr(_series_panels, "get_series_resource_limits", None)
+            if callable(getter):
+                try:
+                    limits = getter()
+                    if isinstance(limits, dict):
+                        return max(512, int(limits.get("visual_sticker_max_dim", 2048)))
+                except Exception:
+                    pass
+        return 2048
 
     def process_image(
         self,
         image: np.ndarray,
         debug: bool = False,
+        *,
+        max_dim: int | None = None,
     ) -> tuple[list[np.ndarray], np.ndarray | None]:
-        bgr = self._ensure_bgr(image)
+        orig_bgr = self._ensure_bgr(image)
+        orig_h, orig_w = orig_bgr.shape[:2]
+        cap = (
+            max(512, int(max_dim))
+            if max_dim is not None and int(max_dim) > 0
+            else self._resolve_default_max_dim()
+        )
+        longest = max(orig_h, orig_w)
+        if longest > cap:
+            scale = cap / float(longest)
+            work_w = max(1, int(round(orig_w * scale)))
+            work_h = max(1, int(round(orig_h * scale)))
+            bgr = cv2.resize(orig_bgr, (work_w, work_h), interpolation=cv2.INTER_AREA)
+        else:
+            bgr = orig_bgr
         fg_raw = self._make_fg_raw(bgr)
         fg_detail = self._make_fg_detail(bgr)
         fg_struct = self._make_fg_struct(fg_raw)
@@ -1659,6 +1737,7 @@ class AdaptiveStickerSplitter:
         if int(panel_labels.max()) == 0:
             self.last_panel_labels = panel_labels
             self.last_expanded_labels = panel_labels
+            self.last_panel_boxes = []
             return [], None
 
         expanded = self._expand_labels(panel_labels, fg_raw, fg_struct)
@@ -1691,7 +1770,13 @@ class AdaptiveStickerSplitter:
                 vertical=True,
             )
 
-        crops = self._extract_crops(bgr, expanded, fg_raw, fg_detail)
+        crops = self._extract_crops(
+            bgr,
+            expanded,
+            fg_raw,
+            fg_detail,
+            orig_image=orig_bgr if bgr is not orig_bgr else None,
+        )
         self.last_panel_labels = panel_labels
         self.last_expanded_labels = expanded
         debug_img = self._build_debug_image(bgr, expanded) if debug else None

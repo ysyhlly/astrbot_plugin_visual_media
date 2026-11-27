@@ -16,6 +16,14 @@ from astrbot.core.platform.message_session import MessageSession
 
 from .tl.core.errors import redact_text
 
+try:
+    from . import series_panels as _series_panels
+except Exception:  # pragma: no cover - standalone fallback
+    try:
+        import series_panels as _series_panels  # type: ignore[no-redef]
+    except Exception:
+        _series_panels = None  # type: ignore[assignment]
+
 TERMINAL = {"succeeded", "partial_success", "failed", "interrupted"}
 
 
@@ -74,6 +82,13 @@ class MediaTasks:
     def _connect(self):
         with closing(sqlite3.connect(self.path, timeout=5)) as db:
             db.execute("PRAGMA busy_timeout=5000")
+            if _series_panels is not None:
+                apply_fn = getattr(_series_panels, "apply_series_sqlite_pragmas", None)
+                if callable(apply_fn):
+                    try:
+                        apply_fn(db, getattr(self.owner, "context", None), readonly=False)
+                    except Exception:
+                        pass
             yield db
 
     def _update(self, key, fields, defaults=False):
