@@ -108,11 +108,15 @@ class VisualMediaPlugin(Star):
             self.tasks = await asyncio.to_thread(MediaTasks, self)
             from .core.commands.crowd_curation import CrowdCurationService
             from .core.commands.make_meme_service import MakeMemeService
+            from .core.events.vibe_bus import VibeEventBusBridge
             from .core.processing.character_pack_service import CharacterPackService
 
             self.character_pack = CharacterPackService(self)
             self.make_meme_service = MakeMemeService(self)
             self.crowd_curation = CrowdCurationService(self)
+            self.vibe_bus = VibeEventBusBridge(self)
+            self.memes.vibe_state = self.vibe_bus.cache
+            self.vibe_bus.subscribe()
             self.media_api = MediaAPI(self)
             self.media_api.register(self.engine_context)
             from importlib import reload
@@ -134,6 +138,11 @@ class VisualMediaPlugin(Star):
         if self._closed:
             return
         self._closed = True
+        if getattr(self, "vibe_bus", None) is not None:
+            try:
+                self.vibe_bus.unsubscribe()
+            except Exception:
+                pass
         if getattr(self, "library", None) is not None:
             await self.library.close()
         if getattr(self, "tasks", None) is not None:
@@ -1058,6 +1067,10 @@ class VisualMediaPlugin(Star):
             except Exception:
                 pass
 
+        vibe_bus = getattr(self, "vibe_bus", None)
+        if vibe_bus is not None and callable(getattr(vibe_bus, "subscribe", None)):
+            vibe_bus.subscribe()
+
         ready = (self.memes is not None) and (self.generation is not None)
         return {
             "ok": True,
@@ -1067,6 +1080,18 @@ class VisualMediaPlugin(Star):
             "generation_ready": gen_ready,
             "reason": "activated",
         }
+
+    def _artwork_fallback_dir(self) -> Path:
+        gen_dir = getattr(getattr(self, "generation", None), "_plugin_data_dir", None)
+        if gen_dir:
+            return Path(gen_dir) / "images"
+        meme_dir = getattr(getattr(self, "memes", None), "base_dir", None)
+        if meme_dir:
+            return Path(meme_dir) / "images"
+        lib_dir = getattr(getattr(self, "library", None), "root", None)
+        if lib_dir:
+            return Path(lib_dir) / "images"
+        return Path(__file__).resolve().parent / ".series_fallback_cache"
 
     async def generate_series_artwork(
         self,
@@ -1078,7 +1103,12 @@ class VisualMediaPlugin(Star):
         reference_character: str = "",
         source_plugin: str = "",
     ) -> dict[str, Any]:
-        """Cross-plugin rate-limited artwork/polaroid generator for series companions."""
+        """Cross-plugin rate-limited multi-style artwork generator with Pillow fallback cards."""
+        from .core.processing.series_artwork_service import (
+            build_series_artwork_prompt,
+            render_fallback_artwork_card,
+        )
+
         clean_prompt = str(prompt or "").strip()
         if not clean_prompt:
             return {
@@ -1086,15 +1116,19 @@ class VisualMediaPlugin(Star):
                 "image_path": "",
                 "image_url": "",
                 "task_id": "",
+                "style": str(style or "polaroid"),
+                "fallback": False,
                 "error": "prompt 不能为空",
             }
-        if getattr(self, "_closed", False) or self.generation is None:
+        if getattr(self, "_closed", False):
             return {
                 "ok": False,
                 "image_path": "",
                 "image_url": "",
                 "task_id": "",
-                "error": "视觉工坊生图服务未就绪",
+                "style": str(style or "polaroid"),
+                "fallback": False,
+                "error": "视觉工坊已关闭",
             }
 
         target_umo = str(umo or "").strip()
@@ -1105,21 +1139,10 @@ class VisualMediaPlugin(Star):
                 "image_path": "",
                 "image_url": "",
                 "task_id": "",
+                "style": str(style or "polaroid"),
+                "fallback": False,
                 "error": "当前会话已被主控排除",
             }
-        if target_umo and group_id:
-            limiter = getattr(self.generation, "rate_limiter", None)
-            if limiter is not None and callable(getattr(limiter, "allows_group", None)):
-                if not limiter.allows_group(
-                    SimpleNamespace(group_id=group_id, unified_msg_origin=target_umo)
-                ):
-                    return {
-                        "ok": False,
-                        "image_path": "",
-                        "image_url": "",
-                        "task_id": "",
-                        "error": "当前群未启用图像生成",
-                    }
 
         # Resolve optional character profile & references
         char_hint = str(reference_character or "").strip()
@@ -1143,14 +1166,11 @@ class VisualMediaPlugin(Star):
                 break
 
         refs: list[str] = []
-        prompt_parts: list[str] = []
+        persona_display = ""
         if matched_profile is not None:
-            appearance = str(matched_profile.get("appearance") or "").strip()
-            profile_style = str(matched_profile.get("style") or "").strip()
-            if appearance:
-                prompt_parts.append(appearance)
-            if profile_style:
-                prompt_parts.append(profile_style)
+            persona_display = str(
+                matched_profile.get("name") or matched_profile.get("key") or ""
+            ).strip()
             lib = getattr(self, "library", None)
             if lib is not None and callable(getattr(lib, "reference_path", None)):
                 for ref_hash in matched_profile.get("references") or []:
@@ -1158,19 +1178,73 @@ class VisualMediaPlugin(Star):
                         refs.append(str(lib.reference_path(ref_hash)))
                     except Exception:
                         continue
+        else:
+            persona_display = char_hint or persona_hint
 
-        style_presets = {
-            "polaroid": "拍立得相纸风格，柔和自然光，留白相框质感，温暖纪实氛围",
-            "poster": "精致活动纪念海报构图，清晰主体与氛围光影",
-            "postcard": "旅途风景明信片插画质感，通透色彩与细腻光影",
-            "sticker": "简洁 Q 版表情贴纸风格，清晰轮廓，高辨识度神态",
-        }
-        clean_style = str(style or "").strip()
-        if clean_style:
-            style_desc = style_presets.get(clean_style.lower(), clean_style)
-            prompt_parts.append(f"画面风格：{style_desc}")
-        prompt_parts.append(clean_prompt)
-        final_prompt = "\n".join(part for part in prompt_parts if part)
+        final_prompt, style_key = build_series_artwork_prompt(
+            clean_prompt,
+            style=style,
+            profile=matched_profile,
+        )
+
+        async def _pillow_fallback(reason: str, task_id_val: str = "") -> dict[str, Any]:
+            try:
+                dir_fn = getattr(self, "_artwork_fallback_dir", None)
+                out_dir = (
+                    dir_fn()
+                    if callable(dir_fn)
+                    else Path(
+                        getattr(getattr(self, "generation", None), "_plugin_data_dir", None)
+                        or getattr(getattr(self, "memes", None), "base_dir", None)
+                        or getattr(getattr(self, "library", None), "root", ".")
+                    )
+                    / "images"
+                )
+                card_path = await asyncio.to_thread(
+                    render_fallback_artwork_card,
+                    clean_prompt,
+                    style=style_key,
+                    output_dir=out_dir,
+                    persona_name=persona_display,
+                    source_plugin=str(source_plugin or ""),
+                    reason=reason,
+                )
+                return {
+                    "ok": True,
+                    "image_path": card_path,
+                    "image_url": "",
+                    "task_id": task_id_val,
+                    "style": style_key,
+                    "fallback": True,
+                    "fallback_reason": reason,
+                    "error": "",
+                }
+            except Exception as fb_exc:
+                return {
+                    "ok": False,
+                    "image_path": "",
+                    "image_url": "",
+                    "task_id": task_id_val,
+                    "style": style_key,
+                    "fallback": True,
+                    "fallback_reason": reason,
+                    "error": f"{reason}; fallback render failed: {fb_exc}",
+                }
+
+        if self.generation is None:
+            return await _pillow_fallback("generation_unavailable")
+
+        if target_umo and group_id:
+            limiter = getattr(self.generation, "rate_limiter", None)
+            if limiter is not None and callable(getattr(limiter, "allows_group", None)):
+                if not limiter.allows_group(
+                    SimpleNamespace(group_id=group_id, unified_msg_origin=target_umo)
+                ):
+                    return await _pillow_fallback("group_generation_disabled")
+
+        # If real engine explicitly reports api_client is None (no provider configured), degrade cleanly
+        if hasattr(self.generation, "api_client") and getattr(self.generation, "api_client") is None:
+            return await _pillow_fallback("provider_unavailable")
 
         caller_id = str(source_plugin or "series_companion").strip()[:120] or "series_companion"
         service_umo = target_umo if target_umo.count(":") >= 2 else None
@@ -1216,23 +1290,14 @@ class VisualMediaPlugin(Star):
                     "image_path": image_path,
                     "image_url": image_url,
                     "task_id": task_id,
+                    "style": style_key,
+                    "fallback": False,
                     "error": "",
                 }
-            return {
-                "ok": False,
-                "image_path": image_path,
-                "image_url": image_url,
-                "task_id": task_id,
-                "error": str(task.get("error") or task.get("message") or f"生成失败 ({status})"),
-            }
+            reason = str(task.get("error") or task.get("message") or f"generation_{status or 'failed'}")
+            return await _pillow_fallback(reason, task_id_val=task_id)
         except Exception as exc:
-            return {
-                "ok": False,
-                "image_path": "",
-                "image_url": "",
-                "task_id": task_id,
-                "error": str(exc),
-            }
+            return await _pillow_fallback(str(exc), task_id_val=task_id)
 
     def get_group_top_memes(
         self,
@@ -1241,7 +1306,7 @@ class VisualMediaPlugin(Star):
         keyword: str = "",
         limit: int = 5,
     ) -> list[dict[str, Any]]:
-        """Return top memes visible in ``umo`` (for chronicle /meme-evolution & companions)."""
+        """Return top memes visible in ``umo`` with semantic/tag matching, frequency & thumbnail path."""
         try:
             if getattr(self, "_closed", False) or self.memes is None:
                 return []
@@ -1255,9 +1320,21 @@ class VisualMediaPlugin(Star):
             if target_umo and self._is_excluded_by_core(umo=target_umo, group_id=group_id):
                 return []
 
-            kw = str(keyword or "").strip().casefold()
-            kw_tokens = [tok for tok in kw.split() if tok] if kw else []
-            ranked: list[tuple[tuple[int, int, int, int, int], dict[str, Any]]] = []
+            from pathlib import Path as _Path
+
+            from .core.processing.series_artwork_service import ensure_meme_thumbnail
+            from .core.search.text_similarity import (
+                calculate_hybrid_similarity,
+                tokenize_for_bm25,
+            )
+
+            kw_raw = str(keyword or "").strip()
+            kw = kw_raw.casefold()
+            kw_tokens = set(tokenize_for_bm25(kw_raw)) if kw_raw else set()
+            kw_ws_tokens = [tok for tok in kw.split() if tok] if kw else []
+            ranked: list[tuple[tuple[float, int, int, int, int], dict[str, Any]]] = []
+            total_visible_uses = 0
+            visible_items: list[tuple[str, dict[str, Any], bool]] = []
 
             for path, meta in self._safe_meme_index().items():
                 if not isinstance(meta, dict):
@@ -1271,7 +1348,18 @@ class VisualMediaPlugin(Star):
                 )
                 if scope_mode != "public" and not origin_matched:
                     continue
+                try:
+                    total_visible_uses += max(0, int(meta.get("use_count") or 0))
+                except (TypeError, ValueError):
+                    pass
+                visible_items.append((str(path), meta, origin_matched))
 
+            base_dir = getattr(self.memes, "base_dir", None)
+            thumb_dir = _Path(base_dir) / "thumbnails" if base_dir else None
+
+            for path, meta, origin_matched in visible_items:
+                scope_mode = str(meta.get("scope_mode") or "public").strip().lower()
+                origin_target = str(meta.get("origin_target") or "").strip()
                 desc = str(meta.get("desc") or "").strip()
                 overlay = str(meta.get("overlay_text") or "").strip()
                 category = str(meta.get("category") or "").strip()
@@ -1292,17 +1380,29 @@ class VisualMediaPlugin(Star):
                     else []
                 )
 
-                kw_score = 0
+                kw_score = 0.0
                 if kw:
                     haystack = " ".join(
-                        [desc, overlay, category, character, *tags, *scenes, *emotions]
+                        [overlay, desc, category, character, *tags, *scenes, *emotions]
                     ).casefold()
-                    if kw in haystack:
-                        kw_score += 2
-                    for tok in kw_tokens:
+                    if overlay and kw in overlay.casefold():
+                        kw_score += 3.0
+                    elif any(kw in t.casefold() for t in tags):
+                        kw_score += 2.5
+                    elif kw in haystack:
+                        kw_score += 2.0
+                    for tok in kw_ws_tokens:
                         if tok in haystack:
-                            kw_score += 1
-                    if kw_score <= 0:
+                            kw_score += 1.0
+                    if kw_tokens:
+                        entry_tokens = set(tokenize_for_bm25(haystack))
+                        overlap = kw_tokens & entry_tokens
+                        if overlap:
+                            kw_score += round(len(overlap) / max(1, len(kw_tokens)) * 1.5, 3)
+                    sem_sim = calculate_hybrid_similarity(kw_raw, haystack)
+                    if sem_sim >= 0.22:
+                        kw_score += round(sem_sim * 1.2, 3)
+                    if kw_score <= 0.0:
                         continue
 
                 try:
@@ -1318,8 +1418,13 @@ class VisualMediaPlugin(Star):
                 except (TypeError, ValueError):
                     created_at = 0
 
+                freq_ratio = (
+                    round(use_count / total_visible_uses, 4)
+                    if total_visible_uses > 0
+                    else 0.0
+                )
                 sort_key = (
-                    kw_score,
+                    round(kw_score, 3),
                     use_count,
                     1 if origin_matched else 0,
                     last_used_at,
@@ -1330,14 +1435,18 @@ class VisualMediaPlugin(Star):
                         sort_key,
                         {
                             "hash": str(meta.get("hash") or ""),
-                            "path": str(path),
+                            "path": path,
+                            "thumbnail_path": "",
                             "category": category,
                             "desc": desc,
                             "overlay_text": overlay,
                             "character": character,
                             "tags": tags,
                             "scenes": scenes,
+                            "emotions": emotions,
                             "use_count": use_count,
+                            "frequency": freq_ratio,
+                            "match_score": round(kw_score, 3),
                             "last_used_at": last_used_at,
                             "created_at": created_at,
                             "scope_mode": scope_mode,
@@ -1348,7 +1457,12 @@ class VisualMediaPlugin(Star):
                 )
 
             ranked.sort(key=lambda pair: pair[0], reverse=True)
-            return [item for _, item in ranked[:max_items]]
+            top_items = [item for _, item in ranked[:max_items]]
+            for item in top_items:
+                item["thumbnail_path"] = ensure_meme_thumbnail(
+                    item["path"], thumb_dir=thumb_dir
+                )
+            return top_items
         except Exception:
             return []
 
@@ -2290,6 +2404,9 @@ class VisualMediaPlugin(Star):
             if self.generation is not None
             else None
         )
+        vibe_bus = getattr(self, "vibe_bus", None)
+        if vibe_bus is not None and callable(getattr(vibe_bus, "subscribe", None)):
+            vibe_bus.subscribe()
         memes = getattr(self, "memes", None)
         if memes is not None:
             emb = self._resolve_embedding_service()

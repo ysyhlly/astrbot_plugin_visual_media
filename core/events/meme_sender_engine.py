@@ -15,6 +15,7 @@ from ..search.jev_selector import JevSelectionError, JevSelector
 from ..search.punctuation_emotion import punctuation_emotion_weights
 from ..tools.joint_reply import joint_reply_owned
 from .event_context import get_event_session_key
+from .vibe_bus import is_vibe_serious_for_event
 
 
 class _MemeTurnState:
@@ -307,6 +308,16 @@ class MemeSenderEngine:
             return decide(False, "auto_send_meme_disabled")
         if not self.plugin.is_send_enabled_for_event(event):
             return decide(False, "send_disabled")
+        vibe_serious, vibe_name = is_vibe_serious_for_event(self.plugin, event)
+        if vibe_serious:
+            behavior = getattr(self.plugin, "media_behavior", None)
+            if behavior is not None:
+                details = {"suppressed_by": "vibe_serious", "vibe": vibe_name or "serious"}
+                if callable(getattr(behavior, "arecord", None)):
+                    await behavior.arecord(event, "meme", "blocked", "vibe_serious", details)
+                elif callable(getattr(behavior, "record", None)):
+                    behavior.record(event, "meme", "blocked", "vibe_serious", details)
+            return decide(False, "vibe_serious")
         if not await self.is_auto_emoji_cooldown_ready(event):
             return decide(False, "cooldown")
         chance = self.normalize_auto_meme_chance()

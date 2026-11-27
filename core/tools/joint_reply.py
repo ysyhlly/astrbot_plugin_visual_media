@@ -15,6 +15,7 @@ from astrbot.api import logger
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Image, Plain
 
+from ..events.vibe_bus import is_vibe_serious_for_event
 from . import joint_prefetch
 from .joint_prefetch import joint_search_enabled
 from .joint_preview import (
@@ -289,6 +290,10 @@ def should_attach_pixel_previews(plan, event=None) -> tuple[bool, str]:
     if isinstance(member_prefs, dict) and member_prefs.get("frequency") == "off":
         if not explicit_meme:
             return False, "member_prefers_text"
+
+    vibe_serious, _vibe_name = is_vibe_serious_for_event(getattr(plan, "plugin", None), ev)
+    if vibe_serious and not explicit_meme:
+        return False, "vibe_serious"
 
     if not getattr(cfg, "joint_reply_preview_context_gate", True):
         return True, "gate_disabled"
@@ -863,7 +868,6 @@ async def prepare_joint_reply(plugin, event, request):
         query = str(getattr(event, "_cd_original_user_text_v1", "") or "").strip()[
             :1000
         ]
-        prefetch = joint_prefetch.start_joint_prefetch(plugin, event)
         candidates = []
         outcome, cache_reason = "disabled", "bypass"
         elapsed_ms = join_wait_ms = 0.0
@@ -871,6 +875,27 @@ async def prepare_joint_reply(plugin, event, request):
             re.search(r"表情|贴纸|动图|\bmeme\b|\bsticker\b", query, re.I)
             is not None
         )
+        behavior = getattr(plugin, "media_behavior", None)
+        vibe_serious, vibe_name = is_vibe_serious_for_event(plugin, event)
+        if vibe_serious and not explicit_media:
+            existing_prefetch = getattr(event, "_stealer_joint_prefetch_v1", None)
+            if existing_prefetch is not None and callable(getattr(existing_prefetch, "close", None)):
+                await existing_prefetch.close()
+            candidates = []
+            outcome = "suppressed_vibe_serious"
+            if behavior is not None:
+                details = {"suppressed_by": "vibe_serious", "vibe": vibe_name or "serious"}
+                if callable(getattr(behavior, "arecord", None)):
+                    await behavior.arecord(event, "meme", "blocked", "vibe_serious", details)
+                elif callable(getattr(behavior, "record", None)):
+                    behavior.record(event, "meme", "blocked", "vibe_serious", details)
+            logger.info(
+                "[Stealer] joint_reply suppressed_by=vibe_serious vibe=%s",
+                vibe_name or "serious",
+            )
+            prefetch = None
+        else:
+            prefetch = joint_prefetch.start_joint_prefetch(plugin, event)
         if prefetch is not None:
             joined = time.monotonic()
             try:
@@ -891,7 +916,6 @@ async def prepare_joint_reply(plugin, event, request):
             cache_reason = getattr(prefetch, "cache_reason", "bypass")
             elapsed_ms = (time.monotonic() - prefetch.started) * 1000
             join_wait_ms = (time.monotonic() - joined) * 1000
-        behavior = getattr(plugin, "media_behavior", None)
         prepares_candidates = behavior and hasattr(behavior, "prepare_candidates")
         if prepares_candidates and candidates:
             candidates = await behavior.prepare_candidates(event, candidates)
